@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+workspace/data/
+*.parquet
+*.csv
+.env
