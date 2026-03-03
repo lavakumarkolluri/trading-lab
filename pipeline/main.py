@@ -23,7 +23,7 @@ MARKETS = {
         "LT.NS", "AXISBANK.NS", "ASIANPAINT.NS", "MARUTI.NS", "TITAN.NS",
         "SUNPHARMA.NS", "ULTRACEMCO.NS", "WIPRO.NS", "HCLTECH.NS", "BAJFINANCE.NS",
         "NESTLEIND.NS", "TECHM.NS", "POWERGRID.NS", "NTPC.NS", "ONGC.NS",
-        "TATAMOTORS.BO", "TATASTEEL.NS", "JSWSTEEL.NS", "ADANIENT.NS", "ADANIPORTS.NS",
+        "TATASTEEL.NS", "JSWSTEEL.NS", "ADANIENT.NS", "ADANIPORTS.NS",
         "COALINDIA.NS", "DIVISLAB.NS", "DRREDDY.NS", "EICHERMOT.NS", "GRASIM.NS",
         "HEROMOTOCO.NS", "HINDALCO.NS", "INDUSINDBK.NS", "M&M.NS", "BAJAJFINSV.NS",
         "BAJAJ-AUTO.NS", "BRITANNIA.NS", "CIPLA.NS", "SBILIFE.NS", "HDFCLIFE.NS",
@@ -69,9 +69,10 @@ CH_PASS = os.getenv("CH_PASSWORD", "")
 DELAY_BETWEEN_DOWNLOADS = 2
 
 # ── Results Tracker ────────────────────────────────────
-results = {"success": [], "failed": []}
+results = {"success": [], "skipped": [], "failed": []}
 
 
+# ── Clients ────────────────────────────────────────────
 def get_minio_client():
     return Minio(
         MINIO_HOST,
@@ -98,32 +99,69 @@ def setup_minio(minio):
         log.info(f"Bucket exists: {MINIO_BUCKET}")
 
 
-def download_symbol(symbol, market):
-    log.info(f"  Downloading {symbol}...")
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period="max", interval="1d")
+# ── Get Last Loaded Date ───────────────────────────────
+def get_last_date(ch, symbol, market):
+    result = ch.query(f"""
+        SELECT max(date) FROM market.ohlcv_daily
+        WHERE symbol = '{symbol}' AND market = '{market}'
+    """)
+    last_date = result.result_rows[0][0]
+    return last_date  # None if symbol not in DB yet
+
+
+# ── Download Only New Data ─────────────────────────────
+def download_symbol(ch, symbol, market):
+    last_date = get_last_date(ch, symbol, market)
+    ticker    = yf.Ticker(symbol)
+
+    if last_date is None:
+        # First time — download full history
+        log.info(f"  First load, downloading full history...")
+        df = ticker.history(period="max", interval="1d")
+    else:
+        today = datetime.now().date()
+        if last_date >= today:
+            log.info(f"  Already up to date (last: {last_date}), skipping")
+            return None
+        # Incremental — download from last date
+        from_date = last_date.strftime("%Y-%m-%d")
+        log.info(f"  Last date in DB: {from_date}, downloading new rows only...")
+        df = ticker.history(start=from_date, interval="1d")
 
     if df.empty:
         raise ValueError(f"No data returned for {symbol}")
 
     df = df.reset_index()[["Date", "Open", "High", "Low", "Close", "Volume"]]
     df["Date"] = df["Date"].dt.date
-        # Fix: filter dates before 1970 (ClickHouse Date type limitation)
+
+    # Filter pre-1970 (ClickHouse Date type limitation)
     df = df[df["Date"] >= pd.Timestamp("1970-01-01").date()]
+
+    # Filter rows already in DB
+    if last_date is not None:
+        df = df[df["Date"] > last_date]
+
+    if df.empty:
+        log.info(f"  No new rows found, skipping")
+        return None
+
     df["symbol"] = symbol
     df["market"] = market
-    df.columns = ["date", "open", "high", "low", "close", "volume", "symbol", "market"]
-    df["volume"] = df["volume"].fillna(0).astype("int64")
-    log.info(f"  Got {len(df)} rows")
+    df.columns   = ["date", "open", "high", "low",
+                    "close", "volume", "symbol", "market"]
+    df["volume"]  = df["volume"].fillna(0).astype("int64")
+    log.info(f"  Got {len(df)} new rows")
     return df
 
 
+# ── Save to MinIO ──────────────────────────────────────
 def save_to_minio(minio, df, symbol, market):
     buffer = io.BytesIO()
     df.to_parquet(buffer, index=False)
     buffer.seek(0)
-    size = len(buffer.getvalue())
-    object_path = f"{market}/daily/{symbol}.parquet"
+    size        = len(buffer.getvalue())
+    today       = datetime.now().strftime("%Y-%m-%d")
+    object_path = f"{market}/daily/{today}/{symbol}.parquet"
     minio.put_object(
         MINIO_BUCKET, object_path,
         buffer, size,
@@ -132,13 +170,8 @@ def save_to_minio(minio, df, symbol, market):
     log.info(f"  Saved to MinIO: {object_path}")
 
 
+# ── Save to ClickHouse ─────────────────────────────────
 def save_to_clickhouse(ch, df):
-    symbol = df["symbol"].iloc[0]
-    market = df["market"].iloc[0]
-    ch.command(f"""
-        ALTER TABLE market.ohlcv_daily
-        DELETE WHERE symbol = '{symbol}' AND market = '{market}'
-    """)
     ch.insert_df("market.ohlcv_daily", df[[
         "date", "symbol", "market",
         "open", "high", "low", "close", "volume"
@@ -146,32 +179,43 @@ def save_to_clickhouse(ch, df):
     log.info(f"  Inserted {len(df)} rows into ClickHouse")
 
 
+# ── Process One Symbol ─────────────────────────────────
 def process_symbol(symbol, market, minio, ch):
     try:
-        df = download_symbol(symbol, market)
+        log.info(f"  Checking {symbol}...")
+        df = download_symbol(ch, symbol, market)
+
+        if df is None:
+            results["skipped"].append(f"{market}/{symbol}")
+            return
+
         save_to_minio(minio, df, symbol, market)
         save_to_clickhouse(ch, df)
-        results["success"].append(f"{market}/{symbol}")
+        results["success"].append(f"{market}/{symbol} (+{len(df)} rows)")
+
     except Exception as e:
         log.error(f"  FAILED {symbol}: {e}")
         results["failed"].append(f"{market}/{symbol} → {e}")
 
 
+# ── Print Summary ──────────────────────────────────────
 def print_summary():
-    print("\n" + "="*55)
+    print("\n" + "=" * 55)
     print("PIPELINE SUMMARY")
-    print("="*55)
-    print(f"✅ Success: {len(results['success'])}")
+    print("=" * 55)
+    print(f"✅ Loaded:   {len(results['success'])}")
     for s in results["success"]:
         print(f"   {s}")
-    print(f"\n❌ Failed:  {len(results['failed'])}")
+    print(f"\n⏭️  Skipped:  {len(results['skipped'])} (already up to date)")
+    print(f"\n❌ Failed:   {len(results['failed'])}")
     for f in results["failed"]:
         print(f"   {f}")
-    print("="*55)
+    print("=" * 55)
 
 
+# ── Main ───────────────────────────────────────────────
 def main():
-    log.info("=== Trading Pipeline Phase 1 Starting ===")
+    log.info("=== Trading Pipeline Starting ===")
     log.info(f"Start time: {datetime.now()}")
 
     minio = get_minio_client()
@@ -180,7 +224,7 @@ def main():
     setup_minio(minio)
 
     total = sum(len(v) for v in MARKETS.values())
-    log.info(f"Total symbols to download: {total}")
+    log.info(f"Total symbols to check: {total}")
 
     for market, symbols in MARKETS.items():
         log.info(f"\n── {market.upper()} ──────────────────────")
