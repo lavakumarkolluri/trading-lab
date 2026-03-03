@@ -23,7 +23,7 @@ MARKETS = {
         "LT.NS", "AXISBANK.NS", "ASIANPAINT.NS", "MARUTI.NS", "TITAN.NS",
         "SUNPHARMA.NS", "ULTRACEMCO.NS", "WIPRO.NS", "HCLTECH.NS", "BAJFINANCE.NS",
         "NESTLEIND.NS", "TECHM.NS", "POWERGRID.NS", "NTPC.NS", "ONGC.NS",
-        "TATAMOTORS.NS", "TATASTEEL.NS", "JSWSTEEL.NS", "ADANIENT.NS", "ADANIPORTS.NS",
+        "TATAMOTORS.BO", "TATASTEEL.NS", "JSWSTEEL.NS", "ADANIENT.NS", "ADANIPORTS.NS",
         "COALINDIA.NS", "DIVISLAB.NS", "DRREDDY.NS", "EICHERMOT.NS", "GRASIM.NS",
         "HEROMOTOCO.NS", "HINDALCO.NS", "INDUSINDBK.NS", "M&M.NS", "BAJAJFINSV.NS",
         "BAJAJ-AUTO.NS", "BRITANNIA.NS", "CIPLA.NS", "SBILIFE.NS", "HDFCLIFE.NS",
@@ -108,6 +108,8 @@ def download_symbol(symbol, market):
 
     df = df.reset_index()[["Date", "Open", "High", "Low", "Close", "Volume"]]
     df["Date"] = df["Date"].dt.date
+        # Fix: filter dates before 1970 (ClickHouse Date type limitation)
+    df = df[df["Date"] >= pd.Timestamp("1970-01-01").date()]
     df["symbol"] = symbol
     df["market"] = market
     df.columns = ["date", "open", "high", "low", "close", "volume", "symbol", "market"]
