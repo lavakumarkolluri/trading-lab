@@ -7,6 +7,7 @@ import os
 import logging
 import time
 from datetime import datetime
+from symbols import MARKETS
 
 # ── Logging Setup ──────────────────────────────────────
 logging.basicConfig(
@@ -14,46 +15,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 log = logging.getLogger(__name__)
-
-# ── Watchlist ──────────────────────────────────────────
-MARKETS = {
-    "indian": [
-        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-        "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS",
-        "LT.NS", "AXISBANK.NS", "ASIANPAINT.NS", "MARUTI.NS", "TITAN.NS",
-        "SUNPHARMA.NS", "ULTRACEMCO.NS", "WIPRO.NS", "HCLTECH.NS", "BAJFINANCE.NS",
-        "NESTLEIND.NS", "TECHM.NS", "POWERGRID.NS", "NTPC.NS", "ONGC.NS",
-        "TATASTEEL.NS", "JSWSTEEL.NS", "ADANIENT.NS", "ADANIPORTS.NS",
-        "COALINDIA.NS", "DIVISLAB.NS", "DRREDDY.NS", "EICHERMOT.NS", "GRASIM.NS",
-        "HEROMOTOCO.NS", "HINDALCO.NS", "INDUSINDBK.NS", "M&M.NS", "BAJAJFINSV.NS",
-        "BAJAJ-AUTO.NS", "BRITANNIA.NS", "CIPLA.NS", "SBILIFE.NS", "HDFCLIFE.NS",
-        "APOLLOHOSP.NS", "BPCL.NS", "TATACONSUM.NS", "UPL.NS", "NIFTYBEES.NS"
-    ],
-    "us": [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
-        "META", "TSLA", "BRK-B", "JPM", "JNJ",
-        "V", "UNH", "XOM", "PG", "MA",
-        "HD", "CVX", "MRK", "ABBV", "PFE",
-        "BAC", "KO", "AVGO", "PEP", "TMO",
-        "COST", "MCD", "ACN", "ABT", "CSCO",
-        "CRM", "DHR", "NEE", "LIN", "TXN",
-        "WMT", "PM", "ORCL", "RTX", "QCOM",
-        "HON", "AMGN", "IBM", "GS", "BLK",
-        "CAT", "GE", "INTU", "AXP", "SPGI",
-        "SPY", "QQQ", "DIA", "IWM", "VTI",
-        "XLF", "XLK", "XLE", "XLV", "XLI"
-    ],
-    "crypto": [
-        "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
-        "ADA-USD", "AVAX-USD", "DOGE-USD", "DOT-USD", "MATIC-USD",
-        "LINK-USD", "UNI-USD", "ATOM-USD", "LTC-USD", "BCH-USD",
-        "XLM-USD", "ALGO-USD", "VET-USD", "FIL-USD", "AAVE-USD"
-    ],
-    "forex": [
-        "USDINR=X", "EURUSD=X", "GBPUSD=X", "JPYUSD=X",
-        "AUDUSD=X", "CADUSD=X", "CHFUSD=X", "CNYUSD=X"
-    ]
-}
 
 # ── Config ─────────────────────────────────────────────
 MINIO_HOST     = os.getenv("MINIO_HOST", "minio:9000")
@@ -66,7 +27,7 @@ CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
 
-DELAY_BETWEEN_DOWNLOADS = 2
+DELAY_BETWEEN_DOWNLOADS = 2  # seconds — avoids Yahoo rate limiting
 
 # ── Results Tracker ────────────────────────────────────
 results = {"success": [], "skipped": [], "failed": []}
@@ -123,7 +84,7 @@ def download_symbol(ch, symbol, market):
         if last_date >= today:
             log.info(f"  Already up to date (last: {last_date}), skipping")
             return None
-        # Incremental — download from last date
+        # Incremental — download only from last date onwards
         from_date = last_date.strftime("%Y-%m-%d")
         log.info(f"  Last date in DB: {from_date}, downloading new rows only...")
         df = ticker.history(start=from_date, interval="1d")
@@ -134,10 +95,10 @@ def download_symbol(ch, symbol, market):
     df = df.reset_index()[["Date", "Open", "High", "Low", "Close", "Volume"]]
     df["Date"] = df["Date"].dt.date
 
-    # Filter pre-1970 (ClickHouse Date type limitation)
+    # Filter pre-1970 dates (ClickHouse Date type limitation)
     df = df[df["Date"] >= pd.Timestamp("1970-01-01").date()]
 
-    # Filter rows already in DB
+    # Filter rows already in DB (avoid duplicates on overlap)
     if last_date is not None:
         df = df[df["Date"] > last_date]
 
@@ -161,7 +122,8 @@ def save_to_minio(minio, df, symbol, market):
     buffer.seek(0)
     size        = len(buffer.getvalue())
     today       = datetime.now().strftime("%Y-%m-%d")
-    object_path = f"{market}/daily/{today}/{symbol}.parquet"
+    safe_symbol = symbol.replace("=", "_").replace("&", "_")
+    object_path = f"{market}/daily/{today}/{safe_symbol}.parquet"
     minio.put_object(
         MINIO_BUCKET, object_path,
         buffer, size,
@@ -203,13 +165,17 @@ def print_summary():
     print("\n" + "=" * 55)
     print("PIPELINE SUMMARY")
     print("=" * 55)
-    print(f"✅ Loaded:   {len(results['success'])}")
+
+    print(f"\n✅ Loaded:   {len(results['success'])}")
     for s in results["success"]:
         print(f"   {s}")
+
     print(f"\n⏭️  Skipped:  {len(results['skipped'])} (already up to date)")
+
     print(f"\n❌ Failed:   {len(results['failed'])}")
     for f in results["failed"]:
         print(f"   {f}")
+
     print("=" * 55)
 
 
