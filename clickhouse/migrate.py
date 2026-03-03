@@ -36,7 +36,19 @@ def info(msg): print(f"{BLUE}ℹ️  {msg}{RESET}")
 
 
 # ── Connection ─────────────────────────────────────────
-
+def get_client():
+    try:
+        client = clickhouse_connect.get_client(
+            host=CH_HOST,
+            port=CH_PORT,
+            username=os.getenv("CH_USER", "default"),
+            password=os.getenv("CH_PASSWORD", "")
+        )
+        client.command("SELECT 1")
+        return client
+    except Exception as e:
+        err(f"Cannot connect to ClickHouse: {e}")
+        sys.exit(1)
 
 # ── Checksum ───────────────────────────────────────────
 def get_checksum(filepath):
