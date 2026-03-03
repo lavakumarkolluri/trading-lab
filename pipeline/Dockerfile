@@ -1,7 +1,5 @@
 FROM python:3.12-slim
-
 WORKDIR /app
-
 RUN pip install --no-cache-dir \
     yfinance \
     pandas \
@@ -11,7 +9,6 @@ RUN pip install --no-cache-dir \
     boto3 \
     requests \
     schedule
-
 COPY main.py .
-
+COPY symbols.py .
 CMD ["python", "main.py"]
