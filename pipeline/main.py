@@ -3,7 +3,7 @@ import pandas as pd
 from minio import Minio
 import clickhouse_connect
 import io
-
+import os
 print("=== Trading Pipeline Starting ===")
 
 # ── Step 1: Download Data ──────────────────────────────
@@ -41,7 +41,12 @@ print("Uploaded to MinIO successfully")
 
 # ── Step 3: Load into ClickHouse ───────────────────────
 print("Loading into ClickHouse...")
-ch = clickhouse_connect.get_client(host="clickhouse", port=8123)
+ch = clickhouse_connect.get_client(
+    host=os.getenv("CH_HOST", "clickhouse"),
+    port=int(os.getenv("CH_PORT", "8123")),
+    username=os.getenv("CH_USER", "default"),
+    password=os.getenv("CH_PASSWORD", "")
+)
 
 ch.command("""
     CREATE DATABASE IF NOT EXISTS trades
