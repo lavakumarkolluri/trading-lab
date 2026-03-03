@@ -36,17 +36,6 @@ def info(msg): print(f"{BLUE}ℹ️  {msg}{RESET}")
 
 
 # ── Connection ─────────────────────────────────────────
-def get_client():
-    try:
-        client = clickhouse_connect.get_client(
-            host=CH_HOST,
-            port=CH_PORT
-        )
-        client.command("SELECT 1")
-        return client
-    except Exception as e:
-        err(f"Cannot connect to ClickHouse: {e}")
-        sys.exit(1)
 
 
 # ── Checksum ───────────────────────────────────────────

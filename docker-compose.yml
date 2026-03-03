@@ -68,6 +68,14 @@ services:
     volumes:
       - ./workspace:/app
       - ./workspace/logs:/app/logs
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=
+      - MINIO_HOST=minio:9000
+      - MINIO_USER=admin
+      - MINIO_PASSWORD=password123
     depends_on:
       - minio
       - clickhouse
@@ -81,6 +89,8 @@ services:
     environment:
       - CH_HOST=clickhouse
       - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=
     depends_on:
       - clickhouse
     restart: "no"
