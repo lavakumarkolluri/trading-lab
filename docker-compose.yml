@@ -8,6 +8,7 @@ services:
     volumes:
       - ./workspace:/home/coder/workspace
       - vscode-data:/home/coder/.local
+      - .:/home/coder/trading-lab
     environment:
       - PASSWORD=yourpassword
     restart: unless-stopped
@@ -60,6 +61,31 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer-data:/data
     restart: unless-stopped
+
+  pipeline:
+    build: ./pipeline
+    container_name: pipeline
+    volumes:
+      - ./workspace:/app
+      - ./workspace/logs:/app/logs
+    depends_on:
+      - minio
+      - clickhouse
+    restart: "no"
+
+  migrate:
+    build: ./pipeline
+    container_name: migrate
+    volumes:
+      - ./clickhouse:/clickhouse
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+    depends_on:
+      - clickhouse
+    restart: "no"
+    entrypoint: ["python", "/clickhouse/migrate.py"]
+    command: ["--run"]
 
 volumes:
   vscode-data:
