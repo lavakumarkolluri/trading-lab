@@ -12,4 +12,6 @@ RUN pip install --no-cache-dir \
     requests \
     schedule
 
+COPY main.py .
+
 CMD ["python", "main.py"]
