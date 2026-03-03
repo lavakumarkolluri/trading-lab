@@ -66,8 +66,8 @@ services:
     build: ./pipeline
     container_name: pipeline
     volumes:
-      - ./workspace:/app
-      - ./workspace/logs:/app/logs
+      - ./workspace:/workspace
+      - ./workspace/logs:/workspace/logs
     environment:
       - CH_HOST=clickhouse
       - CH_PORT=8123
