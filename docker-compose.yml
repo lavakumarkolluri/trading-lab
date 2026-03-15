@@ -1,5 +1,4 @@
 services:
-
   vscode:
     image: codercom/code-server:latest
     container_name: vscode
@@ -97,6 +96,19 @@ services:
     restart: "no"
     entrypoint: ["python", "/clickhouse/migrate.py"]
     command: ["--run"]
+
+  mf_pipeline:
+    build: ./pipeline
+    container_name: mf_pipeline
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=
+    depends_on:
+      - clickhouse
+    restart: "no"
+    entrypoint: ["python", "mf_pipeline.py"]
 
 volumes:
   vscode-data:
