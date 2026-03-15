@@ -11,4 +11,5 @@ RUN pip install --no-cache-dir \
     schedule
 COPY main.py .
 COPY symbols.py .
+COPY mf_pipeline.py .
 CMD ["python", "main.py"]
