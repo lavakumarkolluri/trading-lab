@@ -400,8 +400,9 @@ def main():
 
     if args.scheme:
         log.info(f"Processing single scheme: {args.scheme}")
+        last_date = None if args.full else fetch_last_enriched_date(ch, args.scheme)
         process_scheme(ch, args.scheme,
-                       full_recompute=args.full,
+                       last_date=last_date,
                        idx=1, total=1)
     else:
         scheme_codes   = fetch_all_scheme_codes(ch)
