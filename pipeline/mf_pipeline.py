@@ -1,3 +1,19 @@
+#!/usr/bin/env python3
+"""
+mf_pipeline.py
+──────────────
+Downloads MF scheme master and NAV history from mfapi.in into ClickHouse.
+
+SCHEME FILTER — only downloads schemes matching:
+  1. Name contains "DIRECT" AND "GROWTH"
+  2. Name contains "ETF"
+  3. Name contains "FUND OF FUND" or " FOF"
+  4. Name contains "OVERSEAS" or "INTERNATIONAL" or "GLOBAL"
+
+Inactive schemes (no NAV in last 10 days) are skipped automatically
+via the incremental watermark check.
+"""
+
 import requests
 import clickhouse_connect
 import pandas as pd
@@ -6,7 +22,7 @@ import logging
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 # ── Logging ────────────────────────────────────────────
 logging.basicConfig(
@@ -23,8 +39,9 @@ CH_PASS = os.getenv("CH_PASSWORD", "")
 
 MFAPI_BASE        = "https://api.mfapi.in/mf"
 DELAY_PER_REQUEST = 0.1   # per-worker delay
-BATCH_SIZE        = 500   # insert rows to ClickHouse in batches
-MAX_WORKERS       = 8    # parallel download threads
+BATCH_SIZE        = 500   # log progress every N schemes
+MAX_WORKERS       = 8     # parallel download threads
+INACTIVITY_DAYS   = 10    # skip schemes with no NAV in this many days
 
 # ── Results Tracker ────────────────────────────────────
 results      = {"success": [], "skipped": [], "failed": []}
@@ -34,43 +51,53 @@ results_lock = threading.Lock()
 # ── ClickHouse Client ──────────────────────────────────
 def get_ch_client():
     return clickhouse_connect.get_client(
-        host=CH_HOST,
-        port=CH_PORT,
-        username=CH_USER,
-        password=CH_PASS
+        host=CH_HOST, port=CH_PORT,
+        username=CH_USER, password=CH_PASS
     )
 
 
-# ── Ensure Tables Exist ────────────────────────────────
-def setup_tables(ch):
-    ch.command("""
-        CREATE TABLE IF NOT EXISTS market.mf_schemes
-        (
-            scheme_code     UInt32,
-            scheme_name     String,
-            fund_house      String,
-            scheme_type     String,
-            scheme_category String,
-            is_active       UInt8,
-            added_on        Date
-        )
-        ENGINE = ReplacingMergeTree
-        ORDER BY scheme_code
-    """)
-    log.info("Table ready: market.mf_schemes")
+# ── Scheme Filter ──────────────────────────────────────
+def is_relevant_scheme(name: str) -> bool:
+    """
+    Returns True if the scheme should be downloaded.
 
-    ch.command("""
-        CREATE TABLE IF NOT EXISTS market.mf_nav
-        (
-            date        Date,
-            scheme_code UInt32,
-            nav         Float64,
-            version     UInt64
-        )
-        ENGINE = ReplacingMergeTree(version)
-        ORDER BY (scheme_code, date)
-    """)
-    log.info("Table ready: market.mf_nav")
+    KEEP:
+      - Direct Growth plans  → "DIRECT" AND "GROWTH" in name
+      - ETFs                 → "ETF" in name
+      - Fund of Funds        → "FUND OF FUND" or " FOF" in name
+      - Overseas/Global      → "OVERSEAS", "INTERNATIONAL", "GLOBAL" in name
+
+    SKIP:
+      - Regular plans
+      - Dividend / IDCW plans
+      - Any other plan type
+    """
+    n = name.upper()
+    is_direct_growth = "DIRECT" in n and "GROWTH" in n
+    is_etf           = "ETF" in n
+    is_fof           = "FUND OF FUND" in n or " FOF" in n or n.startswith("FOF ")
+    is_overseas      = any(x in n for x in ["OVERSEAS", "INTERNATIONAL", "GLOBAL"])
+    return is_direct_growth or is_etf or is_fof or is_overseas
+
+
+# ── Preflight check — tables must exist ───────────────
+def assert_tables_exist(ch):
+    """Verify migration has been run before pipeline executes."""
+    for table in ["market.mf_schemes", "market.mf_nav"]:
+        result = ch.query(
+            "SELECT count() FROM system.tables "
+            "WHERE database = {db:String} AND name = {tbl:String}",
+            parameters={
+                "db":  table.split(".")[0],
+                "tbl": table.split(".")[1]
+            }
+        ).result_rows[0][0]
+        if not result:
+            raise RuntimeError(
+                f"Table {table} missing — run migrations first: "
+                f"docker compose run --rm migrate"
+            )
+    log.info("Tables verified ✅")
 
 
 # ── Fetch All Schemes from MFAPI ───────────────────────
@@ -80,8 +107,12 @@ def fetch_all_schemes():
         resp = requests.get(MFAPI_BASE, timeout=30)
         resp.raise_for_status()
         schemes = resp.json()
-        log.info(f"Found {len(schemes)} schemes")
-        return schemes
+        log.info(f"Total schemes from API  : {len(schemes)}")
+
+        # Apply relevance filter
+        filtered = [s for s in schemes if is_relevant_scheme(s["schemeName"])]
+        log.info(f"After Direct/Growth/ETF/FoF filter: {len(filtered)}")
+        return filtered
     except Exception as e:
         log.error(f"Failed to fetch scheme list: {e}")
         raise
@@ -189,12 +220,16 @@ def parse_scheme_category(name):
 
 # ── Load Schemes Master into ClickHouse ────────────────
 def load_schemes_master(ch, schemes):
-    count = ch.query("SELECT count() FROM market.mf_schemes").result_rows[0][0]
+    """Insert scheme master — skips if already loaded."""
+    count = ch.query(
+        "SELECT count() FROM market.mf_schemes"
+    ).result_rows[0][0]
+
     if count > 0:
         log.info(f"Schemes master already loaded ({count} rows), skipping")
         return
 
-    log.info("Loading scheme master list into ClickHouse...")
+    log.info(f"Loading {len(schemes)} schemes into market.mf_schemes...")
     today = date.today()
     rows  = []
     for s in schemes:
@@ -211,16 +246,21 @@ def load_schemes_master(ch, schemes):
         })
     df = pd.DataFrame(rows)
     ch.insert_df("market.mf_schemes", df)
-    log.info(f"Loaded {len(df)} schemes into market.mf_schemes")
+    log.info(f"✅ Loaded {len(df)} schemes into market.mf_schemes")
 
 
-# ── Get Last NAV Date for a Scheme ────────────────────
-def get_last_nav_date(ch, scheme_code):
-    result = ch.query(f"""
-        SELECT max(date) FROM market.mf_nav
-        WHERE scheme_code = {scheme_code}
-    """)
-    return result.result_rows[0][0]
+# ── Fetch all NAV watermarks in ONE query ─────────────
+def fetch_all_nav_watermarks(ch) -> dict:
+    """
+    Fetch max(date) for ALL schemes in ONE query.
+    Returns dict: {scheme_code: last_date}
+    """
+    result = ch.query(
+        "SELECT scheme_code, max(date) "
+        "FROM market.mf_nav "
+        "GROUP BY scheme_code"
+    )
+    return {row[0]: row[1] for row in result.result_rows}
 
 
 # ── Fetch NAV History for One Scheme ──────────────────
@@ -263,11 +303,12 @@ def insert_nav_rows(ch, rows):
 
 
 # ── Process One Scheme ─────────────────────────────────
-def process_scheme(ch, scheme_code, scheme_name, idx, total):
+def process_scheme(ch, scheme_code, scheme_name, last_date, idx, total):
     try:
-        last_date = get_last_nav_date(ch, scheme_code)
-        today     = date.today()
+        today      = date.today()
+        cutoff     = today - timedelta(days=INACTIVITY_DAYS)
 
+        # Skip if last NAV is recent enough and already up to date
         if last_date and last_date >= today:
             with results_lock:
                 results["skipped"].append(scheme_code)
@@ -276,6 +317,18 @@ def process_scheme(ch, scheme_code, scheme_name, idx, total):
         nav_list = fetch_nav_history(scheme_code)
         if not nav_list:
             raise ValueError("No NAV data returned")
+
+        # Check if fund is inactive — most recent NAV older than cutoff
+        try:
+            most_recent = datetime.strptime(nav_list[0]["date"], "%d-%m-%Y").date()
+            if most_recent < cutoff:
+                log.info(f"  Skipping inactive fund [{scheme_code}] {scheme_name[:40]} "
+                         f"(last NAV: {most_recent})")
+                with results_lock:
+                    results["skipped"].append(scheme_code)
+                return
+        except Exception:
+            pass
 
         rows = parse_nav_data(scheme_code, nav_list, last_date)
         if not rows:
@@ -287,7 +340,7 @@ def process_scheme(ch, scheme_code, scheme_name, idx, total):
         with results_lock:
             results["success"].append(scheme_code)
 
-        if idx % 100 == 0:
+        if idx % BATCH_SIZE == 0:
             with results_lock:
                 log.info(f"  Progress: {idx}/{total} | "
                          f"✅ {len(results['success'])} | "
@@ -306,7 +359,7 @@ def print_summary():
     print("MUTUAL FUND PIPELINE SUMMARY")
     print("=" * 55)
     print(f"✅ Loaded:   {len(results['success'])} schemes")
-    print(f"⏭️  Skipped:  {len(results['skipped'])} (already up to date)")
+    print(f"⏭️  Skipped:  {len(results['skipped'])} (up to date or inactive)")
     print(f"❌ Failed:   {len(results['failed'])}")
     if results["failed"]:
         for f in results["failed"][:20]:
@@ -318,36 +371,48 @@ def print_summary():
 
 # ── Worker (one per thread) ────────────────────────────
 def _worker(args):
-    idx, scheme = args
+    idx, scheme, watermarks, total = args
     code = int(scheme["schemeCode"])
     name = scheme["schemeName"]
     ch   = get_ch_client()  # each thread gets its own connection
-    process_scheme(ch, code, name, idx, total)
+    last_date = watermarks.get(code)
+    process_scheme(ch, code, name, last_date, idx, total)
     time.sleep(DELAY_PER_REQUEST)
 
 
 # ── Main ───────────────────────────────────────────────
 def main():
-    global total
     log.info("=== Mutual Fund Pipeline Starting ===")
     log.info(f"Start time: {datetime.now()}")
 
     ch = get_ch_client()
-    setup_tables(ch)
 
-    # Step 1 — fetch all scheme codes
+    # Verify tables exist — fail fast if migrations not run
+    assert_tables_exist(ch)
+
+    # Fetch and filter schemes
     schemes = fetch_all_schemes()
     total   = len(schemes)
 
-    # Step 2 — load schemes master (skips if already loaded)
+    # Load schemes master (skips if already loaded)
     load_schemes_master(ch, schemes)
 
-    # Step 3 — parallel NAV download
+    # Fetch all watermarks in ONE query
+    log.info("Fetching NAV watermarks from ClickHouse...")
+    watermarks = fetch_all_nav_watermarks(ch)
+    log.info(f"Got watermarks for {len(watermarks)} existing schemes")
+
+    # Parallel NAV download
     log.info(f"\nDownloading NAV history for {total} schemes...")
     log.info(f"Running with {MAX_WORKERS} parallel workers")
 
+    tasks = [
+        (idx, scheme, watermarks, total)
+        for idx, scheme in enumerate(schemes, 1)
+    ]
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(_worker, enumerate(schemes, 1))
+        executor.map(_worker, tasks)
 
     print_summary()
     log.info(f"End time: {datetime.now()}")
