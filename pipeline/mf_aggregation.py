@@ -84,10 +84,11 @@ def fetch_all_scheme_codes(ch) -> list[int]:
 
 def fetch_last_enriched_date(ch, scheme_code: int):
     """Return max(date) from mf_nav_enriched for the given scheme, or None."""
-    result = ch.query(f"""
-        SELECT max(date) FROM market.mf_nav_enriched
-        WHERE scheme_code = {scheme_code}
-    """)
+    result = ch.query(
+        "SELECT max(date) FROM market.mf_nav_enriched "
+        "WHERE scheme_code = {code:UInt32}",
+        parameters={"code": scheme_code}
+    )
     val = result.result_rows[0][0]
     return val  # datetime.date or None
 
@@ -101,16 +102,20 @@ def fetch_nav_for_scheme(ch, scheme_code: int,
     """
     if from_date is not None:
         warmup_start = from_date - timedelta(days=WARMUP_DAYS)
-        where = f"AND date >= '{warmup_start}'"
+        result = ch.query(
+            "SELECT date, nav FROM market.mf_nav "
+            "WHERE scheme_code = {code:UInt32} AND date >= {d:Date} "
+            "ORDER BY date",
+            parameters={"code": scheme_code, "d": warmup_start}
+        )
     else:
-        where = ""
+        result = ch.query(
+            "SELECT date, nav FROM market.mf_nav "
+            "WHERE scheme_code = {code:UInt32} "
+            "ORDER BY date",
+            parameters={"code": scheme_code}
+        )
 
-    result = ch.query(f"""
-        SELECT date, nav
-        FROM market.mf_nav
-        WHERE scheme_code = {scheme_code} {where}
-        ORDER BY date
-    """)
     if not result.result_rows:
         return pd.DataFrame(columns=["date", "nav"])
 
@@ -124,12 +129,15 @@ def delete_enriched_range(ch, scheme_code: int, from_date):
     """
     Delete existing enriched rows for this scheme from from_date onwards
     before re-inserting (prevents duplicate stale rows on partial rerun).
+    SETTINGS mutations_sync=1 makes the delete finish before we return,
+    so the following insert never races against a pending deletion.
     """
-    ch.command(f"""
-        ALTER TABLE market.mf_nav_enriched
-        DELETE WHERE scheme_code = {scheme_code}
-              AND   date >= '{from_date}'
-    """)
+    ch.command(
+        "ALTER TABLE market.mf_nav_enriched "
+        "DELETE WHERE scheme_code = {code:UInt32} AND date >= {d:Date} "
+        "SETTINGS mutations_sync = 1",
+        parameters={"code": scheme_code, "d": from_date}
+    )
 
 
 def insert_enriched(ch, df: pd.DataFrame):
