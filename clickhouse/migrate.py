@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 ClickHouse Migration Runner
@@ -119,10 +118,9 @@ def get_run_migrations(client):
 # ── Record Migration ───────────────────────────────────
 def record_migration(client, migration_id, filename,
                      checksum, status, duration_ms, error=""):
-    safe_error = error[:500]
     client.insert(
         "system_migrations.history",
-        [[migration_id, filename, checksum, status, duration_ms, safe_error]],
+        [[migration_id, filename, checksum, status, duration_ms, error[:500]]],
         column_names=["migration_id", "filename", "checksum",
                       "status", "duration_ms", "error_message"]
     )
@@ -290,20 +288,16 @@ def check_drift(client):
             drifts.append(f"missing:{table}")
 
     # Record drift check
-    drift_count    = len(drifts)
-    drift_detected = 1 if drifts else 0
-    details        = json.dumps(drifts).replace("'", "''")
-
-    client.command(f"""
-        INSERT INTO system_migrations.drift_log
-        (drift_detected, drift_count, drift_details)
-        VALUES ({drift_detected}, {drift_count}, '{details}')
-    """)
+    client.insert(
+        "system_migrations.drift_log",
+        [[1 if drifts else 0, len(drifts), json.dumps(drifts)]],
+        column_names=["drift_detected", "drift_count", "drift_details"]
+    )
 
     if not drifts:
         ok("No drift detected. Database matches migrations perfectly.")
     else:
-        err(f"\n{drift_count} drift(s) detected.")
+        err(f"\n{len(drifts)} drift(s) detected.")
         warn("Review and resolve before next migration run.")
 
     print()
