@@ -3,6 +3,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     yfinance \
     pandas \
+    numpy \
     pyarrow \
     minio \
     clickhouse-connect \
@@ -12,4 +13,5 @@ RUN pip install --no-cache-dir \
 COPY main.py .
 COPY symbols.py .
 COPY mf_pipeline.py .
+COPY mf_aggregation.py .
 CMD ["python", "main.py"]

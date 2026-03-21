@@ -110,6 +110,29 @@ services:
     restart: "no"
     entrypoint: ["python", "mf_pipeline.py"]
 
+  # ── NEW: MF NAV Aggregation ────────────────────────────
+  # Run AFTER mf_pipeline has loaded raw NAV data.
+  # Default mode  : incremental (only new NAV rows enriched)
+  # Full recompute: override command with ["--full"]
+  # Single scheme : override command with ["--scheme", "119598"]
+  mf_aggregation:
+    build: ./pipeline
+    container_name: mf_aggregation
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=
+    depends_on:
+      - clickhouse
+    restart: "no"
+    entrypoint: ["python", "mf_aggregation.py"]
+    # Default: incremental.
+    # Override at runtime:
+    #   docker compose run --rm mf_aggregation --full
+    #   docker compose run --rm mf_aggregation --scheme 119598
+    command: []
+
 volumes:
   vscode-data:
   minio-data:
