@@ -119,19 +119,13 @@ def get_run_migrations(client):
 # ── Record Migration ───────────────────────────────────
 def record_migration(client, migration_id, filename,
                      checksum, status, duration_ms, error=""):
-    safe_error = error[:500].replace("'", "''")
-    client.command(f"""
-        INSERT INTO system_migrations.history
-        (migration_id, filename, checksum, status, duration_ms, error_message)
-        VALUES (
-            '{migration_id}',
-            '{filename}',
-            '{checksum}',
-            '{status}',
-            {duration_ms},
-            '{safe_error}'
-        )
-    """)
+    safe_error = error[:500]
+    client.insert(
+        "system_migrations.history",
+        [[migration_id, filename, checksum, status, duration_ms, safe_error]],
+        column_names=["migration_id", "filename", "checksum",
+                      "status", "duration_ms", "error_message"]
+    )
 
 
 # ══════════════════════════════════════════════════════
