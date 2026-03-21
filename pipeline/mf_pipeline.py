@@ -24,7 +24,7 @@ CH_PASS = os.getenv("CH_PASSWORD", "")
 MFAPI_BASE        = "https://api.mfapi.in/mf"
 DELAY_PER_REQUEST = 0.1   # per-worker delay
 BATCH_SIZE        = 500   # insert rows to ClickHouse in batches
-MAX_WORKERS       = 10    # parallel download threads
+MAX_WORKERS       = 8    # parallel download threads
 
 # ── Results Tracker ────────────────────────────────────
 results      = {"success": [], "skipped": [], "failed": []}
