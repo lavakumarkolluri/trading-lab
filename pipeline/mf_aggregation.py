@@ -19,7 +19,7 @@ Aggregations computed per row (per scheme_code × date):
 
 Incremental logic:
   • For each scheme, finds max(date) in mf_nav_enriched
-  • Re-computes only from (max_date - 200 days) to allow rolling window warm-up
+  • Re-computes only from (max_date - 290 days) to allow rolling window warm-up
   • On first run, processes full history
   • Deletes the recomputed range before inserting (ReplacingMergeTree handles
     dedup via version, but explicit delete avoids stale rows on partial reruns)
@@ -35,6 +35,8 @@ import sys
 import logging
 import argparse
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timedelta
 
 import pandas as pd
@@ -57,10 +59,11 @@ CH_PASS    = os.getenv("CH_PASSWORD", "")
 BATCH_SIZE        = 200          # schemes per batch log
 INSERT_CHUNK_SIZE = 50_000       # rows per ClickHouse insert
 WARMUP_DAYS       = 290          # extra lookback for SMA-200 warm-up
-DELAY_PER_SCHEME  = 0.0          # set > 0 to throttle CPU on small machines
+MAX_WORKERS       = 8            # parallel threads
 
-# ── Results tracker ────────────────────────────────────
-results = {"success": 0, "skipped": 0, "failed": []}
+# ── Results tracker (thread-safe) ──────────────────────
+results      = {"success": 0, "skipped": 0, "failed": []}
+results_lock = threading.Lock()
 
 
 # ══════════════════════════════════════════════════════
@@ -175,7 +178,6 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     gain  = delta.clip(lower=0)
     loss  = (-delta).clip(lower=0)
 
-    # Wilder's smoothing = EMA with alpha = 1/period
     avg_gain = gain.ewm(alpha=1 / period, adjust=False,
                         min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False,
@@ -197,10 +199,6 @@ def compute_atr_proxy(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def compute_weekly_rollup(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute week_start, week_open, week_high, week_low,
-    week_close, week_return_pct for each row using the full df.
-    """
     df = df.copy()
     df["_date_ts"]   = pd.to_datetime(df["date"])
     df["week_start"] = df["_date_ts"].dt.to_period("W").apply(
@@ -225,10 +223,6 @@ def compute_weekly_rollup(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_monthly_rollup(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute month_start, month_open, month_high, month_low,
-    month_close, month_return_pct for each row.
-    """
     df = df.copy()
     df["_date_ts"]    = pd.to_datetime(df["date"])
     df["month_start"] = df["_date_ts"].dt.to_period("M").apply(
@@ -253,17 +247,12 @@ def compute_monthly_rollup(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_52w_range(series: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """Trailing 252-day high and low."""
     high = series.rolling(window=252, min_periods=1).max()
     low  = series.rolling(window=252, min_periods=1).min()
     return high, low
 
 
 def compute_ytd_return(df: pd.DataFrame) -> pd.Series:
-    """
-    YTD return = (nav - first_nav_of_year) / first_nav_of_year * 100
-    Resets every January 1.
-    """
     df = df.copy()
     df["_year"] = pd.to_datetime(df["date"]).dt.year
     year_first  = df.groupby("_year")["nav"].transform("first")
@@ -272,12 +261,10 @@ def compute_ytd_return(df: pd.DataFrame) -> pd.Series:
 
 
 def compute_all_time_high(series: pd.Series) -> pd.Series:
-    """Cumulative maximum NAV from inception."""
     return series.cummax()
 
 
 def compute_drawdown(nav: pd.Series, ath: pd.Series) -> pd.Series:
-    """% below all-time high.  0 when nav == ath."""
     dd = (ath - nav) / ath.replace(0, np.nan) * 100
     return dd.fillna(0)
 
@@ -287,15 +274,9 @@ def compute_drawdown(nav: pd.Series, ath: pd.Series) -> pd.Series:
 # ══════════════════════════════════════════════════════
 
 def enrich_scheme(df_raw: pd.DataFrame, scheme_code: int) -> pd.DataFrame:
-    """
-    Given a raw NAV DataFrame (date, nav) for one scheme,
-    compute ALL aggregation columns and return the enriched DataFrame.
-    df_raw MUST be sorted by date ascending.
-    """
     df = df_raw.copy().sort_values("date").reset_index(drop=True)
     df["scheme_code"] = scheme_code
 
-    # ── Technical indicators on full series ───────────
     df["sma_20"]  = compute_sma(df["nav"], 20).fillna(0)
     df["sma_50"]  = compute_sma(df["nav"], 50).fillna(0)
     df["sma_200"] = compute_sma(df["nav"], 200).fillna(0)
@@ -304,25 +285,17 @@ def enrich_scheme(df_raw: pd.DataFrame, scheme_code: int) -> pd.DataFrame:
     df["rsi_14"]  = compute_rsi(df["nav"], 14)
     df["atr_14"]  = compute_atr_proxy(df["nav"], 14)
 
-    # ── 52-week range ──────────────────────────────────
     df["high_52w"], df["low_52w"] = compute_52w_range(df["nav"])
-
-    # ── YTD return ─────────────────────────────────────
     df["ytd_return_pct"] = compute_ytd_return(df)
+    df["all_time_high"]  = compute_all_time_high(df["nav"])
+    df["drawdown_pct"]   = compute_drawdown(df["nav"], df["all_time_high"])
 
-    # ── All-time high & drawdown ───────────────────────
-    df["all_time_high"] = compute_all_time_high(df["nav"])
-    df["drawdown_pct"]  = compute_drawdown(df["nav"], df["all_time_high"])
-
-    # ── Weekly & monthly rollups ───────────────────────
     df = compute_weekly_rollup(df)
     df = compute_monthly_rollup(df)
 
-    # ── Housekeeping columns ───────────────────────────
     df["computed_at"] = datetime.now()
     df["version"]     = int(datetime.now().timestamp())
 
-    # ── Column order matching migration schema ─────────
     cols = [
         "date", "scheme_code", "nav",
         "week_start", "week_open", "week_high",
@@ -347,50 +320,46 @@ def enrich_scheme(df_raw: pd.DataFrame, scheme_code: int) -> pd.DataFrame:
 def process_scheme(ch, scheme_code: int,
                    full_recompute: bool = False,
                    idx: int = 0, total: int = 0):
-    """
-    Incremental or full-recompute enrichment for one scheme.
-    """
     try:
         last_date = None if full_recompute else fetch_last_enriched_date(
             ch, scheme_code
         )
 
-        # Fetch raw NAV (with warm-up window for rolling calculations)
         df_raw = fetch_nav_for_scheme(ch, scheme_code, from_date=last_date)
 
         if df_raw.empty:
-            results["skipped"] += 1
+            with results_lock:
+                results["skipped"] += 1
             return
 
-        # Full enrichment on the fetched window
         df_enriched = enrich_scheme(df_raw, scheme_code)
 
-        # On incremental runs: only insert rows after last_date
-        # (warm-up rows already existed in the enriched table)
         if last_date is not None:
             insert_df = df_enriched[df_enriched["date"] > last_date]
             if insert_df.empty:
-                results["skipped"] += 1
+                with results_lock:
+                    results["skipped"] += 1
                 return
-            # Remove any stale enriched rows for this range before re-inserting
             delete_enriched_range(ch, scheme_code, insert_df["date"].min())
         else:
             insert_df = df_enriched
 
         insert_enriched(ch, insert_df)
-        results["success"] += 1
 
-        if idx % BATCH_SIZE == 0 and idx > 0:
-            log.info(
-                f"  Progress {idx}/{total} | "
-                f"✅ {results['success']} | "
-                f"⏭️  {results['skipped']} | "
-                f"❌ {len(results['failed'])}"
-            )
+        with results_lock:
+            results["success"] += 1
+            if results["success"] % BATCH_SIZE == 0:
+                log.info(
+                    f"  Progress {idx}/{total} | "
+                    f"✅ {results['success']} | "
+                    f"⏭️  {results['skipped']} | "
+                    f"❌ {len(results['failed'])}"
+                )
 
     except Exception as e:
         log.error(f"  FAILED [{scheme_code}]: {e}")
-        results["failed"].append(f"{scheme_code} → {e}")
+        with results_lock:
+            results["failed"].append(f"{scheme_code} → {e}")
 
 
 # ══════════════════════════════════════════════════════
@@ -423,7 +392,7 @@ def main():
     parser.add_argument(
         "--full",
         action="store_true",
-        help="Recompute all schemes from scratch (drops existing enriched rows)"
+        help="Recompute all schemes from scratch"
     )
     parser.add_argument(
         "--scheme",
@@ -441,29 +410,32 @@ def main():
     log.info("ClickHouse connected ✅")
 
     if args.scheme:
-        # ── Single-scheme debug mode ───────────────────
         log.info(f"Processing single scheme: {args.scheme}")
         process_scheme(ch, args.scheme,
                        full_recompute=args.full,
                        idx=1, total=1)
     else:
-        # ── All schemes ────────────────────────────────
-        scheme_codes = fetch_all_scheme_codes(ch)
-        total        = len(scheme_codes)
+        scheme_codes  = fetch_all_scheme_codes(ch)
+        total         = len(scheme_codes)
+        full_recompute = args.full
+
         log.info(f"Schemes to process: {total}")
+        log.info(f"Workers           : {MAX_WORKERS}")
 
         if args.full:
             log.warning(
-                "Full recompute — this will re-enrich ALL schemes. "
-                "On 17k schemes this takes ~20–40 min."
+                "Full recompute — this will re-enrich ALL schemes."
             )
 
-        for idx, code in enumerate(scheme_codes, 1):
-            process_scheme(ch, code,
-                           full_recompute=args.full,
+        # ── Parallel processing — each thread gets its own CH client ──
+        def _worker(item):
+            idx, code = item
+            ch = get_ch_client()
+            process_scheme(ch, code, full_recompute=full_recompute,
                            idx=idx, total=total)
-            if DELAY_PER_SCHEME > 0:
-                time.sleep(DELAY_PER_SCHEME)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            executor.map(_worker, enumerate(scheme_codes, 1))
 
     print_summary()
     log.info(f"Finished : {datetime.now()}")
