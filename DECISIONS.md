@@ -75,7 +75,7 @@
   - All-time high (cumulative max from inception)
   - Drawdown % (% below ATH)
 **Rationale:** Single JOIN for all analytics. No fan-out queries across multiple aggregation tables. Wide tables are idiomatic for ClickHouse's columnar storage.
-**Trade-off:** Recomputing a scheme requires deleting and reinserting its rows. Handled via `ALTER TABLE ... DELETE` on the recomputed range before re-insert.
+**Trade-off:** **Trade-off:** Between a re-insert and the next background merge, duplicate rows are transiently visible. Always query with `SELECT ... FINAL` on `market.mf_nav_enriched` to guarantee correct deduplication at read time.
 
 ---
 
