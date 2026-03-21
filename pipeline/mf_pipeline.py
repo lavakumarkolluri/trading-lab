@@ -5,6 +5,8 @@ import os
 import logging
 import time
 from datetime import datetime, date
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # ── Logging ────────────────────────────────────────────
 logging.basicConfig(
@@ -25,6 +27,7 @@ BATCH_SIZE        = 500   # insert rows to ClickHouse in batches
 
 # ── Results Tracker ────────────────────────────────────
 results = {"success": [], "skipped": [], "failed": []}
+results_lock = threading.Lock(
 
 
 # ── ClickHouse Client ──────────────────────────────────
@@ -261,7 +264,8 @@ def process_scheme(ch, scheme_code, scheme_name, idx, total):
         today     = date.today()
 
         if last_date and last_date >= today:
-            results["skipped"].append(scheme_code)
+            with results_lock:
+                results["skipped"].append(scheme_code)
             return
 
         nav_list = fetch_nav_history(scheme_code)
@@ -270,21 +274,25 @@ def process_scheme(ch, scheme_code, scheme_name, idx, total):
 
         rows = parse_nav_data(scheme_code, nav_list, last_date)
         if not rows:
-            results["skipped"].append(scheme_code)
+            with results_lock:
+                results["skipped"].append(scheme_code)
             return
 
         insert_nav_rows(ch, rows)
-        results["success"].append(scheme_code)
+        with results_lock:
+            results["success"].append(scheme_code)
 
         if idx % 100 == 0:
-            log.info(f"  Progress: {idx}/{total} | "
-                     f"✅ {len(results['success'])} | "
-                     f"⏭️  {len(results['skipped'])} | "
-                     f"❌ {len(results['failed'])}")
+            with results_lock:
+                log.info(f"  Progress: {idx}/{total} | "
+                         f"✅ {len(results['success'])} | "
+                         f"⏭️  {len(results['skipped'])} | "
+                         f"❌ {len(results['failed'])}")
 
     except Exception as e:
         log.error(f"  FAILED [{scheme_code}] {scheme_name[:40]}: {e}")
-        results["failed"].append(f"{scheme_code} → {e}")
+        with results_lock:
+            results["failed"].append(f"{scheme_code} → {e}")
 
 
 # ── Print Summary ──────────────────────────────────────

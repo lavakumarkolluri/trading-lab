@@ -6,6 +6,8 @@ import io
 import os
 import logging
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from symbols import MARKETS
 
@@ -27,10 +29,12 @@ CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
 
-DELAY_BETWEEN_DOWNLOADS = 2  # seconds — avoids Yahoo rate limiting
+MAX_WORKERS            = 8   # parallel download threads
+DELAY_BETWEEN_DOWNLOADS = 0.3  # per-worker delay (was 2s global)
 
 # ── Results Tracker ────────────────────────────────────
-results = {"success": [], "skipped": [], "failed": []}
+results      = {"success": [], "skipped": [], "failed": []}
+results_lock = threading.Lock()
 
 
 # ── Clients ────────────────────────────────────────────
@@ -76,7 +80,6 @@ def download_symbol(ch, symbol, market):
     ticker    = yf.Ticker(symbol)
 
     if last_date is None:
-        # First time — download full history
         log.info(f"  First load, downloading full history...")
         df = ticker.history(period="max", interval="1d")
     else:
@@ -84,7 +87,6 @@ def download_symbol(ch, symbol, market):
         if last_date >= today:
             log.info(f"  Already up to date (last: {last_date}), skipping")
             return None
-        # Incremental — download only from last date onwards
         from_date = last_date.strftime("%Y-%m-%d")
         log.info(f"  Last date in DB: {from_date}, downloading new rows only...")
         df = ticker.history(start=from_date, interval="1d")
@@ -148,16 +150,19 @@ def process_symbol(symbol, market, minio, ch):
         df = download_symbol(ch, symbol, market)
 
         if df is None:
-            results["skipped"].append(f"{market}/{symbol}")
+            with results_lock:
+                results["skipped"].append(f"{market}/{symbol}")
             return
 
         save_to_minio(minio, df, symbol, market)
         save_to_clickhouse(ch, df)
-        results["success"].append(f"{market}/{symbol} (+{len(df)} rows)")
+        with results_lock:
+            results["success"].append(f"{market}/{symbol} (+{len(df)} rows)")
 
     except Exception as e:
         log.error(f"  FAILED {symbol}: {e}")
-        results["failed"].append(f"{market}/{symbol} → {e}")
+        with results_lock:
+            results["failed"].append(f"{market}/{symbol} → {e}")
 
 
 # ── Print Summary ──────────────────────────────────────
@@ -179,25 +184,40 @@ def print_summary():
     print("=" * 55)
 
 
+# ── Worker (one per thread) ────────────────────────────
+def _worker(args):
+    symbol, market, total, idx = args
+    # Each thread gets its own clients — not thread-safe to share
+    ch    = get_ch_client()
+    minio = get_minio_client()
+    log.info(f"[{idx}/{total}] {market}/{symbol}")
+    process_symbol(symbol, market, minio, ch)
+    time.sleep(DELAY_BETWEEN_DOWNLOADS)
+
+
 # ── Main ───────────────────────────────────────────────
 def main():
     log.info("=== Trading Pipeline Starting ===")
     log.info(f"Start time: {datetime.now()}")
 
-    minio = get_minio_client()
-    ch    = get_ch_client()
+    # Setup MinIO bucket (serial, runs once)
+    setup_minio(get_minio_client())
 
-    setup_minio(minio)
-
-    total = sum(len(v) for v in MARKETS.values())
+    # Build flat list of (symbol, market, total, idx) for all workers
+    all_symbols = [
+        (symbol, market)
+        for market, symbols in MARKETS.items()
+        for symbol in symbols
+    ]
+    total = len(all_symbols)
     log.info(f"Total symbols to check: {total}")
+    log.info(f"Running with {MAX_WORKERS} parallel workers")
 
-    for market, symbols in MARKETS.items():
-        log.info(f"\n── {market.upper()} ──────────────────────")
-        for i, symbol in enumerate(symbols, 1):
-            log.info(f"[{i}/{len(symbols)}] {symbol}")
-            process_symbol(symbol, market, minio, ch)
-            time.sleep(DELAY_BETWEEN_DOWNLOADS)
+    tasks = [(symbol, market, total, idx)
+             for idx, (symbol, market) in enumerate(all_symbols, 1)]
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        executor.map(_worker, tasks)
 
     print_summary()
     log.info(f"End time: {datetime.now()}")
