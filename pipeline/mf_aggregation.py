@@ -21,8 +21,8 @@ Incremental logic:
   • For each scheme, finds max(date) in mf_nav_enriched
   • Re-computes only from (max_date - 290 days) to allow rolling window warm-up
   • On first run, processes full history
-  • Deletes the recomputed range before inserting (ReplacingMergeTree handles
-    dedup via version, but explicit delete avoids stale rows on partial reruns)
+  • No explicit deletes — ReplacingMergeTree(version) handles dedup via version
+    column. Always use SELECT ... FINAL on mf_nav_enriched for correct reads.
 
 Usage:
   python mf_aggregation.py                  # incremental (default)
@@ -126,21 +126,6 @@ def fetch_nav_for_scheme(ch, scheme_code: int,
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df["nav"]  = df["nav"].astype(float)
     return df
-
-
-def delete_enriched_range(ch, scheme_code: int, from_date):
-    """
-    Delete existing enriched rows for this scheme from from_date onwards
-    before re-inserting (prevents duplicate stale rows on partial rerun).
-    SETTINGS mutations_sync=1 makes the delete finish before we return,
-    so the following insert never races against a pending deletion.
-    """
-    ch.command(
-        "ALTER TABLE market.mf_nav_enriched "
-        "DELETE WHERE scheme_code = {code:UInt32} AND date >= {d:Date} "
-        "SETTINGS mutations_sync = 1",
-        parameters={"code": scheme_code, "d": from_date}
-    )
 
 
 def insert_enriched(ch, df: pd.DataFrame):
@@ -340,7 +325,6 @@ def process_scheme(ch, scheme_code: int,
                 with results_lock:
                     results["skipped"] += 1
                 return
-            delete_enriched_range(ch, scheme_code, insert_df["date"].min())
         else:
             insert_df = df_enriched
 
@@ -415,8 +399,8 @@ def main():
                        full_recompute=args.full,
                        idx=1, total=1)
     else:
-        scheme_codes  = fetch_all_scheme_codes(ch)
-        total         = len(scheme_codes)
+        scheme_codes   = fetch_all_scheme_codes(ch)
+        total          = len(scheme_codes)
         full_recompute = args.full
 
         log.info(f"Schemes to process: {total}")
