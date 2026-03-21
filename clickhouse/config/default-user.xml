@@ -1,9 +1,9 @@
 <clickhouse>
   <users>
     <default>
-      <password></password>
+      <password from_env="CH_PASSWORD"/>
       <networks>
-        <ip>::/0</ip>
+        <ip>172.16.0.0/12</ip>
       </networks>
       <profile>default</profile>
       <quota>default</quota>
