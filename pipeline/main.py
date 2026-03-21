@@ -29,8 +29,8 @@ CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
 
-MAX_WORKERS            = 8   # parallel download threads
-DELAY_BETWEEN_DOWNLOADS = 0.3  # per-worker delay (was 2s global)
+MAX_WORKERS             = 8    # parallel download threads
+DELAY_BETWEEN_DOWNLOADS = 0.3  # per-worker delay
 
 # ── Results Tracker ────────────────────────────────────
 results      = {"success": [], "skipped": [], "failed": []}
@@ -64,20 +64,24 @@ def setup_minio(minio):
         log.info(f"Bucket exists: {MINIO_BUCKET}")
 
 
-# ── Get Last Loaded Date ───────────────────────────────
-def get_last_date(ch, symbol, market):
-    result = ch.query(f"""
-        SELECT max(date) FROM market.ohlcv_daily
-        WHERE symbol = '{symbol}' AND market = '{market}'
-    """)
-    last_date = result.result_rows[0][0]
-    return last_date  # None if symbol not in DB yet
+# ── Bulk fetch all watermarks in ONE query ─────────────
+# Instead of querying ClickHouse once per symbol (724 round-trips),
+# we fetch max(date) for every symbol in a single query at startup.
+def fetch_all_watermarks(ch) -> dict:
+    result = ch.query(
+        "SELECT symbol, market, max(date) "
+        "FROM market.ohlcv_daily "
+        "GROUP BY symbol, market"
+    )
+    return {
+        (row[0], row[1]): row[2]
+        for row in result.result_rows
+    }
 
 
 # ── Download Only New Data ─────────────────────────────
-def download_symbol(ch, symbol, market):
-    last_date = get_last_date(ch, symbol, market)
-    ticker    = yf.Ticker(symbol)
+def download_symbol(last_date, symbol, market):
+    ticker = yf.Ticker(symbol)
 
     if last_date is None:
         log.info(f"  First load, downloading full history...")
@@ -144,10 +148,10 @@ def save_to_clickhouse(ch, df):
 
 
 # ── Process One Symbol ─────────────────────────────────
-def process_symbol(symbol, market, minio, ch):
+def process_symbol(symbol, market, minio, ch, last_date):
     try:
         log.info(f"  Checking {symbol}...")
-        df = download_symbol(ch, symbol, market)
+        df = download_symbol(last_date, symbol, market)
 
         if df is None:
             with results_lock:
@@ -186,12 +190,12 @@ def print_summary():
 
 # ── Worker (one per thread) ────────────────────────────
 def _worker(args):
-    symbol, market, total, idx = args
+    symbol, market, total, idx, last_date = args
     # Each thread gets its own clients — not thread-safe to share
     ch    = get_ch_client()
     minio = get_minio_client()
     log.info(f"[{idx}/{total}] {market}/{symbol}")
-    process_symbol(symbol, market, minio, ch)
+    process_symbol(symbol, market, minio, ch, last_date)
     time.sleep(DELAY_BETWEEN_DOWNLOADS)
 
 
@@ -203,7 +207,13 @@ def main():
     # Setup MinIO bucket (serial, runs once)
     setup_minio(get_minio_client())
 
-    # Build flat list of (symbol, market, total, idx) for all workers
+    # Fetch all existing watermarks in ONE query — eliminates N+1 round-trips
+    ch = get_ch_client()
+    log.info("Fetching watermarks from ClickHouse...")
+    watermarks = fetch_all_watermarks(ch)
+    log.info(f"Got watermarks for {len(watermarks)} existing symbols")
+
+    # Build flat list of all symbols with their watermark date
     all_symbols = [
         (symbol, market)
         for market, symbols in MARKETS.items()
@@ -213,8 +223,10 @@ def main():
     log.info(f"Total symbols to check: {total}")
     log.info(f"Running with {MAX_WORKERS} parallel workers")
 
-    tasks = [(symbol, market, total, idx)
-             for idx, (symbol, market) in enumerate(all_symbols, 1)]
+    tasks = [
+        (symbol, market, total, idx, watermarks.get((symbol, market)))
+        for idx, (symbol, market) in enumerate(all_symbols, 1)
+    ]
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         executor.map(_worker, tasks)
