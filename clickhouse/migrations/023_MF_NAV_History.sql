@@ -1,4 +1,4 @@
-CREATE TABLE market.mf_nav
+CREATE TABLE IF NOT EXISTS market.mf_nav
 (
     date        Date,
     scheme_code UInt32,
