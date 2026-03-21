@@ -311,12 +311,9 @@ def enrich_scheme(df_raw: pd.DataFrame, scheme_code: int) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════
 
 def process_scheme(ch, scheme_code: int,
-                   full_recompute: bool = False,
+                   last_date=None,
                    idx: int = 0, total: int = 0):
     try:
-        last_date = None if full_recompute else fetch_last_enriched_date(
-            ch, scheme_code
-        )
 
         df_raw = fetch_nav_for_scheme(ch, scheme_code, from_date=last_date)
 
