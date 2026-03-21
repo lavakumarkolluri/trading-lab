@@ -3,6 +3,8 @@
     <default>
       <password from_env="CH_PASSWORD"/>
       <networks>
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
         <ip>172.16.0.0/12</ip>
       </networks>
       <profile>default</profile>
