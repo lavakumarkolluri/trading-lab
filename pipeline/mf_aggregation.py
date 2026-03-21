@@ -417,15 +417,19 @@ def main():
             )
 
         # ── Parallel processing — each thread gets its own CH client ──
+        # Pre-fetch all last enriched dates in ONE query — eliminates N+1 round-trips
+        last_dates = {} if full_recompute else fetch_all_last_enriched_dates(ch)
+        log.info(f"Got last enriched dates for {len(last_dates)} schemes")
+
         def _worker(item):
             idx, code = item
             ch = get_ch_client()
-            process_scheme(ch, code, full_recompute=full_recompute,
+            process_scheme(ch, code,
+                           last_date=last_dates.get(code),
                            idx=idx, total=total)
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(_worker, enumerate(scheme_codes, 1))
-
     print_summary()
     log.info(f"Finished : {datetime.now()}")
 
