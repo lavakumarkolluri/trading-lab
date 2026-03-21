@@ -52,15 +52,12 @@ def get_ch_client():
 
 
 def is_relevant_scheme(name: str) -> bool:
-    """
-    Returns True if the scheme should be KEPT.
-    """
     n = name.upper()
-    is_direct_growth = "DIRECT" in n and "GROWTH" in n
     is_etf           = "ETF" in n
-    is_fof           = "FUND OF FUND" in n or " FOF" in n or n.startswith("FOF ")
-    is_overseas      = any(x in n for x in ["OVERSEAS", "INTERNATIONAL", "GLOBAL"])
-    return is_direct_growth or is_etf or is_fof or is_overseas
+    is_direct_growth = "DIRECT" in n and "GROWTH" in n
+    is_fof_growth    = ("FUND OF FUND" in n or " FOF" in n or n.startswith("FOF ")) and "GROWTH" in n
+    is_overseas_growth = any(x in n for x in ["OVERSEAS", "INTERNATIONAL", "GLOBAL"]) and "GROWTH" in n
+    return is_etf or is_direct_growth or is_fof_growth or is_overseas_growth
 
 
 def main():
