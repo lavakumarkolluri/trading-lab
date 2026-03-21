@@ -24,6 +24,11 @@ services:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: password123
     command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   clickhouse:
@@ -39,6 +44,11 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   jupyter:
@@ -77,8 +87,10 @@ services:
       - MINIO_USER=admin
       - MINIO_PASSWORD=password123
     depends_on:
-      - minio
-      - clickhouse
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     restart: "no"
 
   migrate:
@@ -92,7 +104,8 @@ services:
       - CH_USER=default
       - CH_PASSWORD=
     depends_on:
-      - clickhouse
+      clickhouse:
+        condition: service_healthy
     restart: "no"
     entrypoint: ["python", "/clickhouse/migrate.py"]
     command: ["--run"]
@@ -106,15 +119,11 @@ services:
       - CH_USER=default
       - CH_PASSWORD=
     depends_on:
-      - clickhouse
+      clickhouse:
+        condition: service_healthy
     restart: "no"
     entrypoint: ["python", "mf_pipeline.py"]
 
-  # ── NEW: MF NAV Aggregation ────────────────────────────
-  # Run AFTER mf_pipeline has loaded raw NAV data.
-  # Default mode  : incremental (only new NAV rows enriched)
-  # Full recompute: override command with ["--full"]
-  # Single scheme : override command with ["--scheme", "119598"]
   mf_aggregation:
     build: ./pipeline
     container_name: mf_aggregation
@@ -124,13 +133,10 @@ services:
       - CH_USER=default
       - CH_PASSWORD=
     depends_on:
-      - clickhouse
+      clickhouse:
+        condition: service_healthy
     restart: "no"
     entrypoint: ["python", "mf_aggregation.py"]
-    # Default: incremental.
-    # Override at runtime:
-    #   docker compose run --rm mf_aggregation --full
-    #   docker compose run --rm mf_aggregation --scheme 119598
     command: []
 
 volumes:
