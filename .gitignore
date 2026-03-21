@@ -5,3 +5,5 @@ workspace/data/
 *.parquet
 *.csv
 .env
+*.swp
+*.swo
