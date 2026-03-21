@@ -95,6 +95,14 @@ def fetch_last_enriched_date(ch, scheme_code: int):
     val = result.result_rows[0][0]
     return val  # datetime.date or None
 
+def fetch_all_last_enriched_dates(ch) -> dict:
+    """Fetch max(date) for ALL schemes in ONE query. Returns {scheme_code: last_date}."""
+    result = ch.query(
+        "SELECT scheme_code, max(date) "
+        "FROM market.mf_nav_enriched "
+        "GROUP BY scheme_code"
+    )
+    return {row[0]: row[1] for row in result.result_rows}
 
 def fetch_nav_for_scheme(ch, scheme_code: int,
                          from_date=None) -> pd.DataFrame:
