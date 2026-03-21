@@ -4,9 +4,9 @@ import pandas as pd
 import os
 import logging
 import time
-from datetime import datetime, date
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, date
 
 # ── Logging ────────────────────────────────────────────
 logging.basicConfig(
@@ -22,12 +22,13 @@ CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
 
 MFAPI_BASE        = "https://api.mfapi.in/mf"
-DELAY_PER_REQUEST = 0.3   # seconds between API calls
+DELAY_PER_REQUEST = 0.1   # per-worker delay
 BATCH_SIZE        = 500   # insert rows to ClickHouse in batches
+MAX_WORKERS       = 10    # parallel download threads
 
 # ── Results Tracker ────────────────────────────────────
-results = {"success": [], "skipped": [], "failed": []}
-results_lock = threading.Lock(
+results      = {"success": [], "skipped": [], "failed": []}
+results_lock = threading.Lock()
 
 
 # ── ClickHouse Client ──────────────────────────────────
@@ -103,7 +104,6 @@ def parse_fund_house(name):
     for fh in known:
         if fh.upper() in name_upper:
             return fh
-    # Fallback: first word(s) before first dash or bracket
     parts = name.split(" - ")[0].split("(")[0].strip()
     words = parts.split()
     return " ".join(words[:2]) if len(words) >= 2 else words[0]
@@ -140,46 +140,46 @@ def parse_scheme_type(name):
 def parse_scheme_category(name):
     name_upper = name.upper()
     cats = {
-        "ELSS":             "ELSS",
-        "LIQUID":           "Liquid",
-        "OVERNIGHT":        "Overnight",
-        "ULTRA SHORT":      "Ultra Short Duration",
-        "LOW DURATION":     "Low Duration",
-        "SHORT DURATION":   "Short Duration",
-        "MEDIUM DURATION":  "Medium Duration",
-        "LONG DURATION":    "Long Duration",
-        "GILT":             "Gilt",
-        "CREDIT RISK":      "Credit Risk",
-        "CORPORATE BOND":   "Corporate Bond",
-        "BANKING AND PSU":  "Banking & PSU",
-        "DYNAMIC BOND":     "Dynamic Bond",
-        "FLOATING RATE":    "Floating Rate",
-        "ARBITRAGE":        "Arbitrage",
-        "MULTI ASSET":      "Multi Asset",
-        "BALANCED ADVANTAGE":"Balanced Advantage",
-        "AGGRESSIVE HYBRID":"Aggressive Hybrid",
+        "ELSS":               "ELSS",
+        "LIQUID":             "Liquid",
+        "OVERNIGHT":          "Overnight",
+        "ULTRA SHORT":        "Ultra Short Duration",
+        "LOW DURATION":       "Low Duration",
+        "SHORT DURATION":     "Short Duration",
+        "MEDIUM DURATION":    "Medium Duration",
+        "LONG DURATION":      "Long Duration",
+        "GILT":               "Gilt",
+        "CREDIT RISK":        "Credit Risk",
+        "CORPORATE BOND":     "Corporate Bond",
+        "BANKING AND PSU":    "Banking & PSU",
+        "DYNAMIC BOND":       "Dynamic Bond",
+        "FLOATING RATE":      "Floating Rate",
+        "ARBITRAGE":          "Arbitrage",
+        "MULTI ASSET":        "Multi Asset",
+        "BALANCED ADVANTAGE": "Balanced Advantage",
+        "AGGRESSIVE HYBRID":  "Aggressive Hybrid",
         "CONSERVATIVE HYBRID":"Conservative Hybrid",
-        "EQUITY SAVINGS":   "Equity Savings",
-        "LARGE AND MID":    "Large & Mid Cap",
-        "LARGE CAP":        "Large Cap",
-        "MID CAP":          "Mid Cap",
-        "SMALL CAP":        "Small Cap",
-        "MULTI CAP":        "Multi Cap",
-        "FLEXI CAP":        "Flexi Cap",
-        "FOCUSED":          "Focused",
-        "CONTRA":           "Contra",
-        "VALUE":            "Value",
-        "DIVIDEND YIELD":   "Dividend Yield",
-        "THEMATIC":         "Thematic",
-        "SECTORAL":         "Sectoral",
-        "INDEX":            "Index",
-        "ETF":              "ETF",
-        "GOLD":             "Gold",
-        "SILVER":           "Silver",
-        "FUND OF FUND":     "Fund of Funds",
-        "FOF":              "Fund of Funds",
-        "INTERNATIONAL":    "International",
-        "OVERSEAS":         "International",
+        "EQUITY SAVINGS":     "Equity Savings",
+        "LARGE AND MID":      "Large & Mid Cap",
+        "LARGE CAP":          "Large Cap",
+        "MID CAP":            "Mid Cap",
+        "SMALL CAP":          "Small Cap",
+        "MULTI CAP":          "Multi Cap",
+        "FLEXI CAP":          "Flexi Cap",
+        "FOCUSED":            "Focused",
+        "CONTRA":             "Contra",
+        "VALUE":              "Value",
+        "DIVIDEND YIELD":     "Dividend Yield",
+        "THEMATIC":           "Thematic",
+        "SECTORAL":           "Sectoral",
+        "INDEX":              "Index",
+        "ETF":                "ETF",
+        "GOLD":               "Gold",
+        "SILVER":             "Silver",
+        "FUND OF FUND":       "Fund of Funds",
+        "FOF":                "Fund of Funds",
+        "INTERNATIONAL":      "International",
+        "OVERSEAS":           "International",
     }
     for key, cat in cats.items():
         if key in name_upper:
@@ -189,6 +189,11 @@ def parse_scheme_category(name):
 
 # ── Load Schemes Master into ClickHouse ────────────────
 def load_schemes_master(ch, schemes):
+    count = ch.query("SELECT count() FROM market.mf_schemes").result_rows[0][0]
+    if count > 0:
+        log.info(f"Schemes master already loaded ({count} rows), skipping")
+        return
+
     log.info("Loading scheme master list into ClickHouse...")
     today = date.today()
     rows  = []
@@ -215,7 +220,7 @@ def get_last_nav_date(ch, scheme_code):
         SELECT max(date) FROM market.mf_nav
         WHERE scheme_code = {scheme_code}
     """)
-    return result.result_rows[0][0]  # None if not loaded yet
+    return result.result_rows[0][0]
 
 
 # ── Fetch NAV History for One Scheme ──────────────────
@@ -224,7 +229,7 @@ def fetch_nav_history(scheme_code):
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("data", [])   # list of {date, nav}
+    return data.get("data", [])
 
 
 # ── Parse NAV Data ─────────────────────────────────────
@@ -270,7 +275,7 @@ def process_scheme(ch, scheme_code, scheme_name, idx, total):
 
         nav_list = fetch_nav_history(scheme_code)
         if not nav_list:
-            raise ValueError(f"No NAV data returned")
+            raise ValueError("No NAV data returned")
 
         rows = parse_nav_data(scheme_code, nav_list, last_date)
         if not rows:
@@ -304,15 +309,26 @@ def print_summary():
     print(f"⏭️  Skipped:  {len(results['skipped'])} (already up to date)")
     print(f"❌ Failed:   {len(results['failed'])}")
     if results["failed"]:
-        for f in results["failed"][:20]:   # show first 20 only
+        for f in results["failed"][:20]:
             print(f"   {f}")
         if len(results["failed"]) > 20:
             print(f"   ... and {len(results['failed']) - 20} more")
     print("=" * 55)
 
 
+# ── Worker (one per thread) ────────────────────────────
+def _worker(args):
+    idx, scheme = args
+    code = int(scheme["schemeCode"])
+    name = scheme["schemeName"]
+    ch   = get_ch_client()  # each thread gets its own connection
+    process_scheme(ch, code, name, idx, total)
+    time.sleep(DELAY_PER_REQUEST)
+
+
 # ── Main ───────────────────────────────────────────────
 def main():
+    global total
     log.info("=== Mutual Fund Pipeline Starting ===")
     log.info(f"Start time: {datetime.now()}")
 
@@ -323,19 +339,15 @@ def main():
     schemes = fetch_all_schemes()
     total   = len(schemes)
 
-    # Step 2 — load/refresh schemes master table
+    # Step 2 — load schemes master (skips if already loaded)
     load_schemes_master(ch, schemes)
 
-    # Step 3 — download NAV history for each scheme
+    # Step 3 — parallel NAV download
     log.info(f"\nDownloading NAV history for {total} schemes...")
-    log.info("This will take ~2-3 hours on first run (17000 schemes)")
-    log.info("On daily runs it will be fast (only new NAVs)\n")
+    log.info(f"Running with {MAX_WORKERS} parallel workers")
 
-    for idx, scheme in enumerate(schemes, 1):
-        code = int(scheme["schemeCode"])
-        name = scheme["schemeName"]
-        process_scheme(ch, code, name, idx, total)
-        time.sleep(DELAY_PER_REQUEST)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        executor.map(_worker, enumerate(schemes, 1))
 
     print_summary()
     log.info(f"End time: {datetime.now()}")
