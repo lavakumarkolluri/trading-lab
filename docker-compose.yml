@@ -141,6 +141,21 @@ services:
     entrypoint: ["python", "mf_aggregation.py"]
     command: []
 
+  cleanup_schemes:
+    build: ./pipeline
+    container_name: cleanup_schemes
+    environment:
+     - CH_HOST=clickhouse
+     - CH_PORT=8123
+     - CH_USER=default
+     - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "cleanup_schemes.py"]
+    command: []
+
 volumes:
   vscode-data:
   minio-data:
