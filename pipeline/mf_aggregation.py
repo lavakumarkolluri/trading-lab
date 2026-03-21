@@ -56,7 +56,7 @@ CH_PASS    = os.getenv("CH_PASSWORD", "")
 
 BATCH_SIZE        = 200          # schemes per batch log
 INSERT_CHUNK_SIZE = 50_000       # rows per ClickHouse insert
-WARMUP_DAYS       = 210          # extra lookback for SMA-200 warm-up
+WARMUP_DAYS       = 290          # extra lookback for SMA-200 warm-up
 DELAY_PER_SCHEME  = 0.0          # set > 0 to throttle CPU on small machines
 
 # ── Results tracker ────────────────────────────────────
