@@ -194,6 +194,18 @@ MARKETS = {
     ]
 }
 
+# ── Deduplicate NASDAQ 100 against US ─────────────────
+# ~70 symbols appear in both lists. Keep only symbols
+# unique to NASDAQ 100 to avoid double downloads and
+# duplicate rows in ClickHouse under different market values.
+_us_set = set(MARKETS["us"])
+MARKETS["nasdaq100"] = [s for s in MARKETS["nasdaq100"] if s not in _us_set]
+
+
+if __name__ == "__main__":
+    for market, symbols in MARKETS.items():
+        print(f"{market:12} → {len(symbols)} symbols")
+    print(f"{'TOTAL':12} → {sum(len(v) for v in MARKETS.values())} symbols")
 
 if __name__ == "__main__":
     for market, symbols in MARKETS.items():
