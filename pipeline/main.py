@@ -10,6 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from symbols import MARKETS
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ── Logging Setup ──────────────────────────────────────
 logging.basicConfig(
@@ -80,6 +81,7 @@ def fetch_all_watermarks(ch) -> dict:
 
 
 # ── Download Only New Data ─────────────────────────────
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def download_symbol(last_date, symbol, market):
     ticker = yf.Ticker(symbol)
 

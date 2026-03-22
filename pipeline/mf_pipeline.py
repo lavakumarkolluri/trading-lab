@@ -23,6 +23,8 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timedelta
+from tenacity import retry, stop_after_attempt, wait_exponential
+
 
 # ── Logging ────────────────────────────────────────────
 logging.basicConfig(
@@ -250,6 +252,7 @@ def fetch_all_nav_watermarks(ch) -> dict:
 
 
 # ── Fetch NAV History for One Scheme ──────────────────
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def fetch_nav_history(scheme_code):
     url  = f"{MFAPI_BASE}/{scheme_code}"
     resp = requests.get(url, timeout=15)
