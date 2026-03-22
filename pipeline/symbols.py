@@ -206,8 +206,3 @@ if __name__ == "__main__":
     for market, symbols in MARKETS.items():
         print(f"{market:12} → {len(symbols)} symbols")
     print(f"{'TOTAL':12} → {sum(len(v) for v in MARKETS.values())} symbols")
-
-if __name__ == "__main__":
-    for market, symbols in MARKETS.items():
-        print(f"{market:12} → {len(symbols)} symbols")
-    print(f"{'TOTAL':12} → {sum(len(v) for v in MARKETS.values())} symbols")
