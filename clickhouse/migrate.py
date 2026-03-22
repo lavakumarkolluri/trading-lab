@@ -178,9 +178,7 @@ def run_migrations(client):
             with open(filepath, "r") as f:
                 sql = f.read().strip()
 
-            statements = [s.strip() for s in sql.split(";") if s.strip()]
-            for statement in statements:
-                client.command(statement)
+            client.command(sql)
 
             duration = int((datetime.now() - start).total_seconds() * 1000)
             record_migration(client, migration_id, filename,
