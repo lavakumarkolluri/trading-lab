@@ -1,0 +1,16 @@
+# requirements.txt
+# Pinned from live pipeline image — 2026-03-21
+# To update: docker run --rm trading-lab-mf_aggregation pip freeze
+
+yfinance==1.2.0
+pandas==3.0.1
+numpy==2.4.3
+pyarrow==23.0.1
+minio==7.2.20
+clickhouse-connect==0.14.1
+boto3==1.42.73
+requests==2.32.5
+schedule==1.2.2
+
+# Added for QUAL-003 — retry logic
+tenacity==9.0.0
