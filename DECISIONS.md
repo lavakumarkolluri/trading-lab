@@ -89,7 +89,7 @@
 
 ## Decision 010 — Incremental Enrichment with Warm-up Window
 **Date:** 2026-03-21
-**Decision:** On incremental runs, `mf_aggregation.py` fetches from `(last_enriched_date - 210 days)` to ensure rolling windows (SMA-200 needs 200 rows) are correctly computed even when only a few new rows arrive.
+**Decision:** On incremental runs, `mf_aggregation.py` fetches from `(last_enriched_date - 290 days)` to ensure rolling windows (SMA-200 needs 200 rows) are correctly computed even when only a few new rows arrive.
 **Rationale:** Without warm-up, SMA-200 for newly arriving rows would be NaN because the rolling window only sees the new rows.
 **Trade-off:** Slightly more data read per run. Negligible at ClickHouse query speeds.
 
