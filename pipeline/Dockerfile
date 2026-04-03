@@ -6,5 +6,9 @@ COPY main.py .
 COPY symbols.py .
 COPY mf_pipeline.py .
 COPY mf_aggregation.py .
+COPY mf_db.py .
+COPY mf_compute_technical.py .
+COPY mf_compute_returns.py .
+COPY mf_compute_risk.py .
 COPY cleanup_schemes.py .
 CMD ["python", "main.py"]
