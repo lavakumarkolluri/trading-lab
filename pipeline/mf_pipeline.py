@@ -96,10 +96,16 @@ def fetch_all_schemes():
             resp = requests.get(
                 MFAPI_BASE,
                 timeout=120,
-                headers={"Accept-Encoding": "identity"}  # disable chunked — fixes HTTP/2 truncation
+                headers={"Accept-Encoding": "identity"},
+                stream=True  # stream to avoid truncation
             )
             resp.raise_for_status()
-            schemes = resp.json()
+            # Read in chunks and reassemble
+            content = b""
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    content += chunk
+            schemes = __import__("json").loads(content.decode("utf-8"))
             log.info(f"Total schemes from API  : {len(schemes)}")
             filtered = [s for s in schemes if is_relevant_scheme(s["schemeName"])]
             log.info(f"After Direct/Growth/ETF/FoF filter: {len(filtered)}")
