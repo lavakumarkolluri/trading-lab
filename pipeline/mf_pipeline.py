@@ -89,34 +89,21 @@ def assert_tables_exist(ch):
 
 
 # ── Fetch All Schemes from MFAPI ───────────────────────
-def fetch_all_schemes():
-    log.info("Fetching list of all mutual fund schemes from mfapi.in...")
-    for attempt in range(1, 6):
-        try:
-            resp = requests.get(
-                MFAPI_BASE,
-                timeout=120,
-                headers={"Accept-Encoding": "identity"},
-                stream=True  # stream to avoid truncation
-            )
-            resp.raise_for_status()
-            # Read in chunks and reassemble
-            content = b""
-            for chunk in resp.iter_content(chunk_size=65536):
-                if chunk:
-                    content += chunk
-            schemes = __import__("json").loads(content.decode("utf-8"))
-            log.info(f"Total schemes from API  : {len(schemes)}")
-            filtered = [s for s in schemes if is_relevant_scheme(s["schemeName"])]
-            log.info(f"After Direct/Growth/ETF/FoF filter: {len(filtered)}")
-            return filtered
-        except Exception as e:
-            log.warning(f"Attempt {attempt}/5 failed: {e}")
-            if attempt < 5:
-                wait = attempt * 10
-                log.info(f"Waiting {wait}s before retry...")
-                time.sleep(wait)
-    raise RuntimeError("Failed to fetch scheme list after 5 attempts")
+def fetch_schemes_from_db(ch) -> list[dict]:
+    """
+    Read scheme list from market.mf_schemes instead of hitting mfapi.in.
+    Falls back to API only if DB is empty.
+    """
+    result = ch.query(
+        "SELECT scheme_code, scheme_name FROM market.mf_schemes ORDER BY scheme_code"
+    )
+    if result.result_rows:
+        log.info(f"Loaded {len(result.result_rows)} schemes from DB (skipping API)")
+        return [{"schemeCode": str(row[0]), "schemeName": row[1]}
+                for row in result.result_rows]
+
+    log.info("DB empty — falling back to mfapi.in...")
+    return fetch_all_schemes_from_api()  # rename old function
 
 
 # ── Parse Fund House from Scheme Name ─────────────────
