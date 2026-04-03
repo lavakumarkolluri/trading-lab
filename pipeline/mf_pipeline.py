@@ -380,7 +380,7 @@ def main():
     assert_tables_exist(ch)
 
     # Fetch and filter schemes
-    schemes = fetch_all_schemes()
+    schemes = fetch_schemes_from_db(ch)
     total   = len(schemes)
 
     # Load schemes master (skips if already loaded)
