@@ -91,14 +91,12 @@ def assert_tables_exist(ch):
 # ── Fetch All Schemes from MFAPI ───────────────────────
 def fetch_all_schemes():
     log.info("Fetching list of all mutual fund schemes from mfapi.in...")
-    for attempt in range(1, 6):  # 5 attempts
+    for attempt in range(1, 6):
         try:
-            session = requests.Session()
-            session.mount("https://", requests.adapters.HTTPAdapter())
-            resp = session.get(
+            resp = requests.get(
                 MFAPI_BASE,
-                timeout=120,  # longer timeout for 5.6MB response
-                headers={"Accept-Encoding": "identity"}  # disable compression
+                timeout=120,
+                headers={"Accept-Encoding": "identity"}  # disable chunked — fixes HTTP/2 truncation
             )
             resp.raise_for_status()
             schemes = resp.json()
@@ -109,7 +107,7 @@ def fetch_all_schemes():
         except Exception as e:
             log.warning(f"Attempt {attempt}/5 failed: {e}")
             if attempt < 5:
-                wait = attempt * 10  # 10s, 20s, 30s, 40s
+                wait = attempt * 10
                 log.info(f"Waiting {wait}s before retry...")
                 time.sleep(wait)
     raise RuntimeError("Failed to fetch scheme list after 5 attempts")
