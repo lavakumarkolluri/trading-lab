@@ -26,6 +26,8 @@ NaN/undefined periods → 0.
 
 import numpy as np
 import pandas as pd
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 try:
     import numpy_financial as npf
