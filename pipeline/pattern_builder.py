@@ -118,7 +118,7 @@ SEED_PATTERNS = [
         "feature_version":  "v1",
         "conditions_json":  json.dumps({
             "sma_20_cross": {"eq": 1},
-            "vix_level":    {"between": [0.01, 16.0]},
+            "vix_level":    {"lte": 16.0},
         }),
         "created_by":       "system",
         "is_active":        1,
@@ -431,7 +431,7 @@ def run_pattern_matching(ch, patterns: list[dict],
             ch.command(
                 f"ALTER TABLE analysis.patterns UPDATE "
                 f"total_matches = {len(match_rows)}, "
-                f"version = {version_ts + 1} "
+                f"last_backtested = today() "
                 f"WHERE pattern_id = '{pid}' "
                 f"SETTINGS mutations_sync = 0"
             )
