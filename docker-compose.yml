@@ -185,6 +185,21 @@ services:
     entrypoint: ["python", "pattern_feature_extractor.py"]
     command: []
 
+  pattern_builder:
+    build: ./pipeline
+    container_name: pattern_builder
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "pattern_builder.py"]
+    command: []
+
 volumes:
   vscode-data:
   minio-data:
