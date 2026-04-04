@@ -14,4 +14,5 @@ COPY cleanup_schemes.py .
 COPY event_detector.py .
 COPY pattern_feature_extractor.py .
 COPY pattern_builder.py .
+COPY backtest_engine.py .
 CMD ["python", "main.py"]
