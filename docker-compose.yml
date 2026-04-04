@@ -215,6 +215,21 @@ services:
     entrypoint: ["python", "backtest_engine.py"]
     command: []
 
+  star_rater:
+    build: ./pipeline
+    container_name: star_rater
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "star_rater.py"]
+    command: []
+
 volumes:
   vscode-data:
   minio-data:

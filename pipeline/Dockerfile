@@ -15,4 +15,5 @@ COPY event_detector.py .
 COPY pattern_feature_extractor.py .
 COPY pattern_builder.py .
 COPY backtest_engine.py .
+COPY star_rater.py .
 CMD ["python", "main.py"]
