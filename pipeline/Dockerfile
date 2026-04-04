@@ -11,4 +11,4 @@ COPY mf_compute_technical.py .
 COPY mf_compute_returns.py .
 COPY mf_compute_risk.py .
 COPY cleanup_schemes.py .
-CMD ["python", "main.py"]
+CMD ["python", "main.py"]COPY event_detector.py .

@@ -1,4 +1,4 @@
-CREATE TABLE market.mf_schemes
+CREATE TABLE IF NOT EXISTS market.mf_schemes
 (
     scheme_code     UInt32,
     scheme_name     String,
