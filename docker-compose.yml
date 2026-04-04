@@ -145,15 +145,30 @@ services:
     build: ./pipeline
     container_name: cleanup_schemes
     environment:
-     - CH_HOST=clickhouse
-     - CH_PORT=8123
-     - CH_USER=default
-     - CH_PASSWORD=${CH_PASSWORD}
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
     depends_on:
       clickhouse:
         condition: service_healthy
     restart: "no"
     entrypoint: ["python", "cleanup_schemes.py"]
+    command: []
+
+  event_detector:
+    build: ./pipeline
+    container_name: event_detector
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "event_detector.py"]
     command: []
 
 volumes:
