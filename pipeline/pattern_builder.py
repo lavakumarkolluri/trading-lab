@@ -102,7 +102,7 @@ SEED_PATTERNS = [
         "feature_version":  "v1",
         "conditions_json":  json.dumps({
             "rsi_14":    {"lt": 35},
-            "volume_z5": {"gt": 2.0},
+            "volume_z5": {"gt": 1.5},
         }),
         "created_by":       "system",
         "is_active":        1,
