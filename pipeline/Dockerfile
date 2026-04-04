@@ -13,4 +13,5 @@ COPY mf_compute_risk.py .
 COPY cleanup_schemes.py .
 COPY event_detector.py .
 COPY pattern_feature_extractor.py .
+COPY pattern_builder.py .
 CMD ["python", "main.py"]
