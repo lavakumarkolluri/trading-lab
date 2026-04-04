@@ -125,13 +125,16 @@ def fetch_unprocessed_events(ch, symbol=None, market=None,
 
 
 def fetch_ohlcv_history(ch, symbol: str, market: str,
-                        up_to_date: date) -> pd.DataFrame:
+                        from_date: date,
+                        to_date: date) -> pd.DataFrame:
     """
-    Fetch OHLCV for one symbol from (up_to_date - HISTORY_DAYS) to up_to_date - 1.
-    We fetch up to (event_date - 1) only — no lookahead.
+    Fetch OHLCV for one symbol between from_date and to_date (inclusive).
+    Caller is responsible for setting to_date = max(event_dates) so that
+    all event slices within the batch have full history available.
+    The per-event slice cutoff (event_date - 1) is applied by the caller.
     """
-    fetch_from = up_to_date - timedelta(days=HISTORY_DAYS)
-    fetch_to   = up_to_date - timedelta(days=1)
+    fetch_from = from_date
+    fetch_to   = to_date
 
     result = ch.query(
         "SELECT date, open, high, low, close, volume "
@@ -542,10 +545,13 @@ def process_symbol_events(symbol: str,
     processed_dates = []
 
     try:
-        # Fetch one contiguous OHLCV block for this symbol
-        # wide enough to cover all event dates + their lookback windows
+        # Fetch one contiguous OHLCV block for this symbol covering:
+        #   from: earliest_event - HISTORY_DAYS (warm-up for rolling windows)
+        #   to  : max(event_dates) (so every event's slice has up-to-date data)
         earliest_event = min(event_dates)
-        df_ohlcv = fetch_ohlcv_history(ch, symbol, market, earliest_event)
+        latest_event   = max(event_dates)
+        fetch_from     = earliest_event - timedelta(days=HISTORY_DAYS)
+        df_ohlcv = fetch_ohlcv_history(ch, symbol, market, fetch_from, latest_event)
 
         if df_ohlcv.empty:
             with results_lock:
