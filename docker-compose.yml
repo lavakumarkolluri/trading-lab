@@ -245,6 +245,21 @@ services:
     entrypoint: ["python", "prediction_engine.py"]
     command: []
 
+  validation_engine:
+    build: ./pipeline
+    container_name: validation_engine
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "validation_engine.py"]
+    command: []
+
 volumes:
   vscode-data:
   minio-data:

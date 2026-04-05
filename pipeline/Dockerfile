@@ -17,4 +17,5 @@ COPY pattern_builder.py .
 COPY backtest_engine.py .
 COPY star_rater.py .
 COPY prediction_engine.py .
+COPY validation_engine.py .
 CMD ["python", "main.py"]
