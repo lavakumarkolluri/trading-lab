@@ -48,7 +48,6 @@ import argparse
 import threading
 from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor
-
 import pandas as pd
 import clickhouse_connect
 
