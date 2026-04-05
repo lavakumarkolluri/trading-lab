@@ -396,7 +396,7 @@ def fetch_context(ch, as_of_date: date) -> tuple[float, str, float, float]:
         )
         v = r.result_rows[0][0]
         if v:
-            vix_level = float(v)
+            vix_level = float(v) if v is not None and v == v else 0.0  # guard NaN
     except Exception:
         pass
 

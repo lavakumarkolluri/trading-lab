@@ -254,7 +254,7 @@ def rate_pattern(row: pd.Series,
         }
 
     if sharpe < -0.5:
-        reason = f"Actively harmful pattern (sharpe={sharpe:.2f} < -1.0)"
+        reason = f"Actively harmful pattern (sharpe={sharpe:.2f} < -0.5)"
         if verbose:
             log.info(f"  [{pid}] {label}")
             log.info(f"  → ★ (suppressed: {reason})")
