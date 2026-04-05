@@ -18,4 +18,5 @@ COPY backtest_engine.py .
 COPY star_rater.py .
 COPY prediction_engine.py .
 COPY validation_engine.py .
+COPY meta_pipeline.py .
 CMD ["python", "main.py"]

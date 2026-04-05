@@ -260,6 +260,23 @@ services:
     entrypoint: ["python", "validation_engine.py"]
     command: []
 
+  meta_pipeline:
+    build: ./pipeline
+    container_name: meta_pipeline
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "meta_pipeline.py"]
+    command: []
+
 volumes:
   vscode-data:
   minio-data:
