@@ -423,7 +423,7 @@ def fetch_context(ch, as_of_date: date) -> tuple[float, str, float, float]:
             latest = rows[0][1]
             oldest = rows[-1][1]
             if oldest > 0:
-                nifty_5d = round((latest - oldest) / oldest * 100, 4)
+                nifty_5d = round((latest - oldest) / oldest * 100, 4) if oldest and not (oldest != oldest) and not (latest != latest) else 0.0
     except Exception:
         pass
 
