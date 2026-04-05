@@ -623,11 +623,9 @@ def main():
         as_of_date = date.fromisoformat(args.date)
     else:
         as_of_date = date.today()
+    # Next trading day — skip weekends entirely
     target_date = as_of_date + timedelta(days=1)
-    # Skip weekends for target
-    if target_date.weekday() == 5:   # Saturday
-        target_date += timedelta(days=2)
-    elif target_date.weekday() == 6: # Sunday
+    while target_date.weekday() >= 5:   # 5=Saturday, 6=Sunday
         target_date += timedelta(days=1)
 
     log.info("=== Prediction Engine Starting ===")
