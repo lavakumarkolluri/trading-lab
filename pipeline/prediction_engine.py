@@ -97,12 +97,15 @@ def fetch_eligible_patterns(ch) -> list[dict]:
     result = ch.query(
         "SELECT r.pattern_id, p.label, p.conditions_json, "
         "       r.stars, r.win_rate, r.recency_score "
-        "FROM analysis.pattern_ratings FINAL r "
-        "JOIN analysis.patterns FINAL p ON r.pattern_id = p.pattern_id "
-        "WHERE r.symbol = '*' "
-        "  AND r.stars >= {min_stars:UInt8} "
-        "  AND r.needs_more_data = 0 "
-        "  AND p.is_active = 1 "
+        "FROM (SELECT pattern_id, stars, win_rate, recency_score "
+        "      FROM analysis.pattern_ratings FINAL "
+        "      WHERE symbol = '*' "
+        "        AND stars >= {min_stars:UInt8} "
+        "        AND needs_more_data = 0) AS r "
+        "JOIN (SELECT pattern_id, label, conditions_json "
+        "      FROM analysis.patterns FINAL "
+        "      WHERE is_active = 1) AS p "
+        "ON r.pattern_id = p.pattern_id "
         "ORDER BY r.stars DESC",
         parameters={"min_stars": MIN_STARS}
     )
