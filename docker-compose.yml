@@ -277,6 +277,21 @@ services:
     entrypoint: ["python", "meta_pipeline.py"]
     command: []
 
+  holidays_pipeline:
+    build: ./pipeline
+    container_name: holidays_pipeline
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "holidays_pipeline.py"]
+    command: []
+
 volumes:
   vscode-data:
   minio-data:

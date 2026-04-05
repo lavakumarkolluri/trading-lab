@@ -46,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import clickhouse_connect
+from holidays_pipeline import next_trading_day, is_trading_day
 
 # ── Logging ────────────────────────────────────────────
 logging.basicConfig(
@@ -423,7 +424,7 @@ def fetch_context(ch, as_of_date: date) -> tuple[float, str, float, float]:
             latest = rows[0][1]
             oldest = rows[-1][1]
             if oldest > 0:
-                nifty_5d = round((latest - oldest) / oldest * 100, 4) if oldest and not (oldest != oldest) and not (latest != latest) else 0.0
+                nifty_5d = round((latest - oldest) / oldest * 100, 4)
     except Exception:
         pass
 
@@ -623,10 +624,9 @@ def main():
         as_of_date = date.fromisoformat(args.date)
     else:
         as_of_date = date.today()
-    # Next trading day — skip weekends entirely
-    target_date = as_of_date + timedelta(days=1)
-    while target_date.weekday() >= 5:   # 5=Saturday, 6=Sunday
-        target_date += timedelta(days=1)
+    # Next trading day — skip weekends AND NSE holidays
+    ch_tmp      = get_ch_client()
+    target_date = next_trading_day(as_of_date, ch_tmp)
 
     log.info("=== Prediction Engine Starting ===")
     log.info(f"Prediction date : {as_of_date}")

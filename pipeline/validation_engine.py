@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import clickhouse_connect
+from holidays_pipeline import is_trading_day, next_trading_day
 
 # ── Logging ────────────────────────────────────────────
 logging.basicConfig(
