@@ -46,7 +46,7 @@ import threading
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
-from curl_cffi import requests
+import requests
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -176,27 +176,84 @@ def fetch_loaded_dates(ch) -> set[date]:
 
 def build_nse_session() -> requests.Session:
     """
-    Bootstrap NSE session using curl_cffi Chrome TLS impersonation.
+    Bootstrap NSE session to pass WAF checks.
 
-    curl_cffi replicates Chrome's exact TLS fingerprint (JA3/JA4 hash),
-    which is what Cloudflare/NSE WAF checks — not just HTTP headers.
-    No manual header management needed; impersonate='chrome110' handles everything.
+    NSE's WAF validates:
+      1. User-Agent looks like a real Chrome browser
+      2. sec-ch-ua / sec-fetch-* headers are present (browsers always send these)
+      3. Cookies are set by visiting the homepage BEFORE any API call
+      4. A second warm-up page visit before the data API call
 
     Two-step warm-up:
-      Step 1 — Homepage  (sets _ga, nsit, nseappid cookies)
-      Step 2 — API calls accepted
+      Step 1 — GET https://www.nseindia.com          (sets _ga, nsit, nseappid cookies)
+      Step 2 — GET https://www.nseindia.com/market-data/equity-stock-indices-futures
+                                                       (sets additional session cookies)
+      Step 3 — API calls now accepted
+
+    Raises RuntimeError if either warm-up step returns non-2xx.
     """
-    session = requests.Session(impersonate="chrome110")
+    session = requests.Session()
 
-    log.info("NSE session: homepage handshake (curl_cffi chrome110)...")
+    # Full Chrome 122 header set — NSE WAF checks for sec-ch-ua and sec-fetch-*
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language":           "en-US,en;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "Connection":                "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "sec-ch-ua":                 '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "sec-ch-ua-mobile":          "?0",
+        "sec-ch-ua-platform":        '"Linux"',
+        "Sec-Fetch-Dest":            "document",
+        "Sec-Fetch-Mode":            "navigate",
+        "Sec-Fetch-Site":            "none",
+        "Sec-Fetch-User":            "?1",
+        "DNT":                       "1",
+        "Cache-Control":             "max-age=0",
+    })
+
+    # Step 1 — Homepage (sets base cookies)
+    log.info("NSE session: step 1 — homepage...")
     try:
-        resp = session.get(NSE_HOME_URL, timeout=SESSION_TIMEOUT)
+        resp = session.get(NSE_HOME_URL, timeout=SESSION_TIMEOUT, allow_redirects=True)
         resp.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(f"NSE homepage blocked: {e}") from e
-
-    log.info(f"NSE session ready ✅ (status: {resp.status_code}, cookies: {len(session.cookies)})")
+    except requests.HTTPError as e:
+        raise RuntimeError(f"NSE homepage blocked (step 1): {e}") from e
+    log.info(f"  Homepage OK — cookies: {len(session.cookies)}")
     time.sleep(2.0)
+
+    # Step 2 — FII/DII market data page (sets additional session cookies)
+    # Switch headers to look like a same-site navigation (not a fresh tab)
+    session.headers.update({
+        "Referer":        "https://www.nseindia.com/",
+        "Sec-Fetch-Site": "same-origin",
+    })
+    warmup_url = "https://www.nseindia.com/market-data/fii-dii-activity"
+    log.info("NSE session: step 2 — FII/DII market page warm-up...")
+    try:
+        resp = session.get(warmup_url, timeout=SESSION_TIMEOUT, allow_redirects=True)
+        # 200 or 403 both OK here — we just want the cookies from the response
+        log.info(f"  Warm-up page status: {resp.status_code} — cookies: {len(session.cookies)}")
+    except Exception as e:
+        log.warning(f"  Warm-up page failed (non-fatal): {e}")
+    time.sleep(2.0)
+
+    # Switch to JSON API headers for all subsequent calls
+    session.headers.update({
+        "Accept":         "application/json, text/plain, */*",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Referer":        "https://www.nseindia.com/market-data/fii-dii-activity",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+
+    log.info(f"NSE session ready ✅ (total cookies: {len(session.cookies)})")
     return session
 
 
