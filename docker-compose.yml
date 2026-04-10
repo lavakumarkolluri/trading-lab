@@ -308,6 +308,22 @@ services:
     entrypoint: ["python", "fii_dii_pipeline.py"]
     command: []
 
+  participant_oi_pipeline:
+    build: ./pipeline
+    container_name: participant_oi_pipeline
+    network_mode: host
+    environment:
+      - CH_HOST=localhost
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - MINIO_HOST=localhost:9000
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
+    restart: "no"
+    entrypoint: ["python", "participant_oi_pipeline.py"]
+    command: []
+
 volumes:
   vscode-data:
   minio-data:

@@ -21,4 +21,5 @@ COPY validation_engine.py .
 COPY meta_pipeline.py .
 COPY holidays_pipeline.py .
 COPY fii_dii_pipeline.py .
+COPY participant_oi_pipeline.py .
 CMD ["python", "main.py"]
