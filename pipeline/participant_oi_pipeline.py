@@ -61,7 +61,9 @@ CH_PASS = os.getenv("CH_PASSWORD", "")
 
 MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
 MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD", "password123")
+MINIO_PASS = os.getenv("MINIO_PASSWORD")
+if not MINIO_PASS:
+    raise RuntimeError("MINIO_PASSWORD env var not set — refusing to start")
 MINIO_BUCKET = "trading-data"
 
 NSE_ARCHIVE_URL = (
