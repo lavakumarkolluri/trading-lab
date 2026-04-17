@@ -40,7 +40,7 @@ import argparse
 import threading
 from datetime import datetime, date, timedelta
 
-import requests
+from curl_cffi import requests
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -155,25 +155,9 @@ def fetch_staged_dates(ch) -> set:
 
 # NSE session
 
-def build_nse_session() -> requests.Session:
-    """
-    Plain requests session with homepage warm-up.
-    Grabs nsit + nseappid cookies so the API accepts our calls.
-    No curl_cffi or TLS fingerprinting required.
-    """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept":          "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer":         "https://www.nseindia.com/",
-    })
-
-    log.info("NSE session: homepage warm-up...")
+def build_nse_session():
+    session = requests.Session(impersonate="chrome110")
+    log.info("NSE session: homepage warm-up (curl_cffi chrome110)...")
     resp = session.get(NSE_HOME_URL, timeout=SESSION_TIMEOUT)
     resp.raise_for_status()
     log.info(f"NSE session ready (cookies: {len(session.cookies)})")
