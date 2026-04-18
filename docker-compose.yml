@@ -333,6 +333,38 @@ services:
     entrypoint: ["python", "participant_oi_pipeline.py"]
     command: []
 
+  gap_analyzer:
+    build: ./pipeline
+    container_name: gap_analyzer
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - GAP_LLM_ENABLED=${GAP_LLM_ENABLED:-false}
+      - GAP_LLM_MODEL=${GAP_LLM_MODEL:-claude-sonnet-4-6}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "gap_analyzer.py"]
+    command: []
+
+  scheduler:
+    build: ./pipeline
+    container_name: scheduler
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/trading-lab:ro
+    environment:
+      - COMPOSE_FILE=/trading-lab/docker-compose.yml
+      - TZ=UTC
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    restart: unless-stopped
+    entrypoint: ["python", "scheduler.py"]
+
 volumes:
   vscode-data:
   minio-data:

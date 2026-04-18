@@ -21,6 +21,7 @@ Weekly (Sundays):
   Step 11  — Pattern builder --full                  full pattern remap
   Step 12  — Backtest engine --full                  full backtest refresh
   Step 13  — Star rater (post-full-backtest)         refresh ratings
+  Step 14  — Gap analyzer                            FN/FP rate analysis (OPS-002/DATA-005)
 
 COMPOSE_CMD fix [BUG-001]:
   The pipeline image now includes docker-ce-cli (see Dockerfile).
@@ -48,12 +49,39 @@ import argparse
 import subprocess
 from datetime import datetime, date
 
+try:
+    import urllib.request
+    import json as _json
+    _URLLIB_OK = True
+except ImportError:
+    _URLLIB_OK = False
+
 # ── Logging ────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 log = logging.getLogger(__name__)
+
+# ── Telegram alerting (OPS-003) ────────────────────────
+_TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+def _send_telegram(message: str):
+    if not (_TG_TOKEN and _TG_CHAT_ID and _URLLIB_OK):
+        return
+    try:
+        payload = _json.dumps({"chat_id": _TG_CHAT_ID, "text": message}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        log.warning("Telegram alert failed: %s", e)
+
 
 # ── Config ─────────────────────────────────────────────
 # BUG-001 FIX: use --project-directory so docker compose can locate the
@@ -204,6 +232,16 @@ WEEKLY_STEPS = [
         "args":        [],
         "skippable":   False,
     },
+    # ── OPS-002 / DATA-005: gap analyzer closes the feedback loop ─────────
+    {
+        "step":        14,
+        "name":        "Gap Analyzer",
+        "description": "Measure false negative / false positive rates; optional LLM diagnosis",
+        "service":     "gap_analyzer",
+        "args":        [],
+        "skippable":   False,
+        "soft_fail":   True,   # analysis failure must not block prediction pipeline
+    },
 ]
 
 
@@ -253,19 +291,24 @@ def run_step(step: dict, dry_run: bool) -> bool:
                 )
                 return True
             else:
+                msg = f"❌ Trading pipeline Step {step_n} ({name}) FAILED (exit {result.returncode})"
                 err(f"Step {step_n} FAILED (exit code {result.returncode})")
+                _send_telegram(msg)
                 return False
 
     except FileNotFoundError:
+        msg = f"❌ Trading pipeline Step {step_n} ({name}) FAILED — docker binary not found"
         err(
             f"Step {step_n} FAILED — 'docker' binary not found.\n"
             f"  Ensure the pipeline Docker image was rebuilt after adding\n"
             f"  docker-ce-cli to the Dockerfile (see BUG-001 fix).\n"
             f"  Rebuild with: docker compose build pipeline"
         )
+        _send_telegram(msg)
         return False
     except Exception as e:
         err(f"Step {step_n} FAILED — {e}")
+        _send_telegram(f"❌ Trading pipeline Step {step_n} ({name}) FAILED — {e}")
         return False
 
 
