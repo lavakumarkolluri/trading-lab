@@ -26,6 +26,7 @@ import sys
 import logging
 import argparse
 from datetime import datetime, date, timedelta
+from datetime import timezone
 
 import requests
 import pandas as pd
@@ -206,16 +207,23 @@ def seed_holidays(ch, holidays: list[dict], source: str = "hardcoded"):
 # Imported by: prediction_engine.py, validation_engine.py
 # ══════════════════════════════════════════════════════
 
-# Module-level cache — populated on first call
-_holiday_cache: set[date] = set()
-_cache_loaded:  bool      = False
+# Module-level cache — populated on first call, invalidated after 24h (OPS-004)
+_holiday_cache:     set[date]          = set()
+_cache_loaded:      bool               = False
+_cache_loaded_at:   datetime | None    = None
+_CACHE_TTL_SECONDS: int                = 86_400   # 24 hours
 
 
 def _load_holiday_cache(ch=None):
     """Load all full_closure holidays into module-level cache."""
-    global _holiday_cache, _cache_loaded
-    if _cache_loaded:
-        return
+    global _holiday_cache, _cache_loaded, _cache_loaded_at
+    now = datetime.now(timezone.utc)
+    if _cache_loaded and _cache_loaded_at is not None:
+        age = (now - _cache_loaded_at).total_seconds()
+        if age < _CACHE_TTL_SECONDS:
+            return
+        # TTL expired — force reload
+        _cache_loaded = False
 
     try:
         if ch is None:
@@ -225,14 +233,16 @@ def _load_holiday_cache(ch=None):
             "SELECT holiday_date FROM market.trading_holidays FINAL "
             "WHERE exchange = 'NSE' AND holiday_type = 'full_closure'"
         )
-        _holiday_cache = {row[0] for row in result.result_rows}
-        _cache_loaded  = True
+        _holiday_cache   = {row[0] for row in result.result_rows}
+        _cache_loaded    = True
+        _cache_loaded_at = datetime.now(timezone.utc)
         log.debug(f"Holiday cache loaded: {len(_holiday_cache)} dates")
 
     except Exception as e:
         log.warning(f"Could not load holiday cache: {e}. Using empty cache.")
-        _holiday_cache = set()
-        _cache_loaded  = True
+        _holiday_cache   = set()
+        _cache_loaded    = True
+        _cache_loaded_at = datetime.now(timezone.utc)
 
 
 def is_trading_day(d: date, ch=None) -> bool:

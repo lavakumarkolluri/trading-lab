@@ -146,7 +146,7 @@ def main():
     ch.command(
         f"ALTER TABLE market.mf_schemes DELETE "
         f"WHERE scheme_code IN ({delete_codes}) "
-        f"SETTINGS mutations_sync = 1"
+        f"SETTINGS mutations_sync = 0"
     )
     log.info("✅ market.mf_schemes cleaned")
 
@@ -154,7 +154,7 @@ def main():
     ch.command(
         f"ALTER TABLE market.mf_nav DELETE "
         f"WHERE scheme_code IN ({delete_codes}) "
-        f"SETTINGS mutations_sync = 1"
+        f"SETTINGS mutations_sync = 0"
     )
     log.info("✅ market.mf_nav cleaned")
 
@@ -162,7 +162,7 @@ def main():
     ch.command(
         f"ALTER TABLE market.mf_nav_enriched DELETE "
         f"WHERE scheme_code IN ({delete_codes}) "
-        f"SETTINGS mutations_sync = 1"
+        f"SETTINGS mutations_sync = 0"
     )
     log.info("✅ market.mf_nav_enriched cleaned")
 
