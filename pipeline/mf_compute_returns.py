@@ -26,8 +26,6 @@ NaN/undefined periods → 0.
 
 import numpy as np
 import pandas as pd
-import warnings
-warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 try:
     import numpy_financial as npf
@@ -100,18 +98,24 @@ def _xirr_newton(cashflows: list[float], dates: list,
 
     rate = guess
     for _ in range(max_iter):
-        try:
-            npv  = sum(cf / (1 + rate) ** t for cf, t in zip(cashflows, fracs))
-            dnpv = sum(-t * cf / (1 + rate) ** (t + 1)
-                       for cf, t in zip(cashflows, fracs))
-            if abs(dnpv) < 1e-12:
-                return 0.0
-            rate_new = rate - npv / dnpv
-            if abs(rate_new - rate) < tol:
-                return rate_new if -1 < rate_new < 10 else 0.0
-            rate = rate_new
-        except (ZeroDivisionError, OverflowError):
+        # BUG-005: guard against invalid domain before exponentiation.
+        # (1 + rate) must be positive; rate <= -1 causes ZeroDivisionError
+        # or complex results with fractional exponents.
+        if rate <= -1:
             return 0.0
+        try:
+            with np.errstate(over="raise", invalid="raise"):
+                npv  = sum(cf / (1 + rate) ** t for cf, t in zip(cashflows, fracs))
+                dnpv = sum(-t * cf / (1 + rate) ** (t + 1)
+                           for cf, t in zip(cashflows, fracs))
+        except (ZeroDivisionError, OverflowError, FloatingPointError):
+            return 0.0
+        if abs(dnpv) < 1e-12:
+            return 0.0
+        rate_new = rate - npv / dnpv
+        if abs(rate_new - rate) < tol:
+            return rate_new if -1 < rate_new < 10 else 0.0
+        rate = rate_new
     return 0.0
 
 
