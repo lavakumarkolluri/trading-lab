@@ -379,43 +379,56 @@ def update_pattern_stats(ch, pattern_id: str, stats: dict):
     """
     Update analysis.patterns with aggregated backtest stats.
 
-    SEC-001 FIX:
-    - pattern_id validated against strict allowlist regex before use in query
-    - All numeric stat values explicitly cast to int/float before f-string
-      interpolation — Python typed numbers cannot carry SQL injection payloads
+    BUG-004 / PERF-001 FIX: replaced ALTER TABLE UPDATE with a re-insert.
+    ALTER UPDATE on ReplacingMergeTree can conflict with deduplication merges
+    (Decision 026). Re-inserting with a fresh version timestamp is the correct
+    pattern: the ReplacingMergeTree keeps the row with the highest version.
+
+    SEC-001: pattern_id still validated; numeric values cast before use.
     """
     if not stats:
         return
 
-    # Validate pattern_id — rejects anything containing SQL-special characters
     _validate_id(pattern_id, "pattern_id")
 
-    # Explicit type casts — prevents any accidental string interpolation
-    total_matches   = int(stats["total_matches"])
-    win_rate_1d     = float(stats["win_rate_1d"])
-    win_rate_3d     = float(stats["win_rate_3d"])
-    win_rate_5d     = float(stats["win_rate_5d"])
-    avg_return_1d   = float(stats["avg_return_1d"])
-    avg_return_3d   = float(stats["avg_return_3d"])
-    avg_return_5d   = float(stats["avg_return_5d"])
-    sharpe_1d       = float(stats["sharpe_1d"])
-    max_drawdown_3d = float(stats["max_drawdown_3d"])
-
-    ch.command(
-        f"ALTER TABLE analysis.patterns UPDATE "
-        f"  total_matches   = {total_matches}, "
-        f"  win_rate_1d     = {win_rate_1d}, "
-        f"  win_rate_3d     = {win_rate_3d}, "
-        f"  win_rate_5d     = {win_rate_5d}, "
-        f"  avg_return_1d   = {avg_return_1d}, "
-        f"  avg_return_3d   = {avg_return_3d}, "
-        f"  avg_return_5d   = {avg_return_5d}, "
-        f"  sharpe_1d       = {sharpe_1d}, "
-        f"  max_drawdown_3d = {max_drawdown_3d}, "
-        f"  last_backtested = today() "
-        f"WHERE pattern_id = '{pattern_id}' "
-        f"SETTINGS mutations_sync = 0"
+    # Fetch the full current row so we preserve all non-stat columns
+    result = ch.query(
+        "SELECT pattern_id, label, description, hypothesis, feature_version, "
+        "       conditions_json, created_at, created_by, is_active "
+        "FROM analysis.patterns FINAL "
+        "WHERE pattern_id = {pid:String}",
+        parameters={"pid": pattern_id}
     )
+    if not result.result_rows:
+        log.warning(f"update_pattern_stats: pattern {pattern_id!r} not found — skipping")
+        return
+
+    row = result.result_rows[0]
+    now = datetime.now()
+
+    insert_row = {
+        "pattern_id":      row[0],
+        "label":           row[1],
+        "description":     row[2],
+        "hypothesis":      row[3],
+        "feature_version": row[4],
+        "conditions_json": row[5],
+        "total_matches":   int(stats["total_matches"]),
+        "win_rate_1d":     float(stats["win_rate_1d"]),
+        "win_rate_3d":     float(stats["win_rate_3d"]),
+        "win_rate_5d":     float(stats["win_rate_5d"]),
+        "avg_return_1d":   float(stats["avg_return_1d"]),
+        "avg_return_3d":   float(stats["avg_return_3d"]),
+        "avg_return_5d":   float(stats["avg_return_5d"]),
+        "sharpe_1d":       float(stats["sharpe_1d"]),
+        "max_drawdown_3d": float(stats["max_drawdown_3d"]),
+        "last_backtested": now.date(),
+        "created_at":      row[6],
+        "created_by":      row[7],
+        "is_active":       int(row[8]),
+        "version":         int(now.timestamp()),
+    }
+    ch.insert_df("analysis.patterns", pd.DataFrame([insert_row]))
 
 
 # ══════════════════════════════════════════════════════
