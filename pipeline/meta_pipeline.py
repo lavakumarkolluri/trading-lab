@@ -6,30 +6,33 @@ Daily orchestrator for the meta-learning trading system.
 Runs all pipeline components in the correct sequence after market close.
 
 Sequence:
-  Step 1  — OHLCV pipeline (main.py)              fetch today's market data
-  Step 2  — Event detector                         detect today's ≥2% moves
-  Step 3  — Pattern feature extractor              compute features for new events
-  Step 4  — Validation engine                      validate yesterday's predictions
-  Step 5  — Pattern builder (incremental)          map new events to patterns
-  Step 6  — Backtest engine (incremental)          backtest new pattern matches
-  Step 7  — Star rater                             refresh pattern ratings
-  Step 8  — Prediction engine                      generate tomorrow's predictions
-  Step 9  — [Weekly] Pattern builder --full        full pattern remap (Sundays)
-  Step 10 — [Weekly] Backtest engine --full        full backtest refresh (Sundays)
+  Step  1  — OHLCV pipeline (main.py)              fetch today's market data
+  Step  2  — FII/DII pipeline                       fetch today's FII/DII flows   [OPS-006]
+  Step  3  — Participant OI pipeline                 fetch today's F&O OI          [OPS-005]
+  Step  4  — Event detector                          detect today's ≥2% moves
+  Step  5  — Pattern feature extractor               compute features for new events
+  Step  6  — Validation engine                       validate yesterday's predictions
+  Step  7  — Pattern builder (incremental)           map new events to patterns
+  Step  8  — Backtest engine (incremental)           backtest new pattern matches
+  Step  9  — Star rater                              refresh pattern ratings
+  Step 10  — Prediction engine                       generate tomorrow's predictions
 
-Each step is run as a subprocess using docker compose run.
-If a step fails, the pipeline stops and reports which step failed.
-Steps 4–8 are skipped gracefully if no data is available yet.
+Weekly (Sundays):
+  Step 11  — Pattern builder --full                  full pattern remap
+  Step 12  — Backtest engine --full                  full backtest refresh
+  Step 13  — Star rater (post-full-backtest)         refresh ratings
 
-Schedule recommendation:
-  Run at 4:30 PM IST on weekdays (Mon–Fri) after OHLCV data is available.
-  On Sundays: run weekly refresh (Steps 9–10) to keep patterns up to date.
+COMPOSE_CMD fix [BUG-001]:
+  The pipeline image now includes docker-ce-cli (see Dockerfile).
+  COMPOSE_FILE env var (set in docker-compose.yml) tells the CLI where to find
+  the compose file when running inside the container.
 
 Usage:
   python meta_pipeline.py                  # full daily run
   python meta_pipeline.py --skip-ohlcv    # skip OHLCV fetch (already done)
-  python meta_pipeline.py --weekly         # run weekly refresh steps only
-  python meta_pipeline.py --dry-run        # show steps without executing
+  python meta_pipeline.py --skip-fii      # skip FII/DII fetch
+  python meta_pipeline.py --weekly        # run weekly refresh steps only
+  python meta_pipeline.py --dry-run       # show steps without executing
   python meta_pipeline.py --from-step 4   # resume from a specific step
 
 Docker usage (recommended):
@@ -53,7 +56,20 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────
-COMPOSE_CMD = ["docker", "compose", "run", "--rm"]
+# BUG-001 FIX: use --project-directory so docker compose can locate the
+# compose file and resolve relative build paths correctly when called from
+# inside the pipeline container (where CWD is /app, not the project root).
+# COMPOSE_FILE env var is set in docker-compose.yml for the meta_pipeline
+# service, pointing to /trading-lab/docker-compose.yml.
+_COMPOSE_FILE = os.getenv("COMPOSE_FILE", "docker-compose.yml")
+_PROJECT_DIR  = os.path.dirname(_COMPOSE_FILE) if "/" in _COMPOSE_FILE else "."
+
+COMPOSE_CMD = [
+    "docker", "compose",
+    "-f", _COMPOSE_FILE,
+    "--project-directory", _PROJECT_DIR,
+    "run", "--rm",
+]
 
 # Colour codes
 GREEN  = "\033[92m"
@@ -79,11 +95,33 @@ DAILY_STEPS = [
         "description": "Fetch today's market data (stocks, crypto, forex)",
         "service":     "pipeline",
         "args":        [],
-        "skippable":   True,   # skip via --skip-ohlcv
+        "skippable":   True,
         "skip_key":    "skip_ohlcv",
     },
+    # ── OPS-006 FIX: FII/DII pipeline added to daily orchestration ────────
     {
         "step":        2,
+        "name":        "FII/DII Pipeline",
+        "description": "Fetch today's FII/DII institutional cash-market flows (required by P005 pattern)",
+        "service":     "fii_dii_pipeline",
+        "args":        [],
+        "skippable":   True,
+        "skip_key":    "skip_fii",
+        "soft_fail":   True,   # NSE API can be flaky; don't block the rest of the pipeline
+    },
+    # ── OPS-005 FIX: Participant OI pipeline added to daily orchestration ──
+    {
+        "step":        3,
+        "name":        "Participant OI Pipeline",
+        "description": "Fetch today's NSE F&O participant-wise open interest",
+        "service":     "participant_oi_pipeline",
+        "args":        [],
+        "skippable":   True,
+        "skip_key":    "skip_poi",
+        "soft_fail":   True,   # archive data may not be available until evening
+    },
+    {
+        "step":        4,
         "name":        "Event Detector",
         "description": "Detect ≥2% single-day moves in today's OHLCV",
         "service":     "event_detector",
@@ -91,7 +129,7 @@ DAILY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        3,
+        "step":        5,
         "name":        "Pattern Feature Extractor",
         "description": "Compute 20-dim feature vectors for new events",
         "service":     "pattern_feature_extractor",
@@ -99,16 +137,16 @@ DAILY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        4,
+        "step":        6,
         "name":        "Validation Engine",
         "description": "Validate yesterday's predictions against actual outcomes",
         "service":     "validation_engine",
         "args":        [],
         "skippable":   False,
-        "soft_fail":   True,   # don't stop pipeline if no predictions to validate
+        "soft_fail":   True,   # no predictions to validate on first run
     },
     {
-        "step":        5,
+        "step":        7,
         "name":        "Pattern Builder (incremental)",
         "description": "Map new events to existing patterns",
         "service":     "pattern_builder",
@@ -116,7 +154,7 @@ DAILY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        6,
+        "step":        8,
         "name":        "Backtest Engine (incremental)",
         "description": "Compute forward returns for new pattern matches",
         "service":     "backtest_engine",
@@ -124,7 +162,7 @@ DAILY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        7,
+        "step":        9,
         "name":        "Star Rater",
         "description": "Refresh pattern star ratings",
         "service":     "star_rater",
@@ -132,7 +170,7 @@ DAILY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        8,
+        "step":        10,
         "name":        "Prediction Engine",
         "description": "Generate predictions for tomorrow",
         "service":     "prediction_engine",
@@ -143,7 +181,7 @@ DAILY_STEPS = [
 
 WEEKLY_STEPS = [
     {
-        "step":        9,
+        "step":        11,
         "name":        "Pattern Builder (full remap)",
         "description": "Full remap of all features to all patterns",
         "service":     "pattern_builder",
@@ -151,7 +189,7 @@ WEEKLY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        10,
+        "step":        12,
         "name":        "Backtest Engine (full reprocess)",
         "description": "Recompute all backtest rows from scratch",
         "service":     "backtest_engine",
@@ -159,7 +197,7 @@ WEEKLY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        11,
+        "step":        13,
         "name":        "Star Rater (post-full-backtest)",
         "description": "Refresh ratings after full backtest",
         "service":     "star_rater",
@@ -199,7 +237,7 @@ def run_step(step: dict, dry_run: bool) -> bool:
             cmd,
             capture_output=False,   # stream output directly to terminal
             text=True,
-            check=False             # handle returncode manually
+            check=False
         )
         duration = round((datetime.now() - start).total_seconds(), 1)
 
@@ -209,16 +247,22 @@ def run_step(step: dict, dry_run: bool) -> bool:
         else:
             soft = step.get("soft_fail", False)
             if soft:
-                warn(f"Step {step_n} exited with code {result.returncode} "
-                     f"(soft fail — continuing)")
+                warn(
+                    f"Step {step_n} exited with code {result.returncode} "
+                    f"(soft fail — continuing)"
+                )
                 return True
             else:
                 err(f"Step {step_n} FAILED (exit code {result.returncode})")
                 return False
 
     except FileNotFoundError:
-        err(f"Step {step_n} FAILED — docker compose not found. "
-            f"Run meta_pipeline.py from inside the trading-lab directory.")
+        err(
+            f"Step {step_n} FAILED — 'docker' binary not found.\n"
+            f"  Ensure the pipeline Docker image was rebuilt after adding\n"
+            f"  docker-ce-cli to the Dockerfile (see BUG-001 fix).\n"
+            f"  Rebuild with: docker compose build pipeline"
+        )
         return False
     except Exception as e:
         err(f"Step {step_n} FAILED — {e}")
@@ -230,16 +274,13 @@ def run_step(step: dict, dry_run: bool) -> bool:
 # ══════════════════════════════════════════════════════
 
 def run_daily(skip_flags: dict, from_step: int, dry_run: bool) -> bool:
-    """Run all daily pipeline steps in sequence."""
     for step in DAILY_STEPS:
         step_n = step["step"]
 
-        # Skip if before from_step
         if step_n < from_step:
             warn(f"Step {step_n}: {step['name']} — skipped (--from-step {from_step})")
             continue
 
-        # Skip if flagged
         skip_key = step.get("skip_key")
         if skip_key and skip_flags.get(skip_key):
             warn(f"Step {step_n}: {step['name']} — skipped (--{skip_key.replace('_','-')})")
@@ -255,7 +296,6 @@ def run_daily(skip_flags: dict, from_step: int, dry_run: bool) -> bool:
 
 
 def run_weekly(dry_run: bool) -> bool:
-    """Run weekly refresh steps."""
     for step in WEEKLY_STEPS:
         success = run_step(step, dry_run)
         if not success:
@@ -265,7 +305,7 @@ def run_weekly(dry_run: bool) -> bool:
 
 
 # ══════════════════════════════════════════════════════
-# Summary header
+# Header / footer
 # ══════════════════════════════════════════════════════
 
 def print_header(mode: str, today: date, dry_run: bool):
@@ -274,6 +314,7 @@ def print_header(mode: str, today: date, dry_run: bool):
     print(f"  Date    : {today}")
     print(f"  Dry run : {dry_run}")
     print(f"  Started : {datetime.now().strftime('%H:%M:%S')}")
+    print(f"  Compose : {_COMPOSE_FILE}")
     print(f"{'═'*60}{RESET}\n")
 
 
@@ -296,9 +337,13 @@ def main():
         description="Meta Pipeline — daily orchestrator for the trading system"
     )
     parser.add_argument("--skip-ohlcv", action="store_true",
-                        help="Skip Step 1 OHLCV fetch (if already done separately)")
+                        help="Skip Step 1 OHLCV fetch")
+    parser.add_argument("--skip-fii",   action="store_true",
+                        help="Skip Step 2 FII/DII fetch")
+    parser.add_argument("--skip-poi",   action="store_true",
+                        help="Skip Step 3 Participant OI fetch")
     parser.add_argument("--weekly",     action="store_true",
-                        help="Run weekly full refresh steps (9-11) only")
+                        help="Run weekly full refresh steps (11-13) only")
     parser.add_argument("--dry-run",    action="store_true",
                         help="Show steps without executing them")
     parser.add_argument("--from-step",  type=int, default=1,
@@ -310,18 +355,20 @@ def main():
 
     skip_flags = {
         "skip_ohlcv": args.skip_ohlcv,
+        "skip_fii":   args.skip_fii,
+        "skip_poi":   args.skip_poi,
     }
 
     if args.weekly:
         print_header("WEEKLY REFRESH", today, args.dry_run)
         success = run_weekly(args.dry_run)
     else:
-        mode = "DAILY"
-        if args.skip_ohlcv:
-            mode += " (no OHLCV)"
-        if args.from_step > 1:
-            mode += f" (from step {args.from_step})"
-        print_header(mode, today, args.dry_run)
+        parts = ["DAILY"]
+        if args.skip_ohlcv: parts.append("no OHLCV")
+        if args.skip_fii:   parts.append("no FII")
+        if args.skip_poi:   parts.append("no POI")
+        if args.from_step > 1: parts.append(f"from step {args.from_step}")
+        print_header(" | ".join(parts), today, args.dry_run)
         success = run_daily(skip_flags, args.from_step, args.dry_run)
 
     print_footer(success, start)

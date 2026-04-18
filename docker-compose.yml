@@ -265,11 +265,13 @@ services:
     container_name: meta_pipeline
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - .:/trading-lab:ro          # ← ADD THIS
     environment:
       - CH_HOST=clickhouse
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - COMPOSE_FILE=/trading-lab/docker-compose.yml
     depends_on:
       clickhouse:
         condition: service_healthy

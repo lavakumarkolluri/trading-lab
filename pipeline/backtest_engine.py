@@ -39,6 +39,7 @@ Usage:
 """
 
 import os
+import re
 import json
 import uuid
 import logging
@@ -69,6 +70,11 @@ INSERT_CHUNK_SIZE = 1000
 EVENT_THRESHOLD   = 2.0    # % threshold used to classify a return as "hit"
 MIN_SAMPLE_SIZE   = 10     # minimum matches to compute meaningful stats
 
+# ── SEC-001: allowlist regex for pattern IDs ───────────
+# Allows letters, digits, underscores, hyphens. Max 50 chars.
+# Rejects quotes, semicolons, spaces — anything SQL-meaningful.
+_SAFE_ID = re.compile(r'^[A-Za-z0-9_\-]{1,50}$')
+
 # ── Results tracker ────────────────────────────────────
 results = {
     "processed":  0,
@@ -84,6 +90,16 @@ def get_ch_client():
         host=CH_HOST, port=CH_PORT,
         username=CH_USER, password=CH_PASS
     )
+
+
+# ── SEC-001: input validation helper ──────────────────
+def _validate_id(value: str, label: str) -> None:
+    """Raise ValueError if value contains characters that could inject SQL."""
+    if not _SAFE_ID.match(value):
+        raise ValueError(
+            f"SEC-001: unsafe {label} value {value!r} — "
+            f"expected alphanumeric/underscore/hyphen only"
+        )
 
 
 # ══════════════════════════════════════════════════════
@@ -199,12 +215,12 @@ def fetch_feature_snapshots(ch) -> dict:
     for row in result.result_rows:
         key = (row[0], row[1])
         snapshots[key] = json.dumps({
-            "rsi_14":        row[2],
-            "volume_z5":     row[3],
+            "rsi_14":         row[2],
+            "volume_z5":      row[3],
             "price_vs_sma20": row[4],
-            "bb_position":   row[5],
-            "return_5d":     row[6],
-            "vix_level":     row[7],
+            "bb_position":    row[5],
+            "return_5d":      row[6],
+            "vix_level":      row[7],
         })
     return snapshots
 
@@ -250,7 +266,6 @@ def compute_forward_returns(df_ohlcv: pd.DataFrame,
         return result
 
     future = df_ohlcv[df_ohlcv["date"] > signal_date].head(5)
-
     closes = future["close"].tolist()
 
     def pct(close):
@@ -363,22 +378,40 @@ def insert_backtest_rows(ch, rows: list[dict]):
 def update_pattern_stats(ch, pattern_id: str, stats: dict):
     """
     Update analysis.patterns with aggregated backtest stats.
-    Only updates stat columns — not version (ReplacingMergeTree key).
+
+    SEC-001 FIX:
+    - pattern_id validated against strict allowlist regex before use in query
+    - All numeric stat values explicitly cast to int/float before f-string
+      interpolation — Python typed numbers cannot carry SQL injection payloads
     """
     if not stats:
         return
 
+    # Validate pattern_id — rejects anything containing SQL-special characters
+    _validate_id(pattern_id, "pattern_id")
+
+    # Explicit type casts — prevents any accidental string interpolation
+    total_matches   = int(stats["total_matches"])
+    win_rate_1d     = float(stats["win_rate_1d"])
+    win_rate_3d     = float(stats["win_rate_3d"])
+    win_rate_5d     = float(stats["win_rate_5d"])
+    avg_return_1d   = float(stats["avg_return_1d"])
+    avg_return_3d   = float(stats["avg_return_3d"])
+    avg_return_5d   = float(stats["avg_return_5d"])
+    sharpe_1d       = float(stats["sharpe_1d"])
+    max_drawdown_3d = float(stats["max_drawdown_3d"])
+
     ch.command(
         f"ALTER TABLE analysis.patterns UPDATE "
-        f"  total_matches   = {stats['total_matches']}, "
-        f"  win_rate_1d     = {stats['win_rate_1d']}, "
-        f"  win_rate_3d     = {stats['win_rate_3d']}, "
-        f"  win_rate_5d     = {stats['win_rate_5d']}, "
-        f"  avg_return_1d   = {stats['avg_return_1d']}, "
-        f"  avg_return_3d   = {stats['avg_return_3d']}, "
-        f"  avg_return_5d   = {stats['avg_return_5d']}, "
-        f"  sharpe_1d       = {stats['sharpe_1d']}, "
-        f"  max_drawdown_3d = {stats['max_drawdown_3d']}, "
+        f"  total_matches   = {total_matches}, "
+        f"  win_rate_1d     = {win_rate_1d}, "
+        f"  win_rate_3d     = {win_rate_3d}, "
+        f"  win_rate_5d     = {win_rate_5d}, "
+        f"  avg_return_1d   = {avg_return_1d}, "
+        f"  avg_return_3d   = {avg_return_3d}, "
+        f"  avg_return_5d   = {avg_return_5d}, "
+        f"  sharpe_1d       = {sharpe_1d}, "
+        f"  max_drawdown_3d = {max_drawdown_3d}, "
         f"  last_backtested = today() "
         f"WHERE pattern_id = '{pattern_id}' "
         f"SETTINGS mutations_sync = 0"
