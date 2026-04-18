@@ -451,10 +451,16 @@ def run_pattern_matching(ch, patterns: list[dict],
                 df_chunk = pd.DataFrame(chunk)
                 ch.insert_df("analysis.pattern_event_map", df_chunk)
 
-            # Update total_matches in patterns table
-            # SEC-002: validate pid and cast count to int before interpolation
+            # Update total_matches with the TRUE cumulative count (BUG-003).
+            # len(match_rows) is only new matches this run — using it would
+            # overwrite the accumulated count from previous incremental runs.
+            # SEC-002: _validate_id already called above; cast result to int.
             _validate_id(pid, "pattern_id")
-            total_matches = int(len(match_rows))
+            cum = ch.query(
+                f"SELECT count() FROM analysis.pattern_event_map FINAL "
+                f"WHERE pattern_id = '{pid}'"
+            )
+            total_matches = int(cum.result_rows[0][0])
             ch.command(
                 f"ALTER TABLE analysis.patterns UPDATE "
                 f"total_matches = {total_matches}, "
