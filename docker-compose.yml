@@ -333,6 +333,36 @@ services:
     entrypoint: ["python", "participant_oi_pipeline.py"]
     command: []
 
+  vix_pipeline:
+    build: ./pipeline
+    container_name: vix_pipeline
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "vix_pipeline.py"]
+    command: []
+
+  option_chain_pipeline:
+    build: ./pipeline
+    container_name: option_chain_pipeline
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "option_chain_pipeline.py"]
+    command: []
+
   gap_analyzer:
     build: ./pipeline
     container_name: gap_analyzer

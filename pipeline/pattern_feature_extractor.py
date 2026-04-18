@@ -63,7 +63,7 @@ MAX_WORKERS       = 8
 BATCH_SIZE        = 100       # log progress every N events
 HISTORY_DAYS      = 300       # days of OHLCV to fetch per symbol for rolling windows
 MIN_HISTORY_ROWS  = 30        # skip if fewer rows available before event date
-FEATURE_VERSION   = "v1"
+FEATURE_VERSION   = "v2"   # v2 adds pcr, iv_rank, iv_percentile, max_pain_dist_pct
 
 # ── SEC-004: input validation ──────────────────────────
 _SAFE_SYMBOL = re.compile(r'^[A-Za-z0-9._\-&=]{1,30}$')
@@ -401,7 +401,11 @@ def compute_features(df_hist: pd.DataFrame,
                      vix_level: float,
                      vix_regime: str,
                      nifty_5d: float,
-                     fii_net_3d: float) -> dict | None:
+                     fii_net_3d: float,
+                     pcr: float = 0.0,
+                     iv_rank: float = 0.0,
+                     iv_percentile: float = 0.0,
+                     max_pain_dist_pct: float = 0.0) -> dict | None:
     """
     Compute full feature vector from OHLCV history up to (event_date - 1).
     Returns None if insufficient data.
@@ -447,6 +451,12 @@ def compute_features(df_hist: pd.DataFrame,
         "nifty_trend_5d": nifty_5d,
         "fii_net_3d":     fii_net_3d,
 
+        # ── Options context (v2 — 0.0 until option_chain_pipeline runs) ──
+        "pcr":              pcr,
+        "iv_rank":          iv_rank,
+        "iv_percentile":    iv_percentile,
+        "max_pain_dist_pct": max_pain_dist_pct,
+
         # ── Return context ────────────────────────────
         "return_5d":      compute_return_nd(close, 5),
         "return_20d":     compute_return_nd(close, 20),
@@ -473,6 +483,7 @@ FEATURE_COLS = [
     "volume_z5", "volume_z20", "volume_trend",
     "atr_14", "atr_pct", "bb_position",
     "vix_level", "vix_regime", "nifty_trend_5d", "fii_net_3d",
+    "pcr", "iv_rank", "iv_percentile", "max_pain_dist_pct",
     "return_5d", "return_20d", "drawdown_pct",
     "feature_version", "computed_at", "version",
 ]
@@ -527,6 +538,40 @@ def fetch_vix_cache(ch) -> dict:
         return {}
 
 
+def fetch_options_cache(ch) -> dict:
+    """
+    date → {pcr, iv_rank, iv_percentile, max_pain_strike, nifty_spot}
+    from market.options_eod_summary (populated by option_chain_pipeline).
+    Falls back gracefully to zeros when the table is empty.
+    """
+    try:
+        result = ch.query(
+            "SELECT date, pcr, iv_rank, iv_percentile, "
+            "       max_pain_strike, nifty_spot "
+            "FROM market.options_eod_summary FINAL "
+            "ORDER BY date"
+        )
+        return {
+            row[0]: {
+                "pcr":              float(row[1] or 0.0),
+                "iv_rank":          float(row[2] or 0.0),
+                "iv_percentile":    float(row[3] or 0.0),
+                "max_pain_strike":  float(row[4] or 0.0),
+                "nifty_spot":       float(row[5] or 0.0),
+            }
+            for row in result.result_rows
+        }
+    except Exception:
+        return {}
+
+
+def get_options_for_date(options_cache: dict, d: date) -> dict:
+    return options_cache.get(d, {
+        "pcr": 0.0, "iv_rank": 0.0, "iv_percentile": 0.0,
+        "max_pain_strike": 0.0, "nifty_spot": 0.0,
+    })
+
+
 def fetch_regime_cache(ch) -> dict:
     """date → vix_regime string from analysis.market_regime."""
     try:
@@ -568,6 +613,7 @@ def process_symbol_events(symbol: str,
                           regime_cache: dict,
                           nifty_5d_cache: dict,
                           fii_net_cache: dict,
+                          options_cache: dict,
                           idx: int,
                           total: int):
     ch = get_ch_client()
@@ -604,9 +650,22 @@ def process_symbol_events(symbol: str,
             nifty_5d  = nifty_5d_cache.get(event_date, 0.0)
             fii_net3d = fii_net_cache.get(event_date, 0.0)
 
+            opt = get_options_for_date(options_cache, event_date)
+            # max_pain_dist_pct: how far spot is from max pain (market context)
+            mp_dist = 0.0
+            if opt["max_pain_strike"] > 0 and opt["nifty_spot"] > 0:
+                mp_dist = round(
+                    (opt["max_pain_strike"] - opt["nifty_spot"])
+                    / opt["nifty_spot"] * 100, 4
+                )
+
             feat = compute_features(
                 df_slice, symbol, market, event_date,
-                vix_level, vix_regime, nifty_5d, fii_net3d
+                vix_level, vix_regime, nifty_5d, fii_net3d,
+                pcr=opt["pcr"],
+                iv_rank=opt["iv_rank"],
+                iv_percentile=opt["iv_percentile"],
+                max_pain_dist_pct=mp_dist,
             )
 
             if feat is None:
@@ -799,6 +858,11 @@ def main():
     fii_net_cache = build_fii_net_cache(ch, all_dates)
     log.info(f"FII net cache     : {len(fii_net_cache)} dates")
 
+    log.info("Building options cache (PCR / IV rank / max pain)...")
+    options_cache = fetch_options_cache(ch)
+    log.info(f"Options cache     : {len(options_cache)} dates "
+             f"({'live data' if options_cache else 'empty — run option_chain_pipeline'})")
+
     # Group events by symbol for efficient OHLCV fetching
     # (one OHLCV fetch per symbol, covers all its event dates)
     symbol_groups = {}
@@ -816,6 +880,7 @@ def main():
             symbol, market, event_dates,
             vix_cache, regime_cache,
             nifty_5d_cache, fii_net_cache,
+            options_cache,
             idx, total
         )
 

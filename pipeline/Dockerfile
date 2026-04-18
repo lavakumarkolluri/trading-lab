@@ -45,5 +45,7 @@ COPY fii_dii_pipeline.py .
 COPY participant_oi_pipeline.py .
 COPY gap_analyzer.py .
 COPY scheduler.py .
+COPY vix_pipeline.py .
+COPY option_chain_pipeline.py .
 
 CMD ["python", "main.py"]

@@ -216,6 +216,91 @@ SEED_PATTERNS = [
         "created_by":       "system",
         "is_active":        1,
     },
+
+    # ── Options-context patterns (v2 — require option_chain_pipeline data) ──
+
+    {
+        "pattern_id":       "P007",
+        "label":            "High IV + Overbought → Premium Fade",
+        "description":      "IV rank above 70 while RSI is elevated (>65) and price has "
+                            "run up 3%+ in 5 days. Volatility is expensive relative to the "
+                            "past year; options market pricing in fear of further extension.",
+        "hypothesis":       "When IV is at a 52-week high and price is overbought, the risk "
+                            "premium in options is excessive. Mean reversion is likely both "
+                            "in price (RSI cooling) and in volatility (IV crush). "
+                            "Sell premium or fade the move. Historically: elevated IV + "
+                            "overbought RSI resolves with a 3-5 day pullback 70%+ of the time.",
+        "feature_version":  "v2",
+        "conditions_json":  json.dumps({
+            "iv_rank":   {"gt": 70},
+            "rsi_14":    {"gt": 65},
+            "return_5d": {"gt": 3.0},
+        }),
+        "created_by":       "system",
+        "is_active":        1,
+    },
+    {
+        "pattern_id":       "P008",
+        "label":            "Low IV Squeeze → Cheap Options Breakout",
+        "description":      "IV rank below 25, ATR% below 1.2 (tight range), Bollinger Bands "
+                            "narrow (BB position 0.4–0.6). Price coiling with options cheap.",
+        "hypothesis":       "When implied volatility is near a 52-week low, the market is "
+                            "under-pricing the probability of a large move. Historically, "
+                            "extended low-IV periods resolve with explosive directional moves "
+                            "(the 'vol spring'). Tight Bollinger Bands + low ATR confirm "
+                            "the coil. Buy cheap straddles or wait for the breakout candle.",
+        "feature_version":  "v2",
+        "conditions_json":  json.dumps({
+            "iv_rank":     {"lt": 25},
+            "atr_pct":     {"lt": 1.2},
+            "bb_position": {"between": [0.35, 0.65]},
+        }),
+        "created_by":       "system",
+        "is_active":        1,
+    },
+    {
+        "pattern_id":       "P009",
+        "label":            "PCR Extreme + Oversold → Capitulation Buy",
+        "description":      "PCR above 1.4 (extreme put buying), 5-day return below -3%, "
+                            "RSI below 38. Options market in panic; retail buying protection.",
+        "hypothesis":       "Extreme put-call ratios (>1.4) signal that the retail options "
+                            "market is buying maximum downside protection — typically a "
+                            "contrarian bullish signal. When paired with a -3% 5-day move "
+                            "and oversold RSI, the setup resembles classic capitulation. "
+                            "Smart money (FII / institutions) often steps in at this point. "
+                            "India-specific: Nifty PCR above 1.4 has historically preceded "
+                            "a 2-5% bounce within 5 trading days.",
+        "feature_version":  "v2",
+        "conditions_json":  json.dumps({
+            "pcr":       {"gt": 1.4},
+            "return_5d": {"lt": -3.0},
+            "rsi_14":    {"lt": 38},
+        }),
+        "created_by":       "system",
+        "is_active":        1,
+    },
+    {
+        "pattern_id":       "P010",
+        "label":            "VIX Spike + FII Defense → Recovery Signal",
+        "description":      "VIX above 22 (elevated fear), RSI below 38 (oversold), "
+                            "FII net buying positive over last 3 days. Smart money absorbing "
+                            "the sell-off.",
+        "hypothesis":       "When India VIX spikes above 22 and retail panic-sells, "
+                            "FII (foreign institutional) buyers often step in to defend "
+                            "key levels. Their 3-day net buying turning positive during "
+                            "elevated VIX is a high-conviction buy signal: FII has the "
+                            "balance sheet to absorb selling and the information advantage "
+                            "to know when the move is overdone. Historically this combination "
+                            "precedes a 3-7 day recovery with 65%+ win rate.",
+        "feature_version":  "v2",
+        "conditions_json":  json.dumps({
+            "vix_level":  {"gt": 22},
+            "rsi_14":     {"lt": 38},
+            "fii_net_3d": {"gt": 200},
+        }),
+        "created_by":       "system",
+        "is_active":        1,
+    },
 ]
 
 

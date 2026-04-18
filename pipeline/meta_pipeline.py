@@ -9,19 +9,21 @@ Sequence:
   Step  1  — OHLCV pipeline (main.py)              fetch today's market data
   Step  2  — FII/DII pipeline                       fetch today's FII/DII flows   [OPS-006]
   Step  3  — Participant OI pipeline                 fetch today's F&O OI          [OPS-005]
-  Step  4  — Event detector                          detect today's ≥2% moves
-  Step  5  — Pattern feature extractor               compute features for new events
-  Step  6  — Validation engine                       validate yesterday's predictions
-  Step  7  — Pattern builder (incremental)           map new events to patterns
-  Step  8  — Backtest engine (incremental)           backtest new pattern matches
-  Step  9  — Star rater                              refresh pattern ratings
-  Step 10  — Prediction engine                       generate tomorrow's predictions
+  Step  4  — VIX pipeline                            India VIX + market regime
+  Step  5  — Option chain pipeline                   PCR, max pain, IV rank, strike recs
+  Step  6  — Event detector                          detect today's ≥2% moves
+  Step  7  — Pattern feature extractor               compute features for new events
+  Step  8  — Validation engine                       validate yesterday's predictions
+  Step  9  — Pattern builder (incremental)           map new events to patterns
+  Step 10  — Backtest engine (incremental)           backtest new pattern matches
+  Step 11  — Star rater                              refresh pattern ratings
+  Step 12  — Prediction engine                       generate tomorrow's predictions
 
 Weekly (Sundays):
-  Step 11  — Pattern builder --full                  full pattern remap
-  Step 12  — Backtest engine --full                  full backtest refresh
-  Step 13  — Star rater (post-full-backtest)         refresh ratings
-  Step 14  — Gap analyzer                            FN/FP rate analysis (OPS-002/DATA-005)
+  Step 13  — Pattern builder --full                  full pattern remap
+  Step 14  — Backtest engine --full                  full backtest refresh
+  Step 15  — Star rater (post-full-backtest)         refresh ratings
+  Step 16  — Gap analyzer                            FN/FP rate analysis (OPS-002/DATA-005)
 
 COMPOSE_CMD fix [BUG-001]:
   The pipeline image now includes docker-ce-cli (see Dockerfile).
@@ -150,6 +152,26 @@ DAILY_STEPS = [
     },
     {
         "step":        4,
+        "name":        "VIX Pipeline",
+        "description": "Fetch India VIX + Nifty spot; write market regime classification",
+        "service":     "vix_pipeline",
+        "args":        [],
+        "skippable":   True,
+        "skip_key":    "skip_vix",
+        "soft_fail":   True,   # yfinance outage must not block the main pipeline
+    },
+    {
+        "step":        5,
+        "name":        "Option Chain Pipeline",
+        "description": "Fetch NSE option chain; compute PCR, max pain, IV rank, strike recs",
+        "service":     "option_chain_pipeline",
+        "args":        [],
+        "skippable":   True,
+        "skip_key":    "skip_oc",
+        "soft_fail":   True,   # NSE API flaky; options context enriches but doesn't block
+    },
+    {
+        "step":        6,
         "name":        "Event Detector",
         "description": "Detect ≥2% single-day moves in today's OHLCV",
         "service":     "event_detector",
@@ -157,15 +179,15 @@ DAILY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        5,
+        "step":        7,
         "name":        "Pattern Feature Extractor",
-        "description": "Compute 20-dim feature vectors for new events",
+        "description": "Compute feature vectors (incl. VIX/PCR/IV) for new events",
         "service":     "pattern_feature_extractor",
         "args":        [],
         "skippable":   False,
     },
     {
-        "step":        6,
+        "step":        8,
         "name":        "Validation Engine",
         "description": "Validate yesterday's predictions against actual outcomes",
         "service":     "validation_engine",
@@ -174,7 +196,7 @@ DAILY_STEPS = [
         "soft_fail":   True,   # no predictions to validate on first run
     },
     {
-        "step":        7,
+        "step":        9,
         "name":        "Pattern Builder (incremental)",
         "description": "Map new events to existing patterns",
         "service":     "pattern_builder",
@@ -182,7 +204,7 @@ DAILY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        8,
+        "step":        10,
         "name":        "Backtest Engine (incremental)",
         "description": "Compute forward returns for new pattern matches",
         "service":     "backtest_engine",
@@ -190,7 +212,7 @@ DAILY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        9,
+        "step":        11,
         "name":        "Star Rater",
         "description": "Refresh pattern star ratings",
         "service":     "star_rater",
@@ -198,7 +220,7 @@ DAILY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        10,
+        "step":        12,
         "name":        "Prediction Engine",
         "description": "Generate predictions for tomorrow",
         "service":     "prediction_engine",
@@ -209,7 +231,7 @@ DAILY_STEPS = [
 
 WEEKLY_STEPS = [
     {
-        "step":        11,
+        "step":        13,
         "name":        "Pattern Builder (full remap)",
         "description": "Full remap of all features to all patterns",
         "service":     "pattern_builder",
@@ -217,7 +239,7 @@ WEEKLY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        12,
+        "step":        14,
         "name":        "Backtest Engine (full reprocess)",
         "description": "Recompute all backtest rows from scratch",
         "service":     "backtest_engine",
@@ -225,22 +247,21 @@ WEEKLY_STEPS = [
         "skippable":   False,
     },
     {
-        "step":        13,
+        "step":        15,
         "name":        "Star Rater (post-full-backtest)",
         "description": "Refresh ratings after full backtest",
         "service":     "star_rater",
         "args":        [],
         "skippable":   False,
     },
-    # ── OPS-002 / DATA-005: gap analyzer closes the feedback loop ─────────
     {
-        "step":        14,
+        "step":        16,
         "name":        "Gap Analyzer",
         "description": "Measure false negative / false positive rates; optional LLM diagnosis",
         "service":     "gap_analyzer",
         "args":        [],
         "skippable":   False,
-        "soft_fail":   True,   # analysis failure must not block prediction pipeline
+        "soft_fail":   True,
     },
 ]
 
@@ -385,6 +406,10 @@ def main():
                         help="Skip Step 2 FII/DII fetch")
     parser.add_argument("--skip-poi",   action="store_true",
                         help="Skip Step 3 Participant OI fetch")
+    parser.add_argument("--skip-vix",   action="store_true",
+                        help="Skip Step 4 VIX pipeline")
+    parser.add_argument("--skip-oc",    action="store_true",
+                        help="Skip Step 5 Option chain pipeline")
     parser.add_argument("--weekly",     action="store_true",
                         help="Run weekly full refresh steps (11-13) only")
     parser.add_argument("--dry-run",    action="store_true",
@@ -400,6 +425,8 @@ def main():
         "skip_ohlcv": args.skip_ohlcv,
         "skip_fii":   args.skip_fii,
         "skip_poi":   args.skip_poi,
+        "skip_vix":   args.skip_vix,
+        "skip_oc":    args.skip_oc,
     }
 
     if args.weekly:
