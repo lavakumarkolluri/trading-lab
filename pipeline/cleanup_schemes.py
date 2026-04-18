@@ -139,10 +139,11 @@ def main():
         log.info("Nothing to delete.")
         return
 
-    # Convert to comma-separated string for IN clause
-    delete_codes = ",".join(str(c) for c in to_delete)
+    # SEC-005: cast every code to int — guarantees no string/SQL payload can survive
+    safe_codes = [int(c) for c in to_delete]
+    delete_codes = ",".join(str(c) for c in safe_codes)
 
-    log.info(f"\nDeleting {len(to_delete)} schemes from market.mf_schemes...")
+    log.info(f"\nDeleting {len(safe_codes)} schemes from market.mf_schemes...")
     ch.command(
         f"ALTER TABLE market.mf_schemes DELETE "
         f"WHERE scheme_code IN ({delete_codes}) "

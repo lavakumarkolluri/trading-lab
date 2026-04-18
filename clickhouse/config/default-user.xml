@@ -5,7 +5,8 @@
       <networks>
         <ip>127.0.0.1</ip>
         <ip>::1</ip>
-        <ip>172.16.0.0/12</ip>
+        <!-- SEC-006: restricted from 172.16.0.0/12 to actual compose network -->
+        <ip>172.18.0.0/16</ip>
       </networks>
       <profile>default</profile>
       <quota>default</quota>
