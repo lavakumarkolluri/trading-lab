@@ -120,8 +120,13 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - MINIO_HOST=minio:9000
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
     depends_on:
       clickhouse:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     restart: "no"
     entrypoint: ["python", "mf_pipeline.py"]
@@ -341,8 +346,13 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - MINIO_HOST=minio:9000
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
     depends_on:
       clickhouse:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     restart: "no"
     entrypoint: ["python", "vix_pipeline.py"]
@@ -356,8 +366,13 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - MINIO_HOST=minio:9000
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
     depends_on:
       clickhouse:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     restart: "no"
     entrypoint: ["python", "option_chain_pipeline.py"]
@@ -371,8 +386,13 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - MINIO_HOST=minio:9000
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
     depends_on:
       clickhouse:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     restart: "no"
     entrypoint: ["python", "option_backtest.py"]

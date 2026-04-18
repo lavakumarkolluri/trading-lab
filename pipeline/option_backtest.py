@@ -56,6 +56,8 @@ import numpy as np
 import pandas as pd
 import clickhouse_connect
 from curl_cffi import requests as cffi_requests
+from minio import Minio
+from minio.error import S3Error
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,6 +70,11 @@ CH_HOST = os.getenv("CH_HOST", "clickhouse")
 CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
+
+MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
+MINIO_USER   = os.getenv("MINIO_USER", "admin")
+MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
+MINIO_BUCKET = "trading-data"
 
 LOOKBACK_DAYS  = 730
 MAX_WORKERS    = 3      # concurrent bhavcopy downloads (NSE rate-limits aggressively)
@@ -102,6 +109,37 @@ def get_ch_client():
         host=CH_HOST, port=CH_PORT,
         username=CH_USER, password=CH_PASS
     )
+
+
+def get_minio_client() -> Minio:
+    return Minio(MINIO_HOST, access_key=MINIO_USER,
+                 secret_key=MINIO_PASS, secure=False)
+
+
+def setup_minio_bucket(mc: Minio):
+    if not mc.bucket_exists(MINIO_BUCKET):
+        mc.make_bucket(MINIO_BUCKET)
+
+
+def _bhavcopy_key(dt: date) -> str:
+    return f"bhavcopy/fo/{dt.strftime('%Y%m%d')}.zip"
+
+
+def _load_zip_from_minio(mc: Minio, dt: date) -> bytes | None:
+    key = _bhavcopy_key(dt)
+    try:
+        resp = mc.get_object(MINIO_BUCKET, key)
+        data = resp.read()
+        resp.close()
+        return data
+    except S3Error:
+        return None
+
+
+def _save_zip_to_minio(mc: Minio, dt: date, data: bytes):
+    key = _bhavcopy_key(dt)
+    mc.put_object(MINIO_BUCKET, key, io.BytesIO(data), len(data),
+                  content_type="application/zip")
 
 
 # ══════════════════════════════════════════════════════
@@ -184,12 +222,39 @@ def build_nse_session() -> cffi_requests.Session:
     return session
 
 
-def fetch_bhavcopy(dt: date, session: cffi_requests.Session) -> pd.DataFrame | None:
+def _parse_zip(zip_bytes: bytes, dt: date) -> pd.DataFrame | None:
+    """Parse a bhavcopy zip bytes into a NIFTY options DataFrame."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            raw = pd.read_csv(zf.open(zf.namelist()[0]), low_memory=False)
+        if "TckrSymb" in raw.columns:
+            df = _parse_new_format(raw)
+        elif "SYMBOL" in raw.columns:
+            df = _parse_old_format(raw)
+        else:
+            log.warning(f"  {dt}: unrecognised bhavcopy columns: {list(raw.columns[:5])}")
+            return None
+        return df if not df.empty else None
+    except zipfile.BadZipFile:
+        return None
+    except Exception as e:
+        log.warning(f"  {dt}: parse failed — {e}")
+        return None
+
+
+def fetch_bhavcopy(dt: date, session: cffi_requests.Session,
+                   mc: Minio) -> pd.DataFrame | None:
     """
-    Download and parse NSE F&O bhavcopy for one date.
-    Returns DataFrame(expiry, strike, option_type, close, oi) with
-    NIFTY index options only, or None on 404/parse failure.
+    Load bhavcopy for one date.
+    Check MinIO first (cache hit = no NSE request).
+    On cache miss: download from NSE, save to MinIO, return parsed DataFrame.
     """
+    # 1. Try MinIO cache
+    zip_bytes = _load_zip_from_minio(mc, dt)
+    if zip_bytes is not None:
+        return _parse_zip(zip_bytes, dt)
+
+    # 2. Download from NSE
     url = BHAVCOPY_URL.format(date=dt.strftime("%Y%m%d"))
     try:
         resp = session.get(
@@ -204,24 +269,11 @@ def fetch_bhavcopy(dt: date, session: cffi_requests.Session) -> pd.DataFrame | N
             return None   # holiday / weekend — silent skip
         resp.raise_for_status()
 
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            csv_name = zf.namelist()[0]
-            raw = pd.read_csv(zf.open(csv_name), low_memory=False)
+        # 3. Save raw zip to MinIO before parsing
+        _save_zip_to_minio(mc, dt, resp.content)
 
-        # Detect format by column names
-        if "TckrSymb" in raw.columns:
-            df = _parse_new_format(raw)
-        elif "SYMBOL" in raw.columns:
-            df = _parse_old_format(raw)
-        else:
-            log.warning(f"  {dt}: unrecognised bhavcopy format — columns: "
-                        f"{list(raw.columns[:5])}")
-            return None
+        return _parse_zip(resp.content, dt)
 
-        return df if not df.empty else None
-
-    except zipfile.BadZipFile:
-        return None   # holiday / weekend
     except Exception as e:
         log.warning(f"  {dt}: fetch failed — {e}")
         return None
@@ -229,10 +281,19 @@ def fetch_bhavcopy(dt: date, session: cffi_requests.Session) -> pd.DataFrame | N
 
 def download_bhavcopy_range(dates: list[date]) -> dict[date, pd.DataFrame]:
     """
-    Download bhavcopy files for all dates.
+    Load bhavcopy files for all dates.
+    Each worker checks MinIO first; only hits NSE for cache misses.
     Each worker thread gets its own NSE session (curl_cffi is not thread-safe).
     Returns {date: DataFrame} for dates that have data.
     """
+    mc = get_minio_client()
+    setup_minio_bucket(mc)
+
+    # Count how many are already in MinIO
+    minio_hits = sum(1 for d in dates if _load_zip_from_minio(mc, d) is not None)
+    nse_needed = len(dates) - minio_hits
+    log.info(f"  MinIO cache: {minio_hits} hits, {nse_needed} NSE downloads needed")
+
     _local = threading.local()
     cache  = {}
     lock   = threading.Lock()
@@ -246,13 +307,13 @@ def download_bhavcopy_range(dates: list[date]) -> dict[date, pd.DataFrame]:
 
     def _fetch_one(dt: date):
         time.sleep(REQUEST_DELAY)
-        df = fetch_bhavcopy(dt, _get_session())
+        df = fetch_bhavcopy(dt, _get_session(), mc)
         with lock:
             done[0] += 1
             if df is not None:
                 cache[dt] = df
                 if done[0] % 50 == 0:
-                    log.info(f"  Downloaded {done[0]}/{total} dates "
+                    log.info(f"  Processed {done[0]}/{total} dates "
                              f"({len(cache)} with data)")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:

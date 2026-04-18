@@ -14,6 +14,7 @@ Inactive schemes (no NAV in last 10 days) are skipped automatically
 via the incremental watermark check.
 """
 
+import io
 import requests
 import clickhouse_connect
 import pandas as pd
@@ -24,6 +25,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timedelta
 from tenacity import retry, stop_after_attempt, wait_exponential
+from minio import Minio
+from minio.error import S3Error
 
 
 # ── Logging ────────────────────────────────────────────
@@ -38,6 +41,11 @@ CH_HOST = os.getenv("CH_HOST", "clickhouse")
 CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
+
+MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
+MINIO_USER   = os.getenv("MINIO_USER", "admin")
+MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
+MINIO_BUCKET = "trading-data"
 
 MFAPI_BASE        = "https://api.mfapi.in/mf"
 DELAY_PER_REQUEST = 0.1   # per-worker delay
@@ -56,6 +64,39 @@ def get_ch_client():
         host=CH_HOST, port=CH_PORT,
         username=CH_USER, password=CH_PASS
     )
+
+
+def get_minio_client() -> Minio:
+    return Minio(MINIO_HOST, access_key=MINIO_USER,
+                 secret_key=MINIO_PASS, secure=False)
+
+
+def setup_minio_bucket(mc: Minio):
+    if not mc.bucket_exists(MINIO_BUCKET):
+        mc.make_bucket(MINIO_BUCKET)
+
+
+def _nav_key(scheme_code: int) -> str:
+    return f"mf/nav/{scheme_code}.parquet"
+
+
+def load_nav_from_minio(mc: Minio, scheme_code: int) -> pd.DataFrame:
+    try:
+        resp = mc.get_object(MINIO_BUCKET, _nav_key(scheme_code))
+        df = pd.read_parquet(io.BytesIO(resp.read()))
+        resp.close()
+        return df
+    except S3Error:
+        return pd.DataFrame()
+
+
+def save_nav_to_minio(mc: Minio, scheme_code: int, df: pd.DataFrame):
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False)
+    buf.seek(0)
+    mc.put_object(MINIO_BUCKET, _nav_key(scheme_code), buf,
+                  buf.getbuffer().nbytes,
+                  content_type="application/octet-stream")
 
 
 # ── Scheme Filter ──────────────────────────────────────
@@ -292,13 +333,23 @@ def insert_nav_rows(ch, rows):
 
 
 # ── Process One Scheme ─────────────────────────────────
-def process_scheme(ch, scheme_code, scheme_name, last_date, idx, total):
+def process_scheme(ch, mc, scheme_code, scheme_name, last_date, idx, total):
     try:
-        today      = date.today()
-        cutoff     = today - timedelta(days=INACTIVITY_DAYS)
+        today  = date.today()
+        cutoff = today - timedelta(days=INACTIVITY_DAYS)
 
-        # Skip if last NAV is recent enough and already up to date
-        if last_date and last_date >= today:
+        # Load existing NAV from MinIO to get accurate watermark
+        cached = load_nav_from_minio(mc, scheme_code)
+        minio_last = None
+        if not cached.empty and "date" in cached.columns:
+            minio_last = pd.to_datetime(cached["date"]).dt.date.max()
+
+        # Use the later of DB watermark and MinIO watermark
+        effective_last = max(
+            filter(None, [last_date, minio_last])
+        ) if (last_date or minio_last) else None
+
+        if effective_last and effective_last >= today:
             with results_lock:
                 results["skipped"].append(scheme_code)
             return
@@ -307,7 +358,7 @@ def process_scheme(ch, scheme_code, scheme_name, last_date, idx, total):
         if not nav_list:
             raise ValueError("No NAV data returned")
 
-        # Check if fund is inactive — most recent NAV older than cutoff
+        # Check if fund is inactive
         try:
             most_recent = datetime.strptime(nav_list[0]["date"], "%d-%m-%Y").date()
             if most_recent < cutoff:
@@ -319,13 +370,21 @@ def process_scheme(ch, scheme_code, scheme_name, last_date, idx, total):
         except Exception:
             pass
 
-        rows = parse_nav_data(scheme_code, nav_list, last_date)
+        rows = parse_nav_data(scheme_code, nav_list, effective_last)
         if not rows:
             with results_lock:
                 results["skipped"].append(scheme_code)
             return
 
+        # Insert new rows to ClickHouse
         insert_nav_rows(ch, rows)
+
+        # Merge with cached and save back to MinIO
+        new_df = pd.DataFrame(rows)
+        merged = pd.concat([cached, new_df], ignore_index=True)
+        merged = merged.drop_duplicates(subset=["date", "scheme_code"], keep="last")
+        save_nav_to_minio(mc, scheme_code, merged)
+
         with results_lock:
             results["success"].append(scheme_code)
 
@@ -363,9 +422,10 @@ def _worker(args):
     idx, scheme, watermarks, total = args
     code = int(scheme["schemeCode"])
     name = scheme["schemeName"]
-    ch   = get_ch_client()  # each thread gets its own connection
+    ch   = get_ch_client()
+    mc   = get_minio_client()
     last_date = watermarks.get(code)
-    process_scheme(ch, code, name, last_date, idx, total)
+    process_scheme(ch, mc, code, name, last_date, idx, total)
     time.sleep(DELAY_PER_REQUEST)
 
 
@@ -375,6 +435,8 @@ def main():
     log.info(f"Start time: {datetime.now()}")
 
     ch = get_ch_client()
+    mc = get_minio_client()
+    setup_minio_bucket(mc)
 
     # Verify tables exist — fail fast if migrations not run
     assert_tables_exist(ch)

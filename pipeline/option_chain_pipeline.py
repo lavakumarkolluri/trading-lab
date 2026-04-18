@@ -34,6 +34,8 @@ Docker:
   docker compose run --rm option_chain_pipeline
 """
 
+import io
+import json
 import os
 import time
 import logging
@@ -43,6 +45,8 @@ from datetime import datetime, date, timedelta
 import pandas as pd
 import clickhouse_connect
 from curl_cffi import requests
+from minio import Minio
+from minio.error import S3Error
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
 logging.basicConfig(
@@ -56,6 +60,11 @@ CH_HOST = os.getenv("CH_HOST", "clickhouse")
 CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
+
+MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
+MINIO_USER   = os.getenv("MINIO_USER", "admin")
+MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
+MINIO_BUCKET = "trading-data"
 
 NSE_HOME   = "https://www.nseindia.com"
 NSE_OC_URL = "https://www.nseindia.com/api/option-chain-indices"
@@ -72,6 +81,38 @@ def get_ch_client():
         host=CH_HOST, port=CH_PORT,
         username=CH_USER, password=CH_PASS
     )
+
+
+def get_minio_client() -> Minio:
+    return Minio(MINIO_HOST, access_key=MINIO_USER,
+                 secret_key=MINIO_PASS, secure=False)
+
+
+def setup_minio_bucket(mc: Minio):
+    if not mc.bucket_exists(MINIO_BUCKET):
+        mc.make_bucket(MINIO_BUCKET)
+
+
+def _chain_key(today: date, symbol: str) -> str:
+    return f"option_chain/daily/{today}/{symbol}.json"
+
+
+def save_chain_to_minio(mc: Minio, data: dict, today: date, symbol: str):
+    raw = json.dumps(data).encode()
+    mc.put_object(MINIO_BUCKET, _chain_key(today, symbol),
+                  io.BytesIO(raw), len(raw), content_type="application/json")
+    log.info(f"Saved option chain snapshot → MinIO {_chain_key(today, symbol)}")
+
+
+def load_chain_from_minio(mc: Minio, today: date, symbol: str) -> dict | None:
+    try:
+        resp = mc.get_object(MINIO_BUCKET, _chain_key(today, symbol))
+        data = json.loads(resp.read())
+        resp.close()
+        log.info(f"Loaded option chain from MinIO (cache hit)")
+        return data
+    except S3Error:
+        return None
 
 
 # ══════════════════════════════════════════════════════
@@ -422,18 +463,33 @@ def main():
     parser = argparse.ArgumentParser(
         description="Option Chain Pipeline — NSE EOD option chain fetch"
     )
-    parser.add_argument("--symbol",  default="NIFTY",
+    parser.add_argument("--symbol",    default="NIFTY",
                         choices=["NIFTY", "BANKNIFTY"],
                         help="Index symbol (default: NIFTY)")
-    parser.add_argument("--dry-run", action="store_true",
+    parser.add_argument("--dry-run",   action="store_true",
                         help="Fetch, compute and print — do not insert to DB")
+    parser.add_argument("--load-only", action="store_true",
+                        help="Reload today's MinIO snapshot → ClickHouse, skip NSE fetch")
     args = parser.parse_args()
 
     log.info(f"=== Option Chain Pipeline [{args.symbol}] ===")
 
-    session = build_nse_session()
-    log.info("Fetching option chain...")
-    data = fetch_option_chain(session, args.symbol)
+    today = date.today()
+    mc    = get_minio_client()
+    setup_minio_bucket(mc)
+
+    if args.load_only:
+        data = load_chain_from_minio(mc, today, args.symbol)
+        if data is None:
+            log.error(f"No MinIO snapshot for {today}/{args.symbol}. "
+                      "Run without --load-only first.")
+            return
+    else:
+        session = build_nse_session()
+        log.info("Fetching option chain from NSE...")
+        data = fetch_option_chain(session, args.symbol)
+        if not args.dry_run:
+            save_chain_to_minio(mc, data, today, args.symbol)
 
     df_all, spot, expiries = parse_chain(data)
 
@@ -464,8 +520,7 @@ def main():
         log.info("[DRY RUN] Skipping DB writes")
         return
 
-    ch    = get_ch_client()
-    today = date.today()
+    ch = get_ch_client()
 
     try:
         expiry_date = datetime.strptime(near_expiry, "%d-%b-%Y").date()

@@ -5,16 +5,13 @@ scheduler.py
 Docker-native cron scheduler for the trading pipeline (OPS-001).
 Runs inside a long-lived container — no host cron required.
 
-Schedule:
-  Daily    — Monday–Friday at 16:30 IST (11:00 UTC)   → meta_pipeline daily
-  Weekly   — Sunday        at 06:00 IST (00:30 UTC)   → meta_pipeline --weekly
-  Weekly   — Sunday        at 06:30 IST (01:00 UTC)   → gap_analyzer
-
-All times in UTC (IST = UTC+5:30).
-
-Environment variables:
-  COMPOSE_FILE        path to docker-compose.yml (default: docker-compose.yml)
-  TZ                  set to UTC in docker-compose.yml service definition
+Schedule (all times UTC, IST = UTC+5:30):
+  Daily    — Mon–Fri 11:00 UTC (16:30 IST)  → meta_pipeline (steps 1-12)
+  Weekly   — Sun     00:30 UTC (06:00 IST)  → meta_pipeline --weekly (steps 13-16)
+  Weekly   — Sun     01:00 UTC (06:30 IST)  → gap_analyzer
+  Weekly   — Sun     02:00 UTC (07:30 IST)  → option_backtest (full 2yr refresh)
+  Weekly   — Sun     03:00 UTC (08:30 IST)  → mf_pipeline (NAV refresh)
+  Monthly  — 1st     04:00 UTC (09:30 IST)  → holidays_pipeline (seed next year)
 
 Docker:
   docker compose up -d scheduler
@@ -70,13 +67,34 @@ def job_gap_analyzer():
     _run("gap_analyzer")
 
 
+def job_option_backtest():
+    log.info("=== Option backtest weekly refresh triggered ===")
+    _run("option_backtest")                        # buy strategy
+    _run("option_backtest", "--strategy", "sell")  # sell strategy
+
+
+def job_mf_pipeline():
+    log.info("=== MF pipeline weekly NAV refresh triggered ===")
+    _run("mf_pipeline")
+
+
+def job_holidays():
+    """Run only on the 1st of each month."""
+    if datetime.utcnow().day != 1:
+        return
+    log.info("=== Holidays pipeline monthly refresh triggered ===")
+    _run("holidays_pipeline")
+
+
 def main():
     log.info("Scheduler started — all times UTC")
-    log.info("  Daily   pipeline : Mon–Fri 11:00 UTC (16:30 IST)")
-    log.info("  Weekly  refresh  : Sun     00:30 UTC (06:00 IST)")
-    log.info("  Gap     analyzer : Sun     01:00 UTC (06:30 IST)")
+    log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
+    log.info("  Weekly  refresh     : Sun     00:30 UTC (06:00 IST)")
+    log.info("  Gap     analyzer    : Sun     01:00 UTC (06:30 IST)")
+    log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
+    log.info("  MF      pipeline    : Sun     03:00 UTC (08:30 IST)")
+    log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
 
-    # Monday=0 … Friday=4 in schedule; weekdays() covers Mon–Fri
     schedule.every().monday.at("11:00").do(job_daily)
     schedule.every().tuesday.at("11:00").do(job_daily)
     schedule.every().wednesday.at("11:00").do(job_daily)
@@ -85,6 +103,11 @@ def main():
 
     schedule.every().sunday.at("00:30").do(job_weekly)
     schedule.every().sunday.at("01:00").do(job_gap_analyzer)
+    schedule.every().sunday.at("02:00").do(job_option_backtest)
+    schedule.every().sunday.at("03:00").do(job_mf_pipeline)
+
+    # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
+    schedule.every().day.at("04:00").do(job_holidays)
 
     while True:
         schedule.run_pending()
