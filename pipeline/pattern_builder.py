@@ -42,6 +42,7 @@ Usage:
 """
 
 import os
+import re
 import json
 import logging
 import argparse
@@ -67,6 +68,13 @@ CH_PASS = os.getenv("CH_PASSWORD", "")
 MAX_WORKERS  = 8
 BATCH_SIZE   = 500   # insert pattern_event_map rows in batches
 
+# ── SEC-002: input validation ──────────────────────────
+_SAFE_ID = re.compile(r'^[A-Za-z0-9_\-]{1,50}$')
+
+def _validate_id(value: str, label: str) -> None:
+    if not _SAFE_ID.match(value):
+        raise ValueError(f"SEC-002: unsafe {label} {value!r}")
+
 # ── Results tracker ────────────────────────────────────
 results = {
     "patterns_seeded": 0,
@@ -83,6 +91,23 @@ def get_ch_client():
         host=CH_HOST, port=CH_PORT,
         username=CH_USER, password=CH_PASS
     )
+
+
+# ── DATA-003: fii_dii preflight ────────────────────────
+def check_fii_dii_seeded(ch) -> bool:
+    """
+    Returns True if market.fii_dii has at least one row.
+    Logs a clear warning when empty so P005 zero-match silence is explained.
+    """
+    result = ch.query("SELECT count() FROM market.fii_dii FINAL")
+    n = int(result.result_rows[0][0])
+    if n == 0:
+        log.warning(
+            "DATA-003: market.fii_dii is empty — P005 (fii_accumulation_dip) "
+            "will match 0 events. Run fii_dii_pipeline to seed this table."
+        )
+        return False
+    return True
 
 
 # ══════════════════════════════════════════════════════
@@ -427,9 +452,12 @@ def run_pattern_matching(ch, patterns: list[dict],
                 ch.insert_df("analysis.pattern_event_map", df_chunk)
 
             # Update total_matches in patterns table
+            # SEC-002: validate pid and cast count to int before interpolation
+            _validate_id(pid, "pattern_id")
+            total_matches = int(len(match_rows))
             ch.command(
                 f"ALTER TABLE analysis.patterns UPDATE "
-                f"total_matches = {len(match_rows)}, "
+                f"total_matches = {total_matches}, "
                 f"last_backtested = today() "
                 f"WHERE pattern_id = '{pid}' "
                 f"SETTINGS mutations_sync = 0"
@@ -484,6 +512,9 @@ def main():
 
     ch = get_ch_client()
     log.info("ClickHouse connected ✅")
+
+    # DATA-003: warn early if fii_dii not seeded (P005 will have 0 matches)
+    check_fii_dii_seeded(ch)
 
     # ── Step 1: Seed patterns ──────────────────────────
     if not args.map_only:

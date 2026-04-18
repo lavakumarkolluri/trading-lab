@@ -16,9 +16,11 @@ Rating formula (score in [0, 1], then mapped to 1–5 stars):
 Components:
 
   win_rate_component:
-    win_rate_1d / 100   (already in [0,1] range)
-    win_rate_1d here means % of matches where next-day
-    return was positive (not necessarily ≥ 2%).
+    hit_2pct_1d rate (already in [0,1] range)
+    Defined as % of backtest matches where |return_1d| >= 2% in the
+    predicted direction — same threshold backtest_engine uses for win_rate_1d.
+    DATA-002: previously used return_1d > 0 (directional only), which
+    produced a different and more optimistic metric than the stored win_rate_1d.
 
   sample_adequacy:
     log10(n) / log10(1000), capped at 1.0
@@ -157,16 +159,17 @@ def fetch_recency_scores(ch) -> dict:
     return recency
 
 
-def fetch_positive_win_rates(ch) -> dict:
+def fetch_hit_rates(ch) -> dict:
     """
-    Compute what % of backtest rows had positive return_1d
-    (more lenient than hit_2pct — captures the directional edge).
-    Returns {pattern_id: positive_rate (0.0–1.0)}
+    Compute hit rate per pattern using the same 2% threshold as backtest_engine.
+    DATA-002: aligned to countIf(hit_2pct_1d = 1) so win_rate_component here
+    matches win_rate_1d stored in analysis.patterns.
+    Returns {pattern_id: hit_rate (0.0–1.0)}
     """
     result = ch.query(
         "SELECT "
         "  pattern_id, "
-        "  countIf(return_1d > 0) as positive, "
+        "  countIf(hit_2pct_1d = 1) as hits, "
         "  count() as total "
         "FROM analysis.backtests FINAL "
         "GROUP BY pattern_id"
@@ -174,8 +177,8 @@ def fetch_positive_win_rates(ch) -> dict:
 
     rates = {}
     for row in result.result_rows:
-        pid, pos, total = row[0], row[1], row[2]
-        rates[pid] = round(pos / total, 4) if total > 0 else 0.0
+        pid, hits, total = row[0], row[1], row[2]
+        rates[pid] = round(hits / total, 4) if total > 0 else 0.0
 
     return rates
 
@@ -411,7 +414,7 @@ def main():
     recency_scores = fetch_recency_scores(ch)
 
     log.info("Computing positive win rates from backtests...")
-    positive_rates = fetch_positive_win_rates(ch)
+    positive_rates = fetch_hit_rates(ch)
 
     # ── Rate each pattern ──────────────────────────────
     ratings = []

@@ -10,7 +10,8 @@ Run after market close each trading day (3:30 PM IST).
 Validation logic:
   For each open prediction where target_date <= today:
     1. Fetch actual OHLCV for target_date from market.ohlcv_daily
-    2. entry_price = close on prediction_date (what we predicted from)
+    2. entry_price = open on target_date (DATA-001: avoids forward-look bias;
+         prediction is made at EOD on T, trade enters at open on T+1)
     3. Compute actual returns:
          actual_pct_1d = (close[T+1] - entry_price) / entry_price * 100
          actual_pct_3d = (close[T+3] - entry_price) / entry_price * 100
@@ -35,6 +36,7 @@ Usage:
 """
 
 import os
+import re
 import logging
 import argparse
 import threading
@@ -60,6 +62,23 @@ CH_PASS = os.getenv("CH_PASSWORD", "")
 
 MAX_WORKERS         = 8
 EXPIRY_GRACE_DAYS   = 5    # mark as 'expired' if no OHLCV N days after target
+
+# ── SEC-003: input validation ──────────────────────────
+_SAFE_ID     = re.compile(r'^[A-Za-z0-9_\-]{1,50}$')
+_SAFE_SYMBOL = re.compile(r'^[A-Za-z0-9._\-&=]{1,30}$')
+_VALID_STATUSES = frozenset({"hit", "miss", "expired"})
+
+def _validate_id(value: str, label: str) -> None:
+    if not _SAFE_ID.match(value):
+        raise ValueError(f"SEC-003: unsafe {label} {value!r}")
+
+def _validate_symbol(value: str) -> None:
+    if not _SAFE_SYMBOL.match(value):
+        raise ValueError(f"SEC-003: unsafe symbol {value!r}")
+
+def _validate_status(value: str) -> None:
+    if value not in _VALID_STATUSES:
+        raise ValueError(f"SEC-003: invalid status {value!r}")
 
 # ── Results tracker ────────────────────────────────────
 results = {
@@ -136,7 +155,7 @@ def fetch_ohlcv_window(ch, symbol: str, market: str,
     buffer_to = to_date + timedelta(days=8)
 
     result = ch.query(
-        "SELECT date, close "
+        "SELECT date, open, close "
         "FROM market.ohlcv_daily FINAL "
         "WHERE symbol = {sym:String} AND market = {mkt:String} "
         "  AND date >= {d_from:Date} AND date <= {d_to:Date} "
@@ -152,7 +171,7 @@ def fetch_ohlcv_window(ch, symbol: str, market: str,
     if not result.result_rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(result.result_rows, columns=["date", "close"])
+    df = pd.DataFrame(result.result_rows, columns=["date", "open", "close"])
     df["date"] = pd.to_datetime(df["date"]).dt.date
     return df.sort_values("date").reset_index(drop=True)
 
@@ -175,18 +194,19 @@ def get_nth_close_after(df_ohlcv: pd.DataFrame,
 
 def compute_actual_returns(df_ohlcv: pd.DataFrame,
                            prediction_date: date,
+                           target_date: date,
                            predicted_direction: str,
                            predicted_min_pct: float) -> dict:
     """
-    Compute actual forward returns from entry_price (close on prediction_date).
-    entry_price = close on prediction_date (the day we made the prediction).
+    Compute actual forward returns using open on target_date as entry_price.
+    DATA-001: entry at open[target_date] eliminates forward-look bias
+    (prediction is made at EOD on T; earliest realistic entry is open on T+1).
     """
-    # Entry price = close on prediction_date
-    entry_row = df_ohlcv[df_ohlcv["date"] == prediction_date]
+    entry_row = df_ohlcv[df_ohlcv["date"] == target_date]
     if entry_row.empty:
         return {}
 
-    entry_price = float(entry_row.iloc[0]["close"])
+    entry_price = float(entry_row.iloc[0]["open"])
     if entry_price <= 0:
         return {}
 
@@ -251,11 +271,16 @@ def update_prediction_status(ch, symbol: str,
                               pattern_id: str,
                               status: str):
     """Update status of a prediction to 'hit', 'miss', or 'expired'."""
+    # SEC-003: validate all user-derived values before SQL interpolation
+    _validate_status(status)
+    _validate_symbol(symbol)
+    _validate_id(pattern_id, "pattern_id")
+    safe_date = str(prediction_date)   # date.__str__ always yields YYYY-MM-DD
     ch.command(
         f"ALTER TABLE analysis.predictions UPDATE "
         f"status = '{status}' "
         f"WHERE symbol = '{symbol}' "
-        f"  AND prediction_date = '{prediction_date}' "
+        f"  AND prediction_date = '{safe_date}' "
         f"  AND pattern_id = '{pattern_id}' "
         f"SETTINGS mutations_sync = 0"
     )
@@ -338,7 +363,7 @@ def process_symbol(symbol: str,
 
             # Compute actual returns
             actuals = compute_actual_returns(
-                df_ohlcv, prediction_date, direction, min_pct
+                df_ohlcv, prediction_date, target_date, direction, min_pct
             )
 
             if not actuals:

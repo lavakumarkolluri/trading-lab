@@ -34,6 +34,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import logging
 import argparse
@@ -64,6 +65,13 @@ HISTORY_DAYS      = 300       # days of OHLCV to fetch per symbol for rolling wi
 MIN_HISTORY_ROWS  = 30        # skip if fewer rows available before event date
 FEATURE_VERSION   = "v1"
 
+# ── SEC-004: input validation ──────────────────────────
+_SAFE_SYMBOL = re.compile(r'^[A-Za-z0-9._\-&=]{1,30}$')
+
+def _validate_symbol(value: str) -> None:
+    if not _SAFE_SYMBOL.match(value):
+        raise ValueError(f"SEC-004: unsafe symbol {value!r}")
+
 # ── Results tracker ────────────────────────────────────
 results = {
     "processed": 0,
@@ -79,6 +87,24 @@ def get_ch_client():
         host=CH_HOST, port=CH_PORT,
         username=CH_USER, password=CH_PASS
     )
+
+
+# ── DATA-003: fii_dii preflight ────────────────────────
+def check_fii_dii_seeded(ch) -> bool:
+    """
+    Returns True if market.fii_dii has at least one row.
+    Logs a clear warning when empty so P005 zero-match silence is explained.
+    """
+    result = ch.query("SELECT count() FROM market.fii_dii FINAL")
+    n = int(result.result_rows[0][0])
+    if n == 0:
+        log.warning(
+            "DATA-003: market.fii_dii is empty — P005 (fii_accumulation_dip) "
+            "features will compute fii_net_3d = 0.0. "
+            "Run fii_dii_pipeline to seed this table."
+        )
+        return False
+    return True
 
 
 # ══════════════════════════════════════════════════════
@@ -466,11 +492,15 @@ def mark_events_processed(ch, symbol: str, dates: list[date]):
     """
     if not dates:
         return
+    # SEC-004: validate symbol; assert each element is a date so str() is safe
+    _validate_symbol(symbol)
+    for d in dates:
+        assert isinstance(d, date), f"SEC-004: expected date, got {type(d)}"
     date_list = ", ".join(f"'{d}'" for d in dates)
     ch.command(
         f"ALTER TABLE analysis.detected_events UPDATE processed = 1 "
         f"WHERE symbol = '{symbol}' AND date IN ({date_list}) "
-        f"SETTINGS mutations_sync = 0"   # async — don't block the pipeline
+        f"SETTINGS mutations_sync = 0"
     )
 
 
@@ -733,6 +763,9 @@ def main():
 
     ch = get_ch_client()
     log.info("ClickHouse connected ✅")
+
+    # DATA-003: warn early if fii_dii not seeded (P005 features will be zero)
+    check_fii_dii_seeded(ch)
 
     # Fetch all unprocessed events
     log.info("Fetching unprocessed events from analysis.detected_events...")
