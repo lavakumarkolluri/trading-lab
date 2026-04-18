@@ -76,6 +76,13 @@ NSE_HOME       = "https://www.nseindia.com"
 NSE_ARCHIVE    = "https://nsearchives.nseindia.com"
 SESSION_TIMEOUT = 30
 
+# Transaction costs (Zerodha / NSE typical)
+LOT_SIZE        = 75      # Nifty options lot size
+BROKERAGE       = 20.0    # flat per order leg; round-trip = 2 legs
+STT_PCT         = 0.0005  # 0.05% of premium on sell leg only
+EXCHANGE_PCT    = 0.0005  # NSE + SEBI charges (both legs combined ~0.05%)
+GST_RATE        = 0.18    # 18% GST on brokerage only
+
 # Nifty strike step (index options in 50-point increments)
 STRIKE_STEP = 50.0
 
@@ -359,12 +366,29 @@ def find_atm_price(df_near: pd.DataFrame, spot: float,
     return 0.0, 0.0
 
 
+def transaction_cost_per_unit(entry_price: float, exit_price: float,
+                               strategy: str) -> float:
+    """
+    Round-trip transaction cost per unit (1 contract, not per lot).
+    For BUYING  : you buy at entry, sell at exit → STT on exit leg
+    For SELLING : you sell at entry, buy back at exit → STT on entry leg
+    """
+    brok  = (BROKERAGE * 2) * (1 + GST_RATE)   # buy + sell legs, with GST
+    exch  = (entry_price + exit_price) * EXCHANGE_PCT
+    if strategy == "buy":
+        stt = exit_price * STT_PCT
+    else:
+        stt = entry_price * STT_PCT
+    return round((brok + exch + stt) / LOT_SIZE, 4)   # per unit
+
+
 # ══════════════════════════════════════════════════════
 # Core backtest loop
 # ══════════════════════════════════════════════════════
 
 def run_backtest(vix_df: pd.DataFrame,
-                 bhavcopy_cache: dict[date, pd.DataFrame]) -> list[dict]:
+                 bhavcopy_cache: dict[date, pd.DataFrame],
+                 strategy: str = "buy") -> list[dict]:  # strategy stored per row
     """
     Replay strategy signal day-by-day using only past data.
 
@@ -428,7 +452,12 @@ def run_backtest(vix_df: pd.DataFrame,
         if bias == "neutral":
             continue
 
-        opt_type = "CE" if bias == "bullish" else "PE"
+        # Buy: follow bias (buy CE on bullish, buy PE on bearish)
+        # Sell: fade bias (sell PE on bullish = it decays, sell CE on bearish)
+        if strategy == "buy":
+            opt_type = "CE" if bias == "bullish" else "PE"
+        else:
+            opt_type = "PE" if bias == "bullish" else "CE"
 
         # ── Entry price (ATM option close on signal date, no lookahead)
         atm_strike, entry_price = find_atm_price(df_near, nifty_spot, opt_type)
@@ -464,8 +493,12 @@ def run_backtest(vix_df: pd.DataFrame,
         nifty_ret  = round((nifty_exit - nifty_spot) / nifty_spot * 100, 4) \
                      if nifty_spot > 0 and nifty_exit > 0 else 0.0
 
-        pnl     = round(exit_price - entry_price, 2)
-        pnl_pct = round(pnl / entry_price * 100, 4) if entry_price > 0 else 0.0
+        # Buyer P&L = exit - entry; Seller P&L = entry - exit (collected premium)
+        gross_pnl = exit_price - entry_price if strategy == "buy" \
+                    else entry_price - exit_price
+        cost      = transaction_cost_per_unit(entry_price, exit_price, strategy)
+        pnl       = round(gross_pnl - cost, 2)
+        pnl_pct   = round(pnl / entry_price * 100, 4) if entry_price > 0 else 0.0
 
         signals.append({
             "signal_date":     today,
@@ -475,6 +508,7 @@ def run_backtest(vix_df: pd.DataFrame,
             "vix_rank":        round(vix_rank, 2),
             "pcr":             pcr,
             "bias":            bias,
+            "strategy":        strategy,
             "atm_strike":      atm_strike,
             "entry_type":      opt_type,
             "entry_price":     entry_price,
@@ -505,7 +539,8 @@ def insert_results(ch, signals: list[dict]):
     log.info(f"Inserted {len(signals)} rows → analysis.option_backtest_results")
 
 
-def print_summary(signals: list[dict], from_date: date, to_date: date):
+def print_summary(signals: list[dict], from_date: date, to_date: date,
+                  strategy: str = "buy"):
     if not signals:
         print("\nNo signals generated — check VIX data and bhavcopy downloads.")
         return
@@ -544,9 +579,11 @@ def print_summary(signals: list[dict], from_date: date, to_date: date):
     worst = df.loc[df["pnl"].idxmin()]
 
     w = 58
+    action = "BUY ATM (CE/PE)" if strategy == "buy" else "SELL ATM (PE/CE)"
     print(f"\n{'═'*w}")
     print(f"  OPTION STRATEGY BACKTEST RESULTS")
-    print(f"  Period : {from_date} → {to_date}")
+    print(f"  Strategy : {action}  [P&L after transaction costs]")
+    print(f"  Period   : {from_date} → {to_date}")
     print(f"{'─'*w}")
     print(f"  Total signals      : {total:>6}  "
           f"({total / max(1,(to_date-from_date).days)*100:.0f}% of calendar days)")
@@ -601,6 +638,8 @@ def main():
                         help="Start date YYYY-MM-DD (overrides --days)")
     parser.add_argument("--to",      dest="to_date",   type=str, default=None,
                         help="End date YYYY-MM-DD (default: today-3)")
+    parser.add_argument("--strategy", choices=["buy", "sell"], default="buy",
+                        help="buy = long ATM option; sell = short ATM option (default: buy)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute and print without inserting to DB")
     args = parser.parse_args()
@@ -615,6 +654,7 @@ def main():
     log.info("═" * 55)
     log.info("  OPTION STRATEGY BACKTEST")
     log.info(f"  Period  : {from_date} → {to_date}")
+    log.info(f"  Strategy: {args.strategy.upper()}")
     log.info(f"  Mode    : {'DRY RUN' if args.dry_run else 'LIVE (will insert to DB)'}")
     log.info("═" * 55)
 
@@ -655,13 +695,13 @@ def main():
 
     # ── Step 3: Run backtest ─────────────────────────────
     log.info("Step 3/3: Replaying signals (no-lookahead)...")
-    signals = run_backtest(vix_df, bhavcopy_cache)
+    signals = run_backtest(vix_df, bhavcopy_cache, strategy=args.strategy)
     log.info(f"Signals generated: {len(signals)}")
 
     if not args.dry_run and signals:
         insert_results(ch, signals)
 
-    print_summary(signals, from_date, to_date)
+    print_summary(signals, from_date, to_date, strategy=args.strategy)
 
     if args.dry_run:
         log.info("[DRY RUN] Results not inserted to DB.")
