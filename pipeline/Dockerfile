@@ -47,5 +47,6 @@ COPY gap_analyzer.py .
 COPY scheduler.py .
 COPY vix_pipeline.py .
 COPY option_chain_pipeline.py .
+COPY option_backtest.py .
 
 CMD ["python", "main.py"]
