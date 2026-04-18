@@ -34,7 +34,7 @@
 
 ---
 
-### BUG-002 🟡 🔲 OPEN Migration 025 is an exact duplicate of migration 024
+### BUG-002 🟡 ✅ FIXED Migration 025 is an exact duplicate of migration 024
 **File:** `clickhouse/migrations/025_recreate_market_mf_nav_enriched.sql`
 **Root cause:** File is byte-for-byte identical to migration 024 — same comment header `-- Migration : 024`, same CREATE TABLE. The filename says "recreate" but `CREATE TABLE IF NOT EXISTS` makes it a no-op.
 **Impact:** Whatever schema change was intended was never applied. The migration history is misleading.
@@ -50,21 +50,21 @@
 
 ---
 
-### BUG-004 🟠 🔲 OPEN backtest_engine.py — update_pattern_stats uses ALTER TABLE UPDATE on ReplacingMergeTree
+### BUG-004 🟠 ✅ FIXED backtest_engine.py — update_pattern_stats uses ALTER TABLE UPDATE on ReplacingMergeTree
 **File:** `pipeline/backtest_engine.py`, function `update_pattern_stats`
 **Root cause:** Decision 026 explicitly forbids ALTER TABLE UPDATE on ReplacingMergeTree tables. While this doesn't touch `version` directly, ALTER UPDATE mutations can conflict with deduplication merges.
 **Fix (Sprint 3):** Re-insert the full patterns row with `version = int(datetime.now().timestamp())` instead of using ALTER UPDATE.
 
 ---
 
-### BUG-005 🟡 🔲 OPEN mf_compute_returns.py — XIRR Newton-Raphson domain failure
+### BUG-005 🟡 ✅ FIXED mf_compute_returns.py — XIRR Newton-Raphson domain failure
 **File:** `pipeline/mf_compute_returns.py`, function `_xirr_newton`
 **Root cause:** Global `warnings.filterwarnings("ignore", category=RuntimeWarning)` suppresses all RuntimeWarnings in the module, masking legitimate issues. The Newton-Raphson solver can iterate into invalid domains with fractional time periods.
 **Fix (Sprint 4):** Remove global suppression; use `np.errstate` for the specific operation; add domain guard `rate > -1` before each Newton step.
 
 ---
 
-### BUG-006 🟢 🔲 OPEN prediction_engine.py — VIX NaN guard is opaque
+### BUG-006 🟢 ✅ FIXED prediction_engine.py — VIX NaN guard is opaque
 **File:** `pipeline/prediction_engine.py`
 **Code:** `v == v` is a NaN check that also doesn't guard against `float('inf')`.
 **Fix (Sprint 4):** Replace with `math.isfinite(v)`.
@@ -97,34 +97,34 @@
 
 ---
 
-### SEC-005 🟡 🔲 OPEN SQL Injection — cleanup_schemes.py (low risk, integers only)
-**Fix (Sprint 4):** Parameterize or use typed integer list.
+### SEC-005 🟡 ✅ FIXED SQL Injection — cleanup_schemes.py (low risk, integers only)
+**Fix applied (Sprint 3):** `safe_codes = [int(c) for c in to_delete]` before interpolation.
 
 ---
 
-### SEC-006 🟡 🔲 OPEN ClickHouse allows broad 172.16.0.0/12 network
-**Fix (Sprint 4):** Restrict to specific Docker network CIDR.
+### SEC-006 🟡 ✅ FIXED ClickHouse allows broad 172.16.0.0/12 network
+**Fix applied (Sprint 3):** Restricted to `172.18.0.0/16` (actual trading-lab compose network CIDR) in `clickhouse/config/default-user.xml`.
 
 ---
 
-### SEC-007 🟡 🔲 OPEN participant_oi uses network_mode: host
-**Fix (Sprint 4):** Move to standard Docker network.
+### SEC-007 🟡 ✅ FIXED participant_oi uses network_mode: host
+**Fix applied (Sprint 3):** Removed `network_mode: host`; set `CH_HOST=clickhouse`, `MINIO_HOST=minio:9000`; added healthcheck `depends_on`.
 
 ---
 
 ## PERFORMANCE
 
-### PERF-001 🟠 🔲 OPEN One ALTER UPDATE mutation per pattern per backtest run
-**Fix (Sprint 3):** Re-insert full pattern rows instead of ALTER UPDATE.
+### PERF-001 🟠 ✅ FIXED One ALTER UPDATE mutation per pattern per backtest run
+**Fix applied (Sprint 3):** Re-insert full pattern row with `version=int(now.timestamp())` instead of ALTER UPDATE (Decision 026 compliance).
 
 ### PERF-002 🟡 🔲 OPEN SIP XIRR O(n × months) dominant runtime
 **Fix (Sprint 4):** Pre-compute monthly, forward-fill within month.
 
-### PERF-003 🟡 🔲 OPEN cleanup_schemes mutations_sync=1 can timeout
-**Fix (Sprint 4):** Switch to mutations_sync=0 with separate completion check.
+### PERF-003 🟡 ✅ FIXED cleanup_schemes mutations_sync=1 can timeout
+**Fix applied (Sprint 3):** All three DELETE statements now use `mutations_sync=0`.
 
-### PERF-004 🟡 🔲 OPEN migrate.py single command() silently drops multi-statement files
-**Fix (Sprint 3):** Split SQL on `;\n` and execute each statement separately.
+### PERF-004 🟡 ✅ FIXED migrate.py single command() silently drops multi-statement files
+**Fix applied (Sprint 3):** Split SQL on `";\n"` and execute each statement separately; log statement count.
 
 ---
 
@@ -147,33 +147,33 @@
 
 ---
 
-### DATA-004 🟡 🔲 OPEN fii_dii_pipeline has no validation of NSE API values
-**Fix (Sprint 4):** Add bounds checking on parsed values.
+### DATA-004 🟡 ✅ FIXED fii_dii_pipeline has no validation of NSE API values
+**Fix applied (Sprint 3):** `_validate_flow(value, field, date_str)` clamps out-of-bounds values to 0 with a warning; `_MAX_FLOW_CR = 200_000.0`.
 
-### DATA-005 🟡 🔲 OPEN gap_analyzer.py missing — closed-loop feedback never runs
-**Fix (Sprint 3):** Implement gap_analyzer.py.
+### DATA-005 🟡 ✅ FIXED gap_analyzer.py missing — closed-loop feedback never runs
+**Fix applied (Sprint 3):** `pipeline/gap_analyzer.py` implemented; added as WEEKLY_STEPS Step 14 (soft_fail); `gap_analyzer` service in docker-compose.yml.
 
-### DATA-006 🟡 🔲 OPEN Partial migration executes as success (see PERF-004)
-**Fix (Sprint 3):** Same fix as PERF-004.
+### DATA-006 🟡 ✅ FIXED Partial migration executes as success (see PERF-004)
+**Fix applied (Sprint 3):** Same fix as PERF-004 — multi-statement split in migrate.py.
 
 ---
 
 ## MAINTENANCE / OPERATIONAL
 
-### OPS-001 🔴 🔲 OPEN No cron/scheduler — pipeline never auto-runs
-**Note:** Original fix proposed a host cron job (`setup_cron.sh`). Rejected — policy is nothing runs on host.
-**Fix (Sprint 3):** Implement a scheduler service in docker-compose.yml that runs meta_pipeline on a cron schedule inside Docker.
+### OPS-001 🔴 ✅ FIXED No cron/scheduler — pipeline never auto-runs
+**Note:** Original host cron rejected. Fix is Docker-native.
+**Fix applied (Sprint 3):** `pipeline/scheduler.py` uses `schedule` lib; `scheduler` service runs `restart: unless-stopped`; runs daily 16:30 IST Mon–Fri and weekly Sunday 06:00/06:30 IST.
 
 ---
 
-### OPS-002 🟠 🔲 OPEN gap_analyzer.py absent from Dockerfile and codebase
-**Fix (Sprint 3):** Implement file; add COPY to Dockerfile.
+### OPS-002 🟠 ✅ FIXED gap_analyzer.py absent from Dockerfile and codebase
+**Fix applied (Sprint 3):** `pipeline/gap_analyzer.py` implemented; `COPY gap_analyzer.py .` added to Dockerfile; `gap_analyzer` service in docker-compose.yml.
 
-### OPS-003 🟡 🔲 OPEN No failure alerting mechanism
-**Fix (Sprint 4):** Add Telegram bot notification to meta_pipeline.py.
+### OPS-003 🟡 ✅ FIXED No failure alerting mechanism
+**Fix applied (Sprint 3):** `meta_pipeline.py` calls `_send_telegram()` on any step failure when `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` env vars are set.
 
-### OPS-004 🟡 🔲 OPEN Holiday cache never invalidated in long-running processes
-**Fix (Sprint 4):** Add 24h TTL to `_cache_loaded` check.
+### OPS-004 🟡 ✅ FIXED Holiday cache never invalidated in long-running processes
+**Fix applied (Sprint 3):** `_cache_loaded_at` timestamp + `_CACHE_TTL_SECONDS=86400` force reload after 24h in `holidays_pipeline.py`.
 
 ### OPS-005 🟡 ✅ FIXED participant_oi_pipeline not in meta_pipeline steps
 **Fix applied (Sprint 1):** Added as Step 3 (soft_fail=True) in DAILY_STEPS.
@@ -191,32 +191,32 @@
 | ID | Severity | Status | Short Description |
 |----|----------|--------|-------------------|
 | BUG-001 | 🔴 | ✅ FIXED | meta_pipeline fails — docker CLI missing in image |
-| BUG-002 | 🟡 | 🔲 OPEN | Migration 025 is exact duplicate of 024 |
+| BUG-002 | 🟡 | ✅ FIXED | Migration 025 is exact duplicate of 024 |
 | BUG-003 | 🟠 | ✅ FIXED | pattern_builder overwrites total_matches with per-run count |
-| BUG-004 | 🟠 | 🔲 OPEN | backtest_engine uses ALTER UPDATE on ReplacingMergeTree |
-| BUG-005 | 🟡 | 🔲 OPEN | XIRR Newton-Raphson domain failure suppressed globally |
-| BUG-006 | 🟢 | 🔲 OPEN | VIX NaN guard opaque and misses inf |
+| BUG-004 | 🟠 | ✅ FIXED | backtest_engine uses ALTER UPDATE on ReplacingMergeTree |
+| BUG-005 | 🟡 | ✅ FIXED | XIRR Newton-Raphson domain failure suppressed globally |
+| BUG-006 | 🟢 | ✅ FIXED | VIX NaN guard opaque and misses inf |
 | SEC-001 | 🔴 | ✅ FIXED | SQL injection in backtest_engine update_pattern_stats |
 | SEC-002 | 🔴 | ✅ FIXED | SQL injection in pattern_builder ALTER UPDATE |
 | SEC-003 | 🔴 | ✅ FIXED | SQL injection in validation_engine update_prediction_status |
 | SEC-004 | 🔴 | ✅ FIXED | SQL injection in pattern_feature_extractor mark_events_processed |
-| SEC-005 | 🟡 | 🔲 OPEN | SQL injection in cleanup_schemes DELETE (integer, lower risk) |
-| SEC-006 | 🟡 | 🔲 OPEN | ClickHouse allows broad 172.16.0.0/12 network range |
-| SEC-007 | 🟡 | 🔲 OPEN | participant_oi uses network_mode: host |
-| PERF-001 | 🟠 | 🔲 OPEN | One ALTER UPDATE mutation per pattern per backtest run |
+| SEC-005 | 🟡 | ✅ FIXED | SQL injection in cleanup_schemes DELETE (integer, lower risk) |
+| SEC-006 | 🟡 | ✅ FIXED | ClickHouse allows broad 172.16.0.0/12 network range |
+| SEC-007 | 🟡 | ✅ FIXED | participant_oi uses network_mode: host |
+| PERF-001 | 🟠 | ✅ FIXED | One ALTER UPDATE mutation per pattern per backtest run |
 | PERF-002 | 🟡 | 🔲 OPEN | SIP XIRR O(n × months) — dominant runtime bottleneck |
-| PERF-003 | 🟡 | 🔲 OPEN | cleanup_schemes mutations_sync=1 can timeout on large tables |
-| PERF-004 | 🟡 | 🔲 OPEN | migrate.py single command() silently drops multi-statement files |
+| PERF-003 | 🟡 | ✅ FIXED | cleanup_schemes mutations_sync=1 can timeout on large tables |
+| PERF-004 | 🟡 | ✅ FIXED | migrate.py single command() silently drops multi-statement files |
 | DATA-001 | 🟠 | ✅ FIXED | Entry price uses prediction_date close — forward-look bias |
 | DATA-002 | 🟠 | ✅ FIXED | win_rate in star ratings ≠ win_rate_1d in patterns (threshold mismatch) |
 | DATA-003 | 🟠 | ✅ FIXED | P005 permanently zero matches until fii_dii seeded |
-| DATA-004 | 🟡 | 🔲 OPEN | fii_dii_pipeline has no validation of NSE API values |
-| DATA-005 | 🟡 | 🔲 OPEN | gap_analyzer.py missing — closed-loop feedback never runs |
-| DATA-006 | 🟡 | 🔲 OPEN | Partial migration executes as success (see PERF-004) |
-| OPS-001 | 🔴 | 🔲 OPEN | No cron/scheduler — pipeline never auto-runs (host cron rejected) |
-| OPS-002 | 🟠 | 🔲 OPEN | gap_analyzer.py absent from Dockerfile and codebase |
-| OPS-003 | 🟡 | 🔲 OPEN | No failure alerting mechanism |
-| OPS-004 | 🟡 | 🔲 OPEN | Holiday cache never invalidated in long-running processes |
+| DATA-004 | 🟡 | ✅ FIXED | fii_dii_pipeline has no validation of NSE API values |
+| DATA-005 | 🟡 | ✅ FIXED | gap_analyzer.py missing — closed-loop feedback never runs |
+| DATA-006 | 🟡 | ✅ FIXED | Partial migration executes as success (see PERF-004) |
+| OPS-001 | 🔴 | ✅ FIXED | No cron/scheduler — pipeline never auto-runs (host cron rejected) |
+| OPS-002 | 🟠 | ✅ FIXED | gap_analyzer.py absent from Dockerfile and codebase |
+| OPS-003 | 🟡 | ✅ FIXED | No failure alerting mechanism |
+| OPS-004 | 🟡 | ✅ FIXED | Holiday cache never invalidated in long-running processes |
 | OPS-005 | 🟡 | ✅ FIXED | participant_oi_pipeline not in meta_pipeline steps |
 | OPS-006 | 🟡 | ✅ FIXED | fii_dii_pipeline not in meta_pipeline steps |
 | OPS-007 | 🟢 | ✅ FIXED | progress.md outdated since 2026-03-04 |
@@ -229,5 +229,7 @@
 |--------|-------|--------|
 | Sprint 1 | Pipeline runs + security baseline + orchestration | ✅ COMPLETE |
 | Sprint 2 | Data correctness (BUG-003, DATA-001/002/003, SEC-002/003/004) | ✅ COMPLETE |
-| Sprint 3 | Close the loop (gap_analyzer, BUG-004, migrate.py, OPS-001 Docker scheduler) | 🔲 PENDING |
-| Sprint 4 | Quality & robustness (network, alerting, performance) | 🔲 PENDING |
+| Sprint 3 | Close the loop (gap_analyzer, BUG-004, migrate.py, OPS-001 Docker scheduler) | ✅ COMPLETE |
+| Sprint 4 | Quality & robustness (network, alerting, performance) | ✅ COMPLETE |
+
+**Only remaining open issue: PERF-002** (SIP XIRR O(n × months) optimisation — deferred, not blocking).
