@@ -48,7 +48,7 @@ CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
 
 LOOKBACK_DAYS = 730
-VIX_SYMBOL    = "INDIAVIX.NS"
+VIX_SYMBOL    = "^INDIAVIX"
 NIFTY_SYMBOL  = "^NSEI"
 
 # VIX → regime label thresholds (upper-exclusive bounds)

@@ -54,8 +54,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
-import requests as std_requests
 import clickhouse_connect
+from curl_cffi import requests as cffi_requests
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,8 +70,11 @@ CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
 
 LOOKBACK_DAYS  = 730
-MAX_WORKERS    = 6      # concurrent bhavcopy downloads
-REQUEST_DELAY  = 0.3    # seconds between requests per worker
+MAX_WORKERS    = 3      # concurrent bhavcopy downloads (NSE rate-limits aggressively)
+REQUEST_DELAY  = 1.0    # seconds between requests per worker
+NSE_HOME       = "https://www.nseindia.com"
+NSE_ARCHIVE    = "https://nsearchives.nseindia.com"
+SESSION_TIMEOUT = 30
 
 # Nifty strike step (index options in 50-point increments)
 STRIKE_STEP = 50.0
@@ -110,7 +113,8 @@ def _parse_new_format(df: pd.DataFrame) -> pd.DataFrame:
         df["OptnTp"].isin(["CE", "PE"])
     )
     if "FinInstrmTp" in df.columns:
-        mask &= df["FinInstrmTp"].str.strip().eq("IO")
+        # NSE changed instrument type from "IO" to "IDO" around 2025-2026
+        mask &= df["FinInstrmTp"].str.strip().isin(["IO", "IDO"])
     df = df[mask].copy()
     if df.empty:
         return pd.DataFrame()
@@ -154,7 +158,26 @@ def _parse_old_format(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["expiry", "strike", "close"])
 
 
-def fetch_bhavcopy(dt: date) -> pd.DataFrame | None:
+def build_nse_session() -> cffi_requests.Session:
+    """Build a curl_cffi session that bypasses NSE bot protection."""
+    session = cffi_requests.Session(impersonate="chrome110")
+    log.info("Warming NSE session...")
+    session.get(
+        f"{NSE_HOME}/option-chain",
+        timeout=SESSION_TIMEOUT,
+        headers={
+            "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 Chrome/110.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://www.nseindia.com/",
+        },
+    )
+    log.info(f"NSE session ready (cookies: {len(session.cookies)})")
+    time.sleep(2)
+    return session
+
+
+def fetch_bhavcopy(dt: date, session: cffi_requests.Session) -> pd.DataFrame | None:
     """
     Download and parse NSE F&O bhavcopy for one date.
     Returns DataFrame(expiry, strike, option_type, close, oi) with
@@ -162,8 +185,14 @@ def fetch_bhavcopy(dt: date) -> pd.DataFrame | None:
     """
     url = BHAVCOPY_URL.format(date=dt.strftime("%Y%m%d"))
     try:
-        resp = std_requests.get(url, timeout=30,
-                                headers={"User-Agent": "Mozilla/5.0"})
+        resp = session.get(
+            url, timeout=SESSION_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 Chrome/110.0.0.0 Safari/537.36",
+                "Referer":    "https://www.nseindia.com/",
+            },
+        )
         if resp.status_code == 404:
             return None   # holiday / weekend — silent skip
         resp.raise_for_status()
@@ -185,26 +214,32 @@ def fetch_bhavcopy(dt: date) -> pd.DataFrame | None:
         return df if not df.empty else None
 
     except zipfile.BadZipFile:
-        log.debug(f"  {dt}: bad zip — likely not a trading day")
-        return None
+        return None   # holiday / weekend
     except Exception as e:
-        log.debug(f"  {dt}: fetch failed — {e}")
+        log.warning(f"  {dt}: fetch failed — {e}")
         return None
 
 
 def download_bhavcopy_range(dates: list[date]) -> dict[date, pd.DataFrame]:
     """
-    Download bhavcopy files for all dates in parallel.
+    Download bhavcopy files for all dates.
+    Each worker thread gets its own NSE session (curl_cffi is not thread-safe).
     Returns {date: DataFrame} for dates that have data.
     """
-    cache   = {}
-    lock    = threading.Lock()
-    total   = len(dates)
-    done    = [0]
+    _local = threading.local()
+    cache  = {}
+    lock   = threading.Lock()
+    total  = len(dates)
+    done   = [0]
+
+    def _get_session():
+        if not hasattr(_local, "session"):
+            _local.session = build_nse_session()
+        return _local.session
 
     def _fetch_one(dt: date):
         time.sleep(REQUEST_DELAY)
-        df = fetch_bhavcopy(dt)
+        df = fetch_bhavcopy(dt, _get_session())
         with lock:
             done[0] += 1
             if df is not None:
@@ -229,7 +264,7 @@ def fetch_vix_series(ch, from_date: date, to_date: date) -> pd.DataFrame:
     Returns DataFrame: date, vix, nifty_spot (sorted ascending).
     """
     result = ch.query(
-        "SELECT toDate(timestamp) AS d, avg(vix) AS vix, avg(nifty_spot) AS nifty "
+        "SELECT toDate(timestamp) AS d, avg(vix) AS avg_vix, avg(nifty_spot) AS avg_nifty "
         "FROM market.nifty_live FINAL "
         "WHERE toDate(timestamp) >= {f:Date} AND toDate(timestamp) <= {t:Date} "
         "  AND vix > 0 "
