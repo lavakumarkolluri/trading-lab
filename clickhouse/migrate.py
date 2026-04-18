@@ -176,14 +176,22 @@ def run_migrations(client):
 
         try:
             with open(filepath, "r") as f:
-                sql = f.read().strip()
+                raw = f.read()
 
-            client.command(sql)
+            # PERF-004 / DATA-006: split on ";\n" so multi-statement migration
+            # files execute each statement individually. A single client.command()
+            # silently drops everything after the first semicolon in ClickHouse.
+            statements = [s.strip() for s in raw.split(";\n") if s.strip()]
+            # Strip trailing lone semicolons that produce empty statements
+            statements = [s.rstrip(";").strip() for s in statements if s.rstrip(";").strip()]
+
+            for stmt in statements:
+                client.command(stmt)
 
             duration = int((datetime.now() - start).total_seconds() * 1000)
             record_migration(client, migration_id, filename,
                              checksum, "success", duration)
-            ok(f"  Done in {duration}ms")
+            ok(f"  Done in {duration}ms ({len(statements)} statement(s))")
             success += 1
 
         except Exception as e:

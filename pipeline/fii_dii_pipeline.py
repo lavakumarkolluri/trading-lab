@@ -212,12 +212,16 @@ def fetch_chunk(session: requests.Session,
                 log.warning(f"Unparseable date: {raw_date!r} — skipping")
                 continue
 
+        date_str   = str(trade_date)
+        buy_value  = _validate_flow(_parse_float(item.get("buyValue",  0)), "buy_value",  date_str)
+        sell_value = _validate_flow(_parse_float(item.get("sellValue", 0)), "sell_value", date_str)
+        net_value  = _validate_flow(_parse_float(item.get("netValue",  0)), "net_value",  date_str)
         rows.append({
             "date":       trade_date,
             "entity":     entity,
-            "buy_value":  _parse_float(item.get("buyValue", 0)),
-            "sell_value": _parse_float(item.get("sellValue", 0)),
-            "net_value":  _parse_float(item.get("netValue", 0)),
+            "buy_value":  buy_value,
+            "sell_value": sell_value,
+            "net_value":  net_value,
         })
 
     return rows
@@ -228,6 +232,22 @@ def _parse_float(val) -> float:
         return float(str(val).replace(",", "").strip() or 0)
     except (ValueError, TypeError):
         return 0.0
+
+
+# DATA-004: reasonable bounds for NSE FII/DII daily flow values (in crores)
+# Largest single-day FII flow on record is ~20,000 cr; 200,000 is a safe ceiling.
+_MAX_FLOW_CR  =  200_000.0
+_MIN_FLOW_CR  = -200_000.0
+
+def _validate_flow(value: float, field: str, date_str: str) -> float:
+    """Clamp and warn if a parsed flow value is outside plausible bounds."""
+    if not (-_MAX_FLOW_CR <= value <= _MAX_FLOW_CR):
+        log.warning(
+            f"DATA-004: {field}={value:.0f} on {date_str} is outside "
+            f"[{_MIN_FLOW_CR:.0f}, {_MAX_FLOW_CR:.0f}] — clamping to 0"
+        )
+        return 0.0
+    return value
 
 
 # MinIO
