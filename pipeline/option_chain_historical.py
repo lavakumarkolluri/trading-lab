@@ -52,14 +52,18 @@ LOOKBACK_DAYS = 730    # default 2 years
 REQUEST_DELAY = 1.5    # seconds between downloads
 HTTP_TIMEOUT  = 30
 
-BHAVCOPY_URL = (
+# Old format (up to ~Jul 2024): /historical/DERIVATIVES/YYYY/MMM/foDDMMMYYYYbhav.csv.zip
+BHAVCOPY_URL_OLD = (
     "https://nsearchives.nseindia.com/content/historical/DERIVATIVES"
     "/{yyyy}/{mmm}/fo{ddmmmyyyy}bhav.csv.zip"
 )
+# New format (Jul 2024 onwards): /content/fo/BhavCopy_NSE_FO_0_0_0_YYYYMMDD_F_0000.csv.zip
+BHAVCOPY_URL_NEW = (
+    "https://nsearchives.nseindia.com/content/fo"
+    "/BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
+)
 
-# Only index options for NIFTY and BANKNIFTY
-TARGET_INSTRUMENT = "OPTIDX"
-TARGET_SYMBOLS    = {"NIFTY", "BANKNIFTY"}
+TARGET_SYMBOLS = {"NIFTY", "BANKNIFTY"}
 
 # EOD timestamp (market close IST — stored as naive datetime in ClickHouse)
 EOD_HOUR   = 15
@@ -96,6 +100,14 @@ def build_session() -> cffi_requests.Session:
 
 # ── Download ─────────────────────────────────────────────
 
+def _get(session: cffi_requests.Session, url: str) -> bytes | None:
+    resp = session.get(url, timeout=HTTP_TIMEOUT)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.content
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=3, max=30),
@@ -104,31 +116,88 @@ def build_session() -> cffi_requests.Session:
 )
 def download_bhavcopy(session: cffi_requests.Session, d: date) -> bytes | None:
     """
-    Download and return the raw ZIP bytes for a given date.
-    Returns None if the file does not exist (weekend / holiday).
+    Try old URL format first, then new format (NSE changed schema ~Jul 2024).
+    Returns ZIP bytes, or None if the date has no file (weekend/holiday).
     """
-    url = BHAVCOPY_URL.format(
+    old_url = BHAVCOPY_URL_OLD.format(
         yyyy=d.strftime("%Y"),
         mmm=d.strftime("%b").upper(),
         ddmmmyyyy=d.strftime("%d%b%Y").upper(),
     )
-    resp = session.get(url, timeout=HTTP_TIMEOUT)
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    return resp.content
+    data = _get(session, old_url)
+    if data is not None:
+        return data
+
+    new_url = BHAVCOPY_URL_NEW.format(yyyymmdd=d.strftime("%Y%m%d"))
+    return _get(session, new_url)
 
 
 # ── Parse ─────────────────────────────────────────────────
 
-def parse_bhavcopy(zip_bytes: bytes, trade_date: date) -> list[dict]:
-    """
-    Extract option rows for NIFTY and BANKNIFTY from the bhavcopy ZIP.
-    Returns a list of row dicts for market.options_chain.
-    """
+def _parse_old_format(df: pd.DataFrame, eod_ts: datetime, version: int) -> list[dict]:
+    """Old bhavcopy: INSTRUMENT/SYMBOL/EXPIRY_DT/STRIKE_PR/OPTION_TYP/CLOSE/OPEN_INT..."""
+    df = df[
+        (df["INSTRUMENT"].str.strip() == "OPTIDX") &
+        (df["SYMBOL"].str.strip().isin(TARGET_SYMBOLS))
+    ].copy()
     rows = []
-    eod_ts = datetime(trade_date.year, trade_date.month, trade_date.day,
-                      EOD_HOUR, EOD_MINUTE, 0)
+    for _, r in df.iterrows():
+        opt_type = str(r["OPTION_TYP"]).strip().upper()
+        if opt_type not in ("CE", "PE"):
+            continue
+        try:
+            expiry = datetime.strptime(str(r["EXPIRY_DT"]).strip(), "%d-%b-%Y").date()
+        except ValueError:
+            continue
+        rows.append({
+            "symbol":      str(r["SYMBOL"]).strip(),
+            "timestamp":   eod_ts,
+            "expiry":      expiry,
+            "strike":      float(r["STRIKE_PR"]),
+            "option_type": opt_type,
+            "ltp":         float(r["CLOSE"])    if pd.notna(r["CLOSE"])    else 0.0,
+            "iv":          0.0,
+            "oi":          int(r["OPEN_INT"])   if pd.notna(r["OPEN_INT"]) else 0,
+            "oi_change":   int(r["CHG_IN_OI"])  if pd.notna(r["CHG_IN_OI"]) else 0,
+            "volume":      int(r["CONTRACTS"])  if pd.notna(r["CONTRACTS"]) else 0,
+            "version":     version,
+        })
+    return rows
+
+
+def _parse_new_format(df: pd.DataFrame, eod_ts: datetime, version: int) -> list[dict]:
+    """New bhavcopy (Jul 2024+): FinInstrmTp/TckrSymb/XpryDt/StrkPric/OptnTp/ClsPric..."""
+    df = df[
+        (df["FinInstrmTp"].str.strip() == "IDO") &
+        (df["TckrSymb"].str.strip().isin(TARGET_SYMBOLS))
+    ].copy()
+    rows = []
+    for _, r in df.iterrows():
+        opt_type = str(r["OptnTp"]).strip().upper()
+        if opt_type not in ("CE", "PE"):
+            continue
+        try:
+            expiry = datetime.strptime(str(r["XpryDt"]).strip(), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        rows.append({
+            "symbol":      str(r["TckrSymb"]).strip(),
+            "timestamp":   eod_ts,
+            "expiry":      expiry,
+            "strike":      float(r["StrkPric"]),
+            "option_type": opt_type,
+            "ltp":         float(r["ClsPric"])         if pd.notna(r["ClsPric"])         else 0.0,
+            "iv":          0.0,
+            "oi":          int(r["OpnIntrst"])         if pd.notna(r["OpnIntrst"])       else 0,
+            "oi_change":   int(r["ChngInOpnIntrst"])   if pd.notna(r["ChngInOpnIntrst"]) else 0,
+            "volume":      int(r["TtlTradgVol"])       if pd.notna(r["TtlTradgVol"])     else 0,
+            "version":     version,
+        })
+    return rows
+
+
+def parse_bhavcopy(zip_bytes: bytes, trade_date: date) -> list[dict]:
+    eod_ts  = datetime(trade_date.year, trade_date.month, trade_date.day, EOD_HOUR, EOD_MINUTE)
     version = int(eod_ts.timestamp())
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -136,49 +205,14 @@ def parse_bhavcopy(zip_bytes: bytes, trade_date: date) -> list[dict]:
         if csv_name is None:
             return []
         with zf.open(csv_name) as f:
-            # header=0: use first row as column names (CSV has trailing comma → 16 cols)
             df = pd.read_csv(f, header=0)
 
-    df = df[
-        (df["INSTRUMENT"].str.strip() == TARGET_INSTRUMENT) &
-        (df["SYMBOL"].str.strip().isin(TARGET_SYMBOLS))
-    ].copy()
-
-    if df.empty:
-        return []
-
-    for _, r in df.iterrows():
-        symbol = r["SYMBOL"].strip()
-        opt_type = r["OPTION_TYP"].strip().upper()
-        if opt_type not in ("CE", "PE"):
-            continue
-
-        try:
-            expiry = datetime.strptime(r["EXPIRY_DT"].strip(), "%d-%b-%Y").date()
-        except (ValueError, AttributeError):
-            continue
-
-        strike = float(r["STRIKE_PR"])
-        ltp    = float(r["CLOSE"])    if pd.notna(r["CLOSE"])    else 0.0
-        oi     = int(r["OPEN_INT"])   if pd.notna(r["OPEN_INT"]) else 0
-        chg_oi = int(r["CHG_IN_OI"]) if pd.notna(r["CHG_IN_OI"]) else 0
-        volume = int(r["CONTRACTS"])  if pd.notna(r["CONTRACTS"]) else 0
-
-        rows.append({
-            "symbol":      symbol,
-            "timestamp":   eod_ts,
-            "expiry":      expiry,
-            "strike":      strike,
-            "option_type": opt_type,
-            "ltp":         ltp,
-            "iv":          0.0,
-            "oi":          oi,
-            "oi_change":   chg_oi,
-            "volume":      volume,
-            "version":     version,
-        })
-
-    return rows
+    # Detect format by column names
+    if "INSTRUMENT" in df.columns:
+        return _parse_old_format(df, eod_ts, version)
+    elif "FinInstrmTp" in df.columns:
+        return _parse_new_format(df, eod_ts, version)
+    return []
 
 
 # ── Insert ────────────────────────────────────────────────
