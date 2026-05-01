@@ -81,6 +81,15 @@ if st.sidebar.button("Refresh Now"):
 # ══════════════════════════════════════════════════════════════════════════════
 if page == "Overview":
     st.title("Overview")
+    st.warning(
+        "⚠️ **Existing backtests are preliminary — uncapped strategies.**  "
+        "The nifty_straddle and option_backtest scripts use naked straddles with no spread "
+        "protection, so worst-case losses are unlimited and can appear large (e.g. ₹81k). "
+        "The new Iron Condor / spread strategy (Step 4) will have defined-risk structure "
+        "where max loss per trade is capped by wing width. Capital floor (₹5k) is a "
+        "live-trading halt rule — it does not cap individual trade losses in historical backtests.",
+        icon="⚠️"
+    )
 
     trades = query("""
         SELECT strategy, entry_month, exit_month, net_ret, is_open
@@ -296,10 +305,10 @@ elif page == "Market Pulse":
     """)
 
     pcr = query("""
-        SELECT date, symbol, pcr, max_pain
+        SELECT date, pcr, max_pain_strike AS max_pain
         FROM market.options_eod_summary FINAL
         WHERE date >= today() - 90
-        ORDER BY date, symbol
+        ORDER BY date
     """)
 
     if not vix.empty:
@@ -338,15 +347,16 @@ elif page == "Market Pulse":
             st.metric("Current Nifty", f"{latest_nifty:,.0f}", delta=f"{change_pct:+.2f}%")
 
     if not pcr.empty:
-        st.subheader("Put-Call Ratio (last 90 days)")
+        st.subheader("Nifty Put-Call Ratio (last 90 days)")
         pcr["date"] = pd.to_datetime(pcr["date"])
-        fig = px.line(pcr, x="date", y="pcr", color="symbol",
-                      labels={"pcr": "PCR", "date": ""})
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=pcr["date"], y=pcr["pcr"],
+                                 line_color="#9b59b6", name="PCR"))
         fig.add_hline(y=1.3, line_dash="dash", line_color="green",
-                      annotation_text="Bullish threshold")
+                      annotation_text="Bullish >1.3")
         fig.add_hline(y=0.7, line_dash="dash", line_color="red",
-                      annotation_text="Bearish threshold")
-        fig.update_layout(height=300)
+                      annotation_text="Bearish <0.7")
+        fig.update_layout(height=300, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
 
