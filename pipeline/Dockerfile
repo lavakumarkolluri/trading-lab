@@ -50,5 +50,10 @@ COPY option_chain_pipeline.py .
 COPY option_backtest.py .
 COPY option_chain_intraday.py .
 COPY option_chain_historical.py .
+COPY walk_forward_validation.py .
+COPY momentum_factor_test.py .
+COPY breakout_backtest.py .
+COPY options_eod_summary_pipeline.py .
+COPY compute_historical_iv.py .
 
 CMD ["python", "main.py"]
