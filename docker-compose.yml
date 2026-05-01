@@ -497,6 +497,21 @@ services:
     entrypoint: ["python", "compute_oi_features.py"]
     command: []
 
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
   lot_size_pipeline:
     build: ./pipeline
     container_name: lot_size_pipeline
