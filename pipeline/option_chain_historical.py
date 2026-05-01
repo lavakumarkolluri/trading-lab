@@ -35,6 +35,8 @@ import pandas as pd
 import clickhouse_connect
 from curl_cffi import requests as cffi_requests
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
+from minio import Minio
+from minio.error import S3Error
 
 from fo_utils import build_lot_size_cache
 
@@ -49,6 +51,12 @@ CH_HOST  = os.getenv("CH_HOST", "clickhouse")
 CH_PORT  = int(os.getenv("CH_PORT", "8123"))
 CH_USER  = os.getenv("CH_USER", "default")
 CH_PASS  = os.getenv("CH_PASSWORD", "")
+
+MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
+MINIO_USER   = os.getenv("MINIO_USER", "admin")
+MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
+MINIO_BUCKET = "trading-data"
+MINIO_PREFIX = "bhavcopy/fo/"
 
 LOOKBACK_DAYS = 730    # default 2 years
 REQUEST_DELAY = 1.5    # seconds between downloads
@@ -65,7 +73,7 @@ BHAVCOPY_URL_NEW = (
     "/BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
 )
 
-TARGET_SYMBOLS = {"NIFTY", "BANKNIFTY"}
+TARGET_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 
 # EOD timestamp (market close IST — stored as naive datetime in ClickHouse)
 EOD_HOUR   = 15
@@ -79,6 +87,19 @@ def get_ch_client():
         host=CH_HOST, port=CH_PORT,
         username=CH_USER, password=CH_PASS
     )
+
+
+def get_mc() -> Minio:
+    return Minio(MINIO_HOST, access_key=MINIO_USER, secret_key=MINIO_PASS, secure=False)
+
+
+def save_to_minio(mc: Minio, zip_bytes: bytes, trade_date: date):
+    key = f"{MINIO_PREFIX}{trade_date.strftime('%Y%m%d')}.zip"
+    try:
+        mc.stat_object(MINIO_BUCKET, key)
+    except S3Error:
+        mc.put_object(MINIO_BUCKET, key, io.BytesIO(zip_bytes), len(zip_bytes),
+                      content_type="application/zip")
 
 
 # ── Already-loaded tracking ───────────────────────────────
@@ -290,6 +311,56 @@ def show_status(ch):
     print()
 
 
+# ── Reprocess ─────────────────────────────────────────────
+
+def reprocess_from_minio(ch, mc: Minio):
+    """
+    Re-parse all bhavcopy zips already in MinIO using the current TARGET_SYMBOLS.
+    Used to backfill new symbols (e.g. FINNIFTY, MIDCPNIFTY) without re-downloading.
+    Insert is idempotent via ReplacingMergeTree.
+    """
+    objs = sorted(
+        mc.list_objects(MINIO_BUCKET, prefix=MINIO_PREFIX, recursive=True),
+        key=lambda o: o.object_name
+    )
+    log.info(f"Reprocessing {len(objs)} bhavcopy files from MinIO "
+             f"with symbols: {TARGET_SYMBOLS}")
+
+    lot_size_known = build_lot_size_cache(ch)
+    loaded = skipped = 0
+
+    for obj in objs:
+        name = obj.object_name.split("/")[-1].replace(".zip", "")
+        try:
+            trade_date = datetime.strptime(name, "%Y%m%d").date()
+        except ValueError:
+            continue
+
+        resp      = mc.get_object(MINIO_BUCKET, obj.object_name)
+        zip_bytes = resp.read()
+        resp.close()
+
+        rows, lot_sizes = parse_bhavcopy(zip_bytes, trade_date)
+
+        if lot_sizes:
+            upsert_lot_sizes(ch, lot_sizes, trade_date, lot_size_known)
+
+        if not rows:
+            skipped += 1
+            continue
+
+        try:
+            insert_rows(ch, rows)
+            loaded += 1
+            if loaded % 50 == 0:
+                log.info(f"  {loaded} files inserted so far...")
+        except Exception as e:
+            log.error(f"{trade_date}: insert failed — {e}")
+
+    log.info(f"Reprocess complete: {loaded} files inserted, {skipped} skipped")
+    show_status(ch)
+
+
 # ── Main ──────────────────────────────────────────────────
 
 def main():
@@ -302,14 +373,22 @@ def main():
     parser.add_argument("--to", dest="to_date", type=str, default=None,
                         metavar="YYYY-MM-DD",
                         help="End date (default: yesterday)")
-    parser.add_argument("--status", action="store_true",
+    parser.add_argument("--status",    action="store_true",
                         help="Show current DB stats and exit")
+    parser.add_argument("--reprocess", action="store_true",
+                        help="Re-parse all MinIO bhavcopy zips (backfills new symbols)")
     args = parser.parse_args()
 
     ch = get_ch_client()
+    mc = get_mc()
 
     if args.status:
         show_status(ch)
+        return
+
+    if args.reprocess:
+        log.info("=== Reprocess mode — reading from MinIO ===")
+        reprocess_from_minio(ch, mc)
         return
 
     today = date.today()
@@ -356,6 +435,7 @@ def main():
             time.sleep(0.3)
             continue
 
+        save_to_minio(mc, zip_bytes, d)   # idempotent — skips if already exists
         rows, lot_sizes = parse_bhavcopy(zip_bytes, d)
 
         # Always upsert lot sizes — captures any changes even on days with no new options rows
