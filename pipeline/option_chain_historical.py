@@ -36,6 +36,8 @@ import clickhouse_connect
 from curl_cffi import requests as cffi_requests
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
+from fo_utils import build_lot_size_cache
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -196,23 +198,67 @@ def _parse_new_format(df: pd.DataFrame, eod_ts: datetime, version: int) -> list[
     return rows
 
 
-def parse_bhavcopy(zip_bytes: bytes, trade_date: date) -> list[dict]:
+def extract_lot_sizes_from_df(df: pd.DataFrame) -> dict[str, int]:
+    """Return {symbol: min_lot_size} from a parsed bhavcopy DataFrame."""
+    col = "NewBrdLotQty" if "NewBrdLotQty" in df.columns else None
+    sym = "TckrSymb"     if "TckrSymb"     in df.columns else ("SYMBOL" if "SYMBOL" in df.columns else None)
+    if not col or not sym:
+        return {}
+    valid = df[df[col].notna() & (df[col] > 0)].copy()
+    valid[sym] = valid[sym].str.strip()
+    return {s: int(g[col].min()) for s, g in valid.groupby(sym)}
+
+
+def upsert_lot_sizes(ch, lot_sizes: dict[str, int], trade_date: date,
+                     known: dict[str, list]) -> list[str]:
+    """
+    Insert a row into market.fo_lot_sizes for each symbol whose lot_size
+    differs from the last known value. Updates `known` in-place.
+    Returns list of symbols that changed.
+    """
+    changed = []
+    now     = datetime.utcnow()
+    version = int(now.timestamp())
+    rows    = []
+
+    for sym, ls in lot_sizes.items():
+        history = known.get(sym, [])
+        last_ls = history[-1][1] if history else None
+        if last_ls != ls:
+            rows.append({
+                "symbol":         sym,
+                "effective_from": trade_date,
+                "lot_size":       ls,
+                "computed_at":    now,
+                "version":        version,
+            })
+            known.setdefault(sym, []).append((trade_date, ls))
+            changed.append(sym)
+
+    if rows:
+        ch.insert_df("market.fo_lot_sizes", pd.DataFrame(rows))
+    return changed
+
+
+def parse_bhavcopy(zip_bytes: bytes, trade_date: date) -> tuple[list[dict], dict[str, int]]:
+    """Returns (option_chain_rows, {symbol: lot_size})."""
     eod_ts  = datetime(trade_date.year, trade_date.month, trade_date.day, EOD_HOUR, EOD_MINUTE)
     version = int(eod_ts.timestamp())
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         csv_name = next((n for n in zf.namelist() if n.endswith(".csv")), None)
         if csv_name is None:
-            return []
+            return [], {}
         with zf.open(csv_name) as f:
             df = pd.read_csv(f, header=0)
 
-    # Detect format by column names
+    lot_sizes = extract_lot_sizes_from_df(df)
+
     if "INSTRUMENT" in df.columns:
-        return _parse_old_format(df, eod_ts, version)
+        return _parse_old_format(df, eod_ts, version), lot_sizes
     elif "FinInstrmTp" in df.columns:
-        return _parse_new_format(df, eod_ts, version)
-    return []
+        return _parse_new_format(df, eod_ts, version), lot_sizes
+    return [], lot_sizes
 
 
 # ── Insert ────────────────────────────────────────────────
@@ -291,7 +337,8 @@ def main():
         show_status(ch)
         return
 
-    session = build_session()
+    session       = build_session()
+    lot_size_known = build_lot_size_cache(ch)   # preload current lot size history
     stats = {"loaded": 0, "skipped": 0, "failed": []}
 
     for i, d in enumerate(dates_to_fetch, 1):
@@ -309,7 +356,14 @@ def main():
             time.sleep(0.3)
             continue
 
-        rows = parse_bhavcopy(zip_bytes, d)
+        rows, lot_sizes = parse_bhavcopy(zip_bytes, d)
+
+        # Always upsert lot sizes — captures any changes even on days with no new options rows
+        if lot_sizes:
+            changed = upsert_lot_sizes(ch, lot_sizes, d, lot_size_known)
+            if changed:
+                log.info(f"[{i}/{len(dates_to_fetch)}] {d}: lot size changed for {changed}")
+
         if not rows:
             log.info(f"[{i}/{len(dates_to_fetch)}] {d}: no NIFTY/BANKNIFTY rows — skip")
             stats["skipped"] += 1
