@@ -55,5 +55,7 @@ COPY momentum_factor_test.py .
 COPY breakout_backtest.py .
 COPY options_eod_summary_pipeline.py .
 COPY compute_historical_iv.py .
+COPY compute_oi_features.py .
+COPY nifty_straddle_backtest.py .
 
 CMD ["python", "main.py"]

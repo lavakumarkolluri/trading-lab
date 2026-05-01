@@ -75,6 +75,7 @@ def job_option_backtest():
     log.info("=== Option backtest weekly refresh triggered ===")
     _run("option_backtest")                        # buy strategy
     _run("option_backtest", "--strategy", "sell")  # sell strategy
+    _run("nifty_straddle_backtest")               # weekly straddle backtest refresh
 
 
 def job_mf_pipeline():
@@ -97,7 +98,7 @@ def job_option_chain_intraday():
 
 def job_option_chain_eod():
     """
-    Daily bhavcopy chain: download → PCR/max pain → IV.
+    Daily bhavcopy chain: download → PCR/max pain → IV → OI walls/skew.
     Runs sequentially after NSE publishes bhavcopy (~17:30-18:00 IST).
     Each step is idempotent — safe to re-run if a step fails.
     """
@@ -105,6 +106,7 @@ def job_option_chain_eod():
     _run("option_chain_historical")         # download new bhavcopy day
     _run("options_eod_summary_pipeline")    # compute PCR + max pain
     _run("compute_historical_iv")           # compute ATM IV + iv_rank
+    _run("compute_oi_features")             # compute OI walls + IV skew + FII futures
 
 
 def main():

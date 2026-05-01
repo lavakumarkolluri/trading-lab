@@ -482,6 +482,21 @@ services:
     entrypoint: ["python", "compute_historical_iv.py"]
     command: []
 
+  compute_oi_features:
+    build: ./pipeline
+    container_name: compute_oi_features
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "compute_oi_features.py"]
+    command: []
+
   scheduler:
     build: ./pipeline
     container_name: scheduler
