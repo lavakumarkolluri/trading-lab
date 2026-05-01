@@ -86,9 +86,15 @@ def job_holidays():
     _run("holidays_pipeline")
 
 
+def job_option_chain_intraday():
+    log.info("=== Option chain intraday scraper triggered ===")
+    _run("option_chain_intraday")
+
+
 def main():
     log.info("Scheduler started — all times UTC")
     log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
+    log.info("  Intraday OC scraper : Mon–Fri 03:40 UTC (09:10 IST)")
     log.info("  Weekly  refresh     : Sun     00:30 UTC (06:00 IST)")
     log.info("  Gap     analyzer    : Sun     01:00 UTC (06:30 IST)")
     log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
@@ -100,6 +106,13 @@ def main():
     schedule.every().wednesday.at("11:00").do(job_daily)
     schedule.every().thursday.at("11:00").do(job_daily)
     schedule.every().friday.at("11:00").do(job_daily)
+
+    # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
+    schedule.every().monday.at("03:40").do(job_option_chain_intraday)
+    schedule.every().tuesday.at("03:40").do(job_option_chain_intraday)
+    schedule.every().wednesday.at("03:40").do(job_option_chain_intraday)
+    schedule.every().thursday.at("03:40").do(job_option_chain_intraday)
+    schedule.every().friday.at("03:40").do(job_option_chain_intraday)
 
     schedule.every().sunday.at("00:30").do(job_weekly)
     schedule.every().sunday.at("01:00").do(job_gap_analyzer)

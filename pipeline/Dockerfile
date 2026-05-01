@@ -15,7 +15,7 @@ RUN apt-get update \
        https://download.docker.com/linux/debian bookworm stable" \
        > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Python dependencies ──────────────────────────────────────────────────────
@@ -48,5 +48,7 @@ COPY scheduler.py .
 COPY vix_pipeline.py .
 COPY option_chain_pipeline.py .
 COPY option_backtest.py .
+COPY option_chain_intraday.py .
+COPY option_chain_historical.py .
 
 CMD ["python", "main.py"]

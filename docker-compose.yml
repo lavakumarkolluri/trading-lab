@@ -416,6 +416,42 @@ services:
     entrypoint: ["python", "gap_analyzer.py"]
     command: []
 
+  option_chain_intraday:
+    build: ./pipeline
+    container_name: option_chain_intraday
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - MINIO_HOST=minio:9000
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "option_chain_intraday.py"]
+    command: []
+
+  option_chain_historical:
+    build: ./pipeline
+    container_name: option_chain_historical
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "option_chain_historical.py"]
+    command: []
+
   scheduler:
     build: ./pipeline
     container_name: scheduler
