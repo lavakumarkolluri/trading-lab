@@ -748,14 +748,25 @@ def build_fii_net_cache(ch, all_dates: list[date]) -> dict:
     """
     Batch-compute FII net 3-day sum for all unique event dates.
     Returns {date: fii_net_3d_sum}.
+
+    Primary source: market.fii_dii (cash equity flow, Rs crores) — available Apr 2025+.
+    Fallback:       market.participant_oi FII fut_index_net daily change, scaled to
+                    approximate crores (empirical factor 0.318, 71% direction match).
+                    Covers Apr 2024 – Apr 2025 when cash data is absent.
     """
     if not all_dates:
         return {}
+
+    # Empirical scale: std(cash_net) / std(fut_index_net daily change)
+    # Derived from 226 days of overlap (Apr 2025 – Apr 2026): 3547 cr / 13510 contracts = 0.263
+    # 71% directional agreement; values are approximate proxies, not exact equivalents
+    _SCALE = 0.263  # contracts → approximate Rs crores
 
     fetch_from = min(all_dates) - timedelta(days=10)
     fetch_to   = max(all_dates)
 
     try:
+        # Primary: FII cash equity flow
         result = ch.query(
             "SELECT date, net_value FROM market.fii_dii FINAL "
             "WHERE entity = 'FII' "
@@ -763,12 +774,33 @@ def build_fii_net_cache(ch, all_dates: list[date]) -> dict:
             "ORDER BY date",
             parameters={"d_from": fetch_from, "d_to": fetch_to}
         )
-        if not result.result_rows:
-            return {d: 0.0 for d in all_dates}
-
-        fii = pd.DataFrame(result.result_rows, columns=["date", "net_value"])
+        fii = pd.DataFrame(result.result_rows, columns=["date", "net_value"]) \
+              if result.result_rows else pd.DataFrame(columns=["date", "net_value"])
         fii["date"] = pd.to_datetime(fii["date"]).dt.date
+
+        # Fallback: participant_oi FII futures net — daily change scaled to crores
+        oi_result = ch.query(
+            "SELECT date, fut_index_net FROM market.participant_oi FINAL "
+            "WHERE entity = 'FII' "
+            "  AND date >= {d_from:Date} AND date <= {d_to:Date} "
+            "ORDER BY date",
+            parameters={"d_from": fetch_from, "d_to": fetch_to}
+        )
+        if oi_result.result_rows:
+            oi = pd.DataFrame(oi_result.result_rows, columns=["date", "fut_index_net"])
+            oi["date"] = pd.to_datetime(oi["date"]).dt.date
+            oi = oi.sort_values("date").reset_index(drop=True)
+            oi["net_value"] = oi["fut_index_net"].diff() * _SCALE
+            oi = oi.dropna(subset=["net_value"])
+            # Merge: cash data takes priority; fallback fills gaps
+            cash_dates = set(fii["date"].tolist())
+            fallback = oi[~oi["date"].isin(cash_dates)][["date", "net_value"]]
+            fii = pd.concat([fii, fallback], ignore_index=True)
+
         fii = fii.sort_values("date").reset_index(drop=True)
+
+        if fii.empty:
+            return {d: 0.0 for d in all_dates}
 
         cache = {}
         for d in all_dates:
