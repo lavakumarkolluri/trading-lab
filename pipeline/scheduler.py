@@ -6,7 +6,11 @@ Docker-native cron scheduler for the trading pipeline (OPS-001).
 Runs inside a long-lived container — no host cron required.
 
 Schedule (all times UTC, IST = UTC+5:30):
+  Daily    — Mon–Fri 03:40 UTC (09:10 IST)  → option_chain_intraday (self-exits 15:35 IST)
   Daily    — Mon–Fri 11:00 UTC (16:30 IST)  → meta_pipeline (steps 1-12)
+  Daily    — Mon–Fri 12:30 UTC (18:00 IST)  → option_chain_historical (bhavcopy pickup)
+  Daily    — Mon–Fri 13:00 UTC (18:30 IST)  → options_eod_summary_pipeline (PCR/max pain)
+  Daily    — Mon–Fri 13:30 UTC (19:00 IST)  → compute_historical_iv (ATM IV + rank)
   Weekly   — Sun     00:30 UTC (06:00 IST)  → meta_pipeline --weekly (steps 13-16)
   Weekly   — Sun     01:00 UTC (06:30 IST)  → gap_analyzer
   Weekly   — Sun     02:00 UTC (07:30 IST)  → option_backtest (full 2yr refresh)
@@ -91,28 +95,40 @@ def job_option_chain_intraday():
     _run("option_chain_intraday")
 
 
+def job_option_chain_eod():
+    """
+    Daily bhavcopy chain: download → PCR/max pain → IV.
+    Runs sequentially after NSE publishes bhavcopy (~17:30-18:00 IST).
+    Each step is idempotent — safe to re-run if a step fails.
+    """
+    log.info("=== Option chain EOD pipeline triggered ===")
+    _run("option_chain_historical")         # download new bhavcopy day
+    _run("options_eod_summary_pipeline")    # compute PCR + max pain
+    _run("compute_historical_iv")           # compute ATM IV + iv_rank
+
+
 def main():
     log.info("Scheduler started — all times UTC")
-    log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
     log.info("  Intraday OC scraper : Mon–Fri 03:40 UTC (09:10 IST)")
+    log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
+    log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV")
     log.info("  Weekly  refresh     : Sun     00:30 UTC (06:00 IST)")
     log.info("  Gap     analyzer    : Sun     01:00 UTC (06:30 IST)")
     log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
     log.info("  MF      pipeline    : Sun     03:00 UTC (08:30 IST)")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
 
-    schedule.every().monday.at("11:00").do(job_daily)
-    schedule.every().tuesday.at("11:00").do(job_daily)
-    schedule.every().wednesday.at("11:00").do(job_daily)
-    schedule.every().thursday.at("11:00").do(job_daily)
-    schedule.every().friday.at("11:00").do(job_daily)
-
     # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
-    schedule.every().monday.at("03:40").do(job_option_chain_intraday)
-    schedule.every().tuesday.at("03:40").do(job_option_chain_intraday)
-    schedule.every().wednesday.at("03:40").do(job_option_chain_intraday)
-    schedule.every().thursday.at("03:40").do(job_option_chain_intraday)
-    schedule.every().friday.at("03:40").do(job_option_chain_intraday)
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("03:40").do(job_option_chain_intraday)
+
+    # Daily meta pipeline: 16:30 IST (11:00 UTC)
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("11:00").do(job_daily)
+
+    # Option chain EOD: bhavcopy + PCR/max pain + IV at 18:00 IST (12:30 UTC)
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("12:30").do(job_option_chain_eod)
 
     schedule.every().sunday.at("00:30").do(job_weekly)
     schedule.every().sunday.at("01:00").do(job_gap_analyzer)
