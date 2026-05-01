@@ -83,6 +83,11 @@ def job_mf_pipeline():
     _run("mf_pipeline")
 
 
+def job_fundamental_pipeline():
+    log.info("=== Fundamental data pipeline weekly refresh triggered ===")
+    _run("fundamental_pipeline")
+
+
 def job_holidays():
     """Run only on the 1st of each month."""
     if datetime.utcnow().day != 1:
@@ -118,6 +123,7 @@ def main():
     log.info("  Gap     analyzer    : Sun     01:00 UTC (06:30 IST)")
     log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
     log.info("  MF      pipeline    : Sun     03:00 UTC (08:30 IST)")
+    log.info("  Fundamentals        : Sun     04:30 UTC (10:00 IST)")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
 
     # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
@@ -136,6 +142,7 @@ def main():
     schedule.every().sunday.at("01:00").do(job_gap_analyzer)
     schedule.every().sunday.at("02:00").do(job_option_backtest)
     schedule.every().sunday.at("03:00").do(job_mf_pipeline)
+    schedule.every().sunday.at("04:30").do(job_fundamental_pipeline)
 
     # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
     schedule.every().day.at("04:00").do(job_holidays)

@@ -497,6 +497,26 @@ services:
     entrypoint: ["python", "compute_oi_features.py"]
     command: []
 
+  fundamental_pipeline:
+    build: ./pipeline
+    container_name: fundamental_pipeline
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - MINIO_HOST=minio:9000
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "fundamental_pipeline.py"]
+    command: []
+
   scheduler:
     build: ./pipeline
     container_name: scheduler
