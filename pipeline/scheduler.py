@@ -88,6 +88,11 @@ def job_fundamental_pipeline():
     _run("fundamental_pipeline")
 
 
+def job_lot_size_pipeline():
+    log.info("=== F&O lot size pipeline weekly refresh triggered ===")
+    _run("lot_size_pipeline")
+
+
 def job_holidays():
     """Run only on the 1st of each month."""
     if datetime.utcnow().day != 1:
@@ -143,6 +148,7 @@ def main():
     schedule.every().sunday.at("02:00").do(job_option_backtest)
     schedule.every().sunday.at("03:00").do(job_mf_pipeline)
     schedule.every().sunday.at("04:30").do(job_fundamental_pipeline)
+    schedule.every().sunday.at("05:00").do(job_lot_size_pipeline)
 
     # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
     schedule.every().day.at("04:00").do(job_holidays)

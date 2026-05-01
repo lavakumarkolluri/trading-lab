@@ -57,6 +57,8 @@ COPY options_eod_summary_pipeline.py .
 COPY compute_historical_iv.py .
 COPY compute_oi_features.py .
 COPY nifty_straddle_backtest.py .
+COPY fo_utils.py .
+COPY lot_size_pipeline.py .
 COPY fundamental_pipeline.py .
 
 CMD ["python", "main.py"]

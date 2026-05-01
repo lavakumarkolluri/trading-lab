@@ -56,6 +56,7 @@ import numpy as np
 import pandas as pd
 import clickhouse_connect
 from curl_cffi import requests as cffi_requests
+from fo_utils import build_lot_size_cache, get_lot_size
 from minio import Minio
 from minio.error import S3Error
 
@@ -84,7 +85,6 @@ NSE_ARCHIVE    = "https://nsearchives.nseindia.com"
 SESSION_TIMEOUT = 30
 
 # Transaction costs (Zerodha / NSE typical)
-LOT_SIZE        = 75      # Nifty options lot size
 BROKERAGE       = 20.0    # flat per order leg; round-trip = 2 legs
 STT_PCT         = 0.0005  # 0.05% of premium on sell leg only
 EXCHANGE_PCT    = 0.0005  # NSE + SEBI charges (both legs combined ~0.05%)
@@ -428,7 +428,7 @@ def find_atm_price(df_near: pd.DataFrame, spot: float,
 
 
 def transaction_cost_per_unit(entry_price: float, exit_price: float,
-                               strategy: str) -> float:
+                               strategy: str, lot_size: int) -> float:
     """
     Round-trip transaction cost per unit (1 contract, not per lot).
     For BUYING  : you buy at entry, sell at exit → STT on exit leg
@@ -440,7 +440,7 @@ def transaction_cost_per_unit(entry_price: float, exit_price: float,
         stt = exit_price * STT_PCT
     else:
         stt = entry_price * STT_PCT
-    return round((brok + exch + stt) / LOT_SIZE, 4)   # per unit
+    return round((brok + exch + stt) / lot_size, 4)   # per unit
 
 
 # ══════════════════════════════════════════════════════
@@ -449,7 +449,8 @@ def transaction_cost_per_unit(entry_price: float, exit_price: float,
 
 def run_backtest(vix_df: pd.DataFrame,
                  bhavcopy_cache: dict[date, pd.DataFrame],
-                 strategy: str = "buy") -> list[dict]:  # strategy stored per row
+                 strategy: str = "buy",
+                 lot_size_cache: dict | None = None) -> list[dict]:
     """
     Replay strategy signal day-by-day using only past data.
 
@@ -555,9 +556,10 @@ def run_backtest(vix_df: pd.DataFrame,
                      if nifty_spot > 0 and nifty_exit > 0 else 0.0
 
         # Buyer P&L = exit - entry; Seller P&L = entry - exit (collected premium)
+        lot_size  = get_lot_size("NIFTY", today, lot_size_cache or {})
         gross_pnl = exit_price - entry_price if strategy == "buy" \
                     else entry_price - exit_price
-        cost      = transaction_cost_per_unit(entry_price, exit_price, strategy)
+        cost      = transaction_cost_per_unit(entry_price, exit_price, strategy, lot_size)
         pnl       = round(gross_pnl - cost, 2)
         pnl_pct   = round(pnl / entry_price * 100, 4) if entry_price > 0 else 0.0
 
@@ -721,8 +723,9 @@ def main():
 
     # ── Step 1: Fetch VIX from DB ────────────────────────
     log.info("Step 1/3: Fetching VIX + Nifty from market.nifty_live...")
-    ch      = get_ch_client()
-    vix_df  = fetch_vix_series(ch, from_date, to_date)
+    ch             = get_ch_client()
+    lot_size_cache = build_lot_size_cache(ch)
+    vix_df         = fetch_vix_series(ch, from_date, to_date)
 
     if vix_df.empty:
         log.error(
@@ -756,7 +759,8 @@ def main():
 
     # ── Step 3: Run backtest ─────────────────────────────
     log.info("Step 3/3: Replaying signals (no-lookahead)...")
-    signals = run_backtest(vix_df, bhavcopy_cache, strategy=args.strategy)
+    signals = run_backtest(vix_df, bhavcopy_cache, strategy=args.strategy,
+                           lot_size_cache=lot_size_cache)
     log.info(f"Signals generated: {len(signals)}")
 
     if not args.dry_run and signals:

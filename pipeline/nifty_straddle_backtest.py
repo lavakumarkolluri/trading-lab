@@ -14,7 +14,7 @@ Strategy:
     3. Expiry        : settle at intrinsic = |spot - strike|
 
 P&L = (entry_premium - exit_cost) × lot_size - transaction_costs
-Lot size: 75 (Nifty F&O lot size throughout the period)
+Lot size: date-aware from market.fo_lot_sizes (25 until ~Jan 2025, 75 thereafter per SEBI mandate)
 Cost: ₹40 per lot per leg (brokerage + STT + exchange) × 4 legs = ₹160 round trip
 
 Usage:
@@ -36,6 +36,8 @@ import pandas as pd
 import numpy as np
 import clickhouse_connect
 
+from fo_utils import build_lot_size_cache, get_lot_size
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
@@ -44,7 +46,6 @@ CH_PORT   = int(os.getenv("CH_PORT", "8123"))
 CH_USER   = os.getenv("CH_USER", "default")
 CH_PASS   = os.getenv("CH_PASSWORD", "")
 
-LOT_SIZE       = 75       # Nifty lot size
 COST_PER_TRADE = 160      # ₹160 round trip (all 4 legs)
 TARGET_RATIO   = 0.50     # exit when straddle decays to 50% of entry
 STOP_RATIO     = 2.00     # stop when straddle reaches 200% of entry
@@ -100,9 +101,10 @@ def straddle_value(df_day: pd.DataFrame, strike: float) -> float | None:
 
 
 def run_backtest(ch, target_ratio: float, stop_ratio: float) -> pd.DataFrame:
-    spot_map  = load_spot_map(ch)
-    expiries  = load_all_expiries(ch)
-    trades    = []
+    spot_map      = load_spot_map(ch)
+    expiries      = load_all_expiries(ch)
+    lot_size_cache = build_lot_size_cache(ch)
+    trades        = []
 
     for idx in range(1, len(expiries)):
         prev_expiry = expiries[idx - 1]
@@ -175,8 +177,9 @@ def run_backtest(ch, target_ratio: float, stop_ratio: float) -> pd.DataFrame:
             # Position still open (last expiry in dataset)
             continue
 
+        lot_size    = get_lot_size("NIFTY", entry_date, lot_size_cache)
         pnl_points  = entry_premium - exit_cost
-        pnl_rupees  = pnl_points * LOT_SIZE - COST_PER_TRADE
+        pnl_rupees  = pnl_points * lot_size - COST_PER_TRADE
         hold_days   = (exit_date - entry_date).days
 
         trades.append({
@@ -188,6 +191,7 @@ def run_backtest(ch, target_ratio: float, stop_ratio: float) -> pd.DataFrame:
             "entry_premium":   entry_premium,
             "exit_cost":       exit_cost,
             "exit_reason":     exit_reason,
+            "lot_size":        lot_size,
             "pnl_points":      pnl_points,
             "pnl_rupees":      pnl_rupees,
             "hold_days":       hold_days,
