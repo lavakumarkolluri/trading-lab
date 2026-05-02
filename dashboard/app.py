@@ -635,24 +635,114 @@ elif page == "Market Pulse":
 # PAGE 5 — LIVE TRADING
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "Live Trading":
-    st.title("Live Trading")
-    st.info("Live trading not yet active. This page will show open positions, "
-            "today's P&L, and real-time alerts once the Zerodha integration is live "
-            "(Step 7 of the build sequence).")
+    st.title("Live Trading — Strategy Selector")
 
+    # ── Today's recommendation ────────────────────────────────────────────────
+    st.subheader("Today's Trade Recommendation")
+    rec_df = query("""
+        SELECT rec_date, symbol, expiry, strategy, short_n, wing_m,
+               atm_strike, short_ce_strike, short_pe_strike,
+               long_ce_strike, long_pe_strike,
+               net_credit, max_loss, lots, capital_at_risk,
+               confidence, pcr_bias, iv_skew, outcome
+        FROM analysis.trade_recommendations
+        ORDER BY rec_date DESC
+        LIMIT 1
+    """)
+    if rec_df.empty:
+        st.info("No recommendation yet for today. Run `strategy_selector --recommend`.")
+    else:
+        r = rec_df.iloc[0]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Symbol",     r["symbol"])
+        c2.metric("Strategy",   r["strategy"].replace("_", " ").title())
+        c3.metric("Confidence", f"{r['confidence']:.1f}/100")
+        c4.metric("Outcome",    r["outcome"].upper())
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Net Credit",      f"{r['net_credit']:.2f} pts")
+        c2.metric("Max Loss",        f"{r['max_loss']:.2f} pts")
+        c3.metric("Lots",            int(r["lots"]))
+        c4.metric("Capital at Risk", fmt_inr(float(r["capital_at_risk"])))
+
+        with st.expander("Leg Strikes"):
+            st.json({
+                "ATM":      r["atm_strike"],
+                "Short CE": r["short_ce_strike"], "Short PE": r["short_pe_strike"],
+                "Long CE":  r["long_ce_strike"],  "Long PE":  r["long_pe_strike"],
+            })
+
+    # ── Past recommendations ──────────────────────────────────────────────────
+    st.subheader("Recommendation History")
+    hist_df = query("""
+        SELECT rec_date, symbol, strategy, short_n, wing_m,
+               net_credit, max_loss, lots,
+               confidence, outcome, pnl_pts, pnl_amount
+        FROM analysis.trade_recommendations
+        ORDER BY rec_date DESC
+        LIMIT 30
+    """)
+    if not hist_df.empty:
+        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+
+    # ── Compounding simulation ────────────────────────────────────────────────
+    st.subheader("Compounding Simulation (OOS Backtest)")
+    sim_df = query("""
+        SELECT sim_date, symbol, strategy, confidence, lots,
+               pnl_pts, pnl_amount, capital_before, capital_after, skipped
+        FROM analysis.strategy_simulation
+        ORDER BY sim_date
+    """)
+    if sim_df.empty:
+        st.info("No simulation data yet. Run `strategy_selector --backtest`.")
+    else:
+        sim_df["sim_date"] = pd.to_datetime(sim_df["sim_date"])
+
+        # Capital curve
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=sim_df["sim_date"], y=sim_df["capital_after"],
+            mode="lines", name="Capital (traded)",
+            line=dict(color="royalblue", width=2),
+        ))
+        skipped_mask = sim_df["skipped"] == 0
+        baseline = sim_df.copy()
+        # Flat baseline = rows where skipped = 1 carry capital_before
+        fig.add_trace(go.Scatter(
+            x=sim_df["sim_date"],
+            y=[STARTING_CAPITAL] * len(sim_df),
+            mode="lines", name="Starting capital",
+            line=dict(color="gray", width=1, dash="dash"),
+        ))
+        fig.update_layout(
+            height=340, title="Capital Curve (Compounding)",
+            yaxis_title="Capital (₹)", xaxis_title="Date",
+            legend=dict(orientation="h"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Summary stats
+        traded = sim_df[sim_df["skipped"] == 0]
+        if not traded.empty:
+            final_cap = float(sim_df["capital_after"].iloc[-1])
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Final Capital",   fmt_inr(final_cap))
+            c2.metric("Total Return",    f"{(final_cap/STARTING_CAPITAL - 1)*100:.1f}%")
+            c3.metric("Trades Taken",    len(traded))
+            c4.metric("Trades Skipped",  int(sim_df["skipped"].sum()))
+
+        st.dataframe(
+            sim_df[["sim_date", "symbol", "strategy", "confidence",
+                     "lots", "pnl_pts", "pnl_amount", "capital_after", "skipped"]].tail(30),
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── Risk parameters ───────────────────────────────────────────────────────
     st.subheader("Risk Parameters")
     c1, c2, c3 = st.columns(3)
     c1.metric("Starting Capital",  fmt_inr(STARTING_CAPITAL))
     c2.metric("Daily Stop (2%)",   fmt_inr(STARTING_CAPITAL * DAILY_STOP_PCT))
     c3.metric("Capital Floor",     fmt_inr(CAPITAL_FLOOR))
-
-    st.subheader("Expiry Calendar")
-    cal = pd.DataFrame({
-        "Day":    ["Monday",    "Tuesday", "Wednesday", "Thursday", "Friday"],
-        "Index":  ["MidcapNifty + Bankex", "FinNifty", "BankNifty", "Nifty 50", "Sensex"],
-        "Status": ["Pending"] * 5,
-    })
-    st.dataframe(cal, use_container_width=True, hide_index=True)
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 time.sleep(60)

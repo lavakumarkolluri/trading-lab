@@ -62,5 +62,6 @@ COPY lot_size_pipeline.py .
 COPY fundamental_pipeline.py .
 COPY confidence_scorer.py .
 COPY strategy_backtester.py .
+COPY strategy_selector.py .
 
 CMD ["python", "main.py"]

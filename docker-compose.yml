@@ -572,6 +572,21 @@ services:
     entrypoint: ["python", "confidence_scorer.py"]
     command: []
 
+  strategy_selector:
+    build: ./pipeline
+    container_name: strategy_selector
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "strategy_selector.py"]
+    command: []
+
   fundamental_pipeline:
     build: ./pipeline
     container_name: fundamental_pipeline

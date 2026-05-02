@@ -15,6 +15,8 @@ Schedule (all times UTC, IST = UTC+5:30):
   Weekly   — Sun     01:00 UTC (06:30 IST)  → gap_analyzer
   Weekly   — Sun     02:00 UTC (07:30 IST)  → option_backtest (full 2yr refresh)
   Weekly   — Sun     03:00 UTC (08:30 IST)  → mf_pipeline (NAV refresh)
+  Weekly   — Sun     06:30 UTC (12:00 IST)  → strategy_selector --backtest
+  Daily    — Mon–Thu 10:30 UTC (16:00 IST)  → strategy_selector --recommend
   Monthly  — 1st     04:00 UTC (09:30 IST)  → holidays_pipeline (seed next year)
 
 Docker:
@@ -103,6 +105,16 @@ def job_confidence_scorer():
     _run("confidence_scorer")
 
 
+def job_strategy_selector_recommend():
+    log.info("=== Strategy selector daily recommendation triggered ===")
+    _run("strategy_selector", "--recommend")
+
+
+def job_strategy_selector_backtest():
+    log.info("=== Strategy selector compounding simulation triggered ===")
+    _run("strategy_selector", "--backtest")
+
+
 def job_holidays():
     """Run only on the 1st of each month."""
     if datetime.utcnow().day != 1:
@@ -141,6 +153,8 @@ def main():
     log.info("  Fundamentals        : Sun     04:30 UTC (10:00 IST)")
     log.info("  Lot sizes           : Sun     05:00 UTC (10:30 IST)")
     log.info("  Confidence scorer   : Sun     05:30 UTC (11:00 IST)")
+    log.info("  Strategy selector   : Sun     06:30 UTC (12:00 IST) --backtest")
+    log.info("  Strategy recommend  : Mon-Fri 10:30 UTC (16:00 IST) --recommend")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
 
     # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
@@ -163,6 +177,11 @@ def main():
     schedule.every().sunday.at("05:00").do(job_lot_size_pipeline)
     schedule.every().sunday.at("05:30").do(job_strategy_backtester)
     schedule.every().sunday.at("06:00").do(job_confidence_scorer)
+    schedule.every().sunday.at("06:30").do(job_strategy_selector_backtest)
+
+    # Daily recommendation: 30 min before market open (10:30 UTC = 16:00 IST)
+    for day in ("monday", "tuesday", "wednesday", "thursday"):
+        getattr(schedule.every(), day).at("10:30").do(job_strategy_selector_recommend)
 
     # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
     schedule.every().day.at("04:00").do(job_holidays)
