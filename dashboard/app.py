@@ -382,8 +382,143 @@ elif page == "Strategy Backtests":
             st.plotly_chart(fig, use_container_width=True)
 
 
+# ── Spread Strategy Backtests ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Defined-Risk Strategy Backtests (IC / Spreads)")
+    st.caption(
+        "Entry: previous-day EOD prices. Exit: expiry settlement. "
+        "All hedge leg costs deducted from net_credit before any P&L calculation."
+    )
+
+    opt = query("""
+        SELECT symbol, strategy, short_n, wing_m, n_trades,
+               round(win_rate*100,1) AS win_rate,
+               round(avg_pnl_pts,1) AS avg_pnl_pts,
+               round(avg_pnl_pct,1) AS avg_pnl_pct,
+               round(sharpe_pct,2)  AS sharpe,
+               round(premium_to_risk,1) AS premium_pct
+        FROM analysis.spread_optimal FINAL
+        ORDER BY symbol, strategy, sharpe DESC
+    """)
+
+    spread_trades = query("""
+        SELECT symbol, strategy, short_n, wing_m, expiry, entry_date,
+               atm_strike, net_credit, max_loss, pnl_pts, pnl_pct, target
+        FROM analysis.spread_backtest FINAL
+        WHERE strategy != 'straddle'
+        ORDER BY symbol, expiry
+    """)
+
+    if opt.empty:
+        st.info("No spread backtest data. Run: docker compose run --rm strategy_backtester")
+    else:
+        sym_sel = st.selectbox("Symbol", sorted(opt["symbol"].unique()), key="spr_sym")
+        opt_sym = opt[opt["symbol"] == sym_sel]
+
+        # Win rate heatmap per strategy × short_n
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Win Rate % by Strategy & Short Strike Distance**")
+            pivot = opt_sym[opt_sym.strategy != "straddle"].pivot_table(
+                index="strategy", columns="short_n", values="win_rate", aggfunc="max"
+            )
+            fig = go.Figure(go.Heatmap(
+                z=pivot.values,
+                x=[f"sn={c}" for c in pivot.columns],
+                y=pivot.index,
+                colorscale="RdYlGn",
+                text=[[f"{v:.0f}%" for v in row] for row in pivot.values],
+                texttemplate="%{text}",
+                zmin=40, zmax=100,
+            ))
+            fig.update_layout(height=280)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.markdown("**Sharpe Ratio by Strategy & Wing Width**")
+            pivot2 = opt_sym[opt_sym.strategy != "straddle"].pivot_table(
+                index="strategy", columns="wing_m", values="sharpe", aggfunc="max"
+            )
+            fig2 = go.Figure(go.Heatmap(
+                z=pivot2.values,
+                x=[f"wm={c}" for c in pivot2.columns],
+                y=pivot2.index,
+                colorscale="RdYlGn",
+                text=[[f"{v:.2f}" for v in row] for row in pivot2.values],
+                texttemplate="%{text}",
+            ))
+            fig2.update_layout(height=280)
+            st.plotly_chart(fig2, use_container_width=True)
+
+        # Straddle vs IC P&L comparison over time
+        if not spread_trades.empty:
+            st.markdown(f"**Cumulative P&L: All Strategies for {sym_sel}**")
+            st_sym = spread_trades[spread_trades["symbol"] == sym_sel].copy()
+            st_sym["expiry"] = pd.to_datetime(st_sym["expiry"])
+
+            # Best IC params per symbol
+            best_ic = opt_sym[opt_sym.strategy == "iron_condor"].nlargest(1, "sharpe")
+            best_bp = opt_sym[opt_sym.strategy == "bull_put"].nlargest(1, "sharpe")
+            best_bc = opt_sym[opt_sym.strategy == "bear_call"].nlargest(1, "sharpe")
+
+            straddle_data = query(f"""
+                SELECT expiry, pnl_pts
+                FROM analysis.spread_backtest FINAL
+                WHERE symbol = '{sym_sel}' AND strategy = 'straddle'
+                ORDER BY expiry
+            """)
+
+            fig3 = go.Figure()
+            for label, df_src, clr in [
+                ("Straddle (no hedge)", straddle_data, "#e74c3c"),
+            ]:
+                if not df_src.empty:
+                    df_src["expiry"] = pd.to_datetime(df_src["expiry"])
+                    df_src = df_src.sort_values("expiry")
+                    fig3.add_trace(go.Scatter(
+                        x=df_src["expiry"], y=df_src["pnl_pts"].cumsum(),
+                        mode="lines", name=label, line_color=clr, line_dash="dash",
+                    ))
+
+            for (strat, sn, wm), label, clr in [
+                (("iron_condor", int(best_ic["short_n"].iloc[0]), int(best_ic["wing_m"].iloc[0])),
+                 "Best IC", "#3498db"),
+                (("bull_put", int(best_bp["short_n"].iloc[0]), int(best_bp["wing_m"].iloc[0])),
+                 "Best Bull Put", "#2ecc71"),
+                (("bear_call", int(best_bc["short_n"].iloc[0]), int(best_bc["wing_m"].iloc[0])),
+                 "Best Bear Call", "#f39c12"),
+            ]:
+                grp = st_sym[
+                    (st_sym.strategy == strat) &
+                    (st_sym.short_n == sn) &
+                    (st_sym.wing_m == wm)
+                ].sort_values("expiry")
+                if not grp.empty:
+                    fig3.add_trace(go.Scatter(
+                        x=grp["expiry"], y=grp["pnl_pts"].cumsum(),
+                        mode="lines", name=f"{label} (sn={sn}, wm={wm})", line_color=clr,
+                    ))
+
+            fig3.update_layout(height=320, yaxis_title="Cumulative P&L (pts)",
+                               legend=dict(orientation="h", yanchor="bottom", y=1))
+            st.plotly_chart(fig3, use_container_width=True)
+
+        # Optimal params table
+        st.markdown("**Top 10 Combinations (by Sharpe)**")
+        top = opt_sym[opt_sym.strategy != "straddle"].nlargest(10, "sharpe")[
+            ["strategy", "short_n", "wing_m", "n_trades", "win_rate",
+             "avg_pnl_pts", "avg_pnl_pct", "sharpe", "premium_pct"]
+        ].rename(columns={
+            "strategy": "Strategy", "short_n": "Short N", "wing_m": "Wing M",
+            "n_trades": "Trades", "win_rate": "Win %", "avg_pnl_pts": "Avg P&L pts",
+            "avg_pnl_pct": "Avg P&L %", "sharpe": "Sharpe", "premium_pct": "Prem/Risk %"
+        })
+        st.dataframe(top, use_container_width=True, hide_index=True)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 3 — TRADE LOG
+# PAGE 4 — TRADE LOG
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "Trade Log":
     st.title("Trade Log")

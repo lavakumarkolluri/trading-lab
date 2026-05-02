@@ -93,6 +93,11 @@ def job_lot_size_pipeline():
     _run("lot_size_pipeline")
 
 
+def job_strategy_backtester():
+    log.info("=== Strategy backtester weekly refresh triggered ===")
+    _run("strategy_backtester")
+
+
 def job_confidence_scorer():
     log.info("=== Confidence scorer weekly retrain triggered ===")
     _run("confidence_scorer")
@@ -156,7 +161,8 @@ def main():
     schedule.every().sunday.at("03:00").do(job_mf_pipeline)
     schedule.every().sunday.at("04:30").do(job_fundamental_pipeline)
     schedule.every().sunday.at("05:00").do(job_lot_size_pipeline)
-    schedule.every().sunday.at("05:30").do(job_confidence_scorer)
+    schedule.every().sunday.at("05:30").do(job_strategy_backtester)
+    schedule.every().sunday.at("06:00").do(job_confidence_scorer)
 
     # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
     schedule.every().day.at("04:00").do(job_holidays)

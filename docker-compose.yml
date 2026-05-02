@@ -537,6 +537,21 @@ services:
     entrypoint: ["python", "lot_size_pipeline.py"]
     command: []
 
+  strategy_backtester:
+    build: ./pipeline
+    container_name: strategy_backtester
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "strategy_backtester.py"]
+    command: []
+
   confidence_scorer:
     build: ./pipeline
     container_name: confidence_scorer
