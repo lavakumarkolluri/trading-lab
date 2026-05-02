@@ -537,6 +537,26 @@ services:
     entrypoint: ["python", "lot_size_pipeline.py"]
     command: []
 
+  confidence_scorer:
+    build: ./pipeline
+    container_name: confidence_scorer
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - MINIO_HOST=minio:9000
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "confidence_scorer.py"]
+    command: []
+
   fundamental_pipeline:
     build: ./pipeline
     container_name: fundamental_pipeline

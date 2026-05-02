@@ -93,6 +93,11 @@ def job_lot_size_pipeline():
     _run("lot_size_pipeline")
 
 
+def job_confidence_scorer():
+    log.info("=== Confidence scorer weekly retrain triggered ===")
+    _run("confidence_scorer")
+
+
 def job_holidays():
     """Run only on the 1st of each month."""
     if datetime.utcnow().day != 1:
@@ -129,6 +134,8 @@ def main():
     log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
     log.info("  MF      pipeline    : Sun     03:00 UTC (08:30 IST)")
     log.info("  Fundamentals        : Sun     04:30 UTC (10:00 IST)")
+    log.info("  Lot sizes           : Sun     05:00 UTC (10:30 IST)")
+    log.info("  Confidence scorer   : Sun     05:30 UTC (11:00 IST)")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
 
     # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
@@ -149,6 +156,7 @@ def main():
     schedule.every().sunday.at("03:00").do(job_mf_pipeline)
     schedule.every().sunday.at("04:30").do(job_fundamental_pipeline)
     schedule.every().sunday.at("05:00").do(job_lot_size_pipeline)
+    schedule.every().sunday.at("05:30").do(job_confidence_scorer)
 
     # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
     schedule.every().day.at("04:00").do(job_holidays)

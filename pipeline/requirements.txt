@@ -16,3 +16,7 @@ tenacity==9.0.0
 # Added for SIP XIRR computation
 numpy_financial==1.0.0
 curl_cffi==0.13.0
+
+# Added for confidence scorer (Step 3)
+xgboost==2.1.4
+scikit-learn==1.6.1

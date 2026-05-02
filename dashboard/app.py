@@ -62,6 +62,7 @@ def color(val: float) -> str:
 st.sidebar.title("📈 Trading Lab")
 page = st.sidebar.radio("Navigate", [
     "Overview",
+    "Confidence Scores",
     "Strategy Backtests",
     "Trade Log",
     "Market Pulse",
@@ -160,7 +161,142 @@ if page == "Overview":
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 2 — STRATEGY BACKTESTS
+# PAGE 2 — CONFIDENCE SCORES
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Confidence Scores":
+    st.title("Confidence Scores — XGBoost 0DTE Straddle")
+    st.caption(
+        "Per-symbol XGBoost models trained on 24–28 months of weekly expiry data. "
+        "Score = probability that selling ATM straddle on next expiry will be profitable."
+    )
+
+    # ── Today's scores ───────────────────────────────────────────────────────
+    scores = query("""
+        SELECT symbol, next_expiry, round(confidence, 1) AS confidence,
+               round(expected_pnl_pct, 1) AS expected_pnl_pct
+        FROM analysis.confidence_scores FINAL
+        WHERE score_date = today()
+        ORDER BY confidence DESC
+    """)
+
+    if scores.empty:
+        st.info("No confidence scores for today yet. Run: docker compose run --rm confidence_scorer")
+    else:
+        st.subheader("Today's Signal")
+        cols = st.columns(len(scores))
+        for i, (_, row) in enumerate(scores.iterrows()):
+            conf = float(row["confidence"])
+            color_str = "🟢" if conf >= 70 else "🟡" if conf >= 55 else "🔴"
+            action = "TRADE" if conf >= 65 else "SKIP"
+            cols[i].metric(
+                label=f"{color_str} {row['symbol']}",
+                value=f"{conf:.0f}/100",
+                delta=f"{action} — Expiry {row['next_expiry']}",
+            )
+
+        st.dataframe(
+            scores.rename(columns={
+                "symbol": "Symbol", "next_expiry": "Next Expiry",
+                "confidence": "Confidence /100", "expected_pnl_pct": "Expected P&L %"
+            }),
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── Walk-forward backtest ─────────────────────────────────────────────────
+    st.subheader("Walk-Forward Backtest Results")
+    bt = query("""
+        SELECT symbol, expiry, entry_date, atm_strike, entry_premium,
+               pnl_pts, pnl_pct, target, round(confidence * 100, 1) AS confidence
+        FROM analysis.confidence_backtest FINAL
+        ORDER BY symbol, expiry
+    """)
+
+    if bt.empty:
+        st.info("No backtest data yet.")
+    else:
+        symbol_filter = st.selectbox("Symbol", ["All"] + sorted(bt["symbol"].unique().tolist()))
+        bt_view = bt if symbol_filter == "All" else bt[bt["symbol"] == symbol_filter]
+
+        # Summary KPIs
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("OOS Predictions", len(bt_view))
+        k2.metric("Win Rate (actual)",  f"{bt_view['target'].mean():.1%}")
+        k3.metric("Avg Confidence",  f"{bt_view['confidence'].mean():.1f}/100")
+        k4.metric("Avg P&L (pts)",   f"{bt_view['pnl_pts'].mean():.1f}")
+
+        # Confidence vs outcome scatter
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Confidence vs Actual P&L**")
+            fig = go.Figure()
+            for outcome, label, marker_color in [(1, "Win", "#2ecc71"), (0, "Loss", "#e74c3c")]:
+                grp = bt_view[bt_view["target"] == outcome]
+                fig.add_trace(go.Scatter(
+                    x=grp["confidence"], y=grp["pnl_pts"],
+                    mode="markers", name=label,
+                    marker=dict(color=marker_color, size=7, opacity=0.7),
+                    hovertemplate="%{customdata[0]} | conf=%{x} | pnl=%{y:.0f}pts<extra></extra>",
+                    customdata=grp[["symbol"]].values,
+                ))
+            fig.add_vline(x=65, line_dash="dash", line_color="gray",
+                          annotation_text="Threshold 65")
+            fig.update_layout(height=320, xaxis_title="Confidence Score",
+                              yaxis_title="P&L (points)")
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.markdown("**Win Rate by Confidence Band**")
+            bt_view = bt_view.copy()
+            bt_view["band"] = pd.cut(
+                bt_view["confidence"],
+                bins=[0, 50, 60, 70, 80, 100],
+                labels=["<50", "50–60", "60–70", "70–80", ">80"]
+            )
+            band_stats = bt_view.groupby("band", observed=True).agg(
+                n=("target", "count"),
+                win_rate=("target", "mean"),
+                avg_pnl=("pnl_pts", "mean")
+            ).reset_index()
+            fig2 = go.Figure()
+            fig2.add_trace(go.Bar(
+                x=band_stats["band"].astype(str),
+                y=(band_stats["win_rate"] * 100).round(1),
+                text=(band_stats["win_rate"] * 100).round(1).astype(str) + "%",
+                textposition="outside",
+                marker_color=["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71", "#27ae60"],
+            ))
+            fig2.add_hline(y=50, line_dash="dash", line_color="gray")
+            fig2.update_layout(height=320, yaxis_title="Win Rate %",
+                               xaxis_title="Confidence Band", yaxis_range=[0, 110])
+            st.plotly_chart(fig2, use_container_width=True)
+
+        # P&L over time
+        st.markdown("**Cumulative P&L by Confidence Threshold (≥65 vs all)**")
+        bt_sorted = bt_view.sort_values("expiry")
+        bt_sorted["expiry"] = pd.to_datetime(bt_sorted["expiry"])
+        fig3 = go.Figure()
+        for min_conf, label, clr in [(0, "All trades", "#aaaaaa"), (65, "Conf ≥ 65", "#3498db")]:
+            grp = bt_sorted[bt_sorted["confidence"] >= min_conf].copy()
+            grp["cum_pnl"] = grp["pnl_pts"].cumsum()
+            fig3.add_trace(go.Scatter(
+                x=grp["expiry"], y=grp["cum_pnl"],
+                mode="lines", name=label, line_color=clr,
+            ))
+        fig3.update_layout(height=280, yaxis_title="Cumulative P&L (pts)")
+        st.plotly_chart(fig3, use_container_width=True)
+
+        # Raw table
+        with st.expander("Full backtest table"):
+            st.dataframe(
+                bt_view[["symbol", "expiry", "entry_date", "atm_strike",
+                          "entry_premium", "pnl_pts", "pnl_pct", "target", "confidence"]]
+                .sort_values("expiry", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 — STRATEGY BACKTESTS
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "Strategy Backtests":
     st.title("Strategy Backtests")

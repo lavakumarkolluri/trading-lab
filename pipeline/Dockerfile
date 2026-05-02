@@ -60,5 +60,6 @@ COPY nifty_straddle_backtest.py .
 COPY fo_utils.py .
 COPY lot_size_pipeline.py .
 COPY fundamental_pipeline.py .
+COPY confidence_scorer.py .
 
 CMD ["python", "main.py"]
