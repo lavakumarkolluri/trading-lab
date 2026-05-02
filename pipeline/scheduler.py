@@ -115,6 +115,11 @@ def job_strategy_selector_backtest():
     _run("strategy_selector", "--backtest")
 
 
+def job_strategy_selector_fill_outcomes():
+    log.info("=== Strategy selector outcome fill-back triggered ===")
+    _run("strategy_selector", "--fill-outcomes")
+
+
 def job_holidays():
     """Run only on the 1st of each month."""
     if datetime.utcnow().day != 1:
@@ -182,6 +187,10 @@ def main():
     # Daily recommendation: 30 min before market open (10:30 UTC = 16:00 IST)
     for day in ("monday", "tuesday", "wednesday", "thursday"):
         getattr(schedule.every(), day).at("10:30").do(job_strategy_selector_recommend)
+
+    # Outcome fill-back: after EOD pipeline (14:00 UTC = 19:30 IST)
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("14:00").do(job_strategy_selector_fill_outcomes)
 
     # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
     schedule.every().day.at("04:00").do(job_holidays)

@@ -23,6 +23,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Application code ─────────────────────────────────────────────────────────
+COPY ch_utils.py .
 COPY main.py .
 COPY symbols.py .
 COPY mf_pipeline.py .
@@ -50,9 +51,10 @@ COPY option_chain_pipeline.py .
 COPY option_backtest.py .
 COPY option_chain_intraday.py .
 COPY option_chain_historical.py .
-COPY walk_forward_validation.py .
-COPY momentum_factor_test.py .
-COPY breakout_backtest.py .
+# Research/analysis scripts — run locally, not part of pipeline image
+# COPY walk_forward_validation.py .
+# COPY momentum_factor_test.py .
+# COPY breakout_backtest.py .
 COPY options_eod_summary_pipeline.py .
 COPY compute_historical_iv.py .
 COPY compute_oi_features.py .

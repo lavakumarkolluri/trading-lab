@@ -77,13 +77,28 @@ def get_lot_size(ch, symbol: str) -> int:
     return int(rows[0][0]) if rows else 75
 
 
+def get_current_capital(ch) -> float:
+    """Return latest capital_after from strategy_simulation, or INITIAL_CAPITAL if no history."""
+    rows = ch.query(
+        "SELECT capital_after FROM analysis.strategy_simulation FINAL "
+        "ORDER BY sim_date DESC LIMIT 1"
+    ).result_rows
+    return float(rows[0][0]) if rows else INITIAL_CAPITAL
+
+
 def get_confidence(ch, score_date: date, symbol: str):
-    """Returns (confidence, pcr_bias, iv_skew, next_expiry) or None."""
+    """Returns (confidence, pcr_bias, iv_skew, next_expiry) or None.
+
+    Looks back up to 7 days to handle the case where scoring ran Sunday
+    and recommendation is requested Mon–Thu.
+    """
     rows = ch.query(
         "SELECT confidence, next_expiry, features_json "
-        "FROM analysis.confidence_scores "
-        "WHERE score_date = {d:Date} AND symbol = {sym:String} "
-        "ORDER BY version DESC LIMIT 1",
+        "FROM analysis.confidence_scores FINAL "
+        "WHERE score_date >= {d:Date} - INTERVAL 7 DAY "
+        "  AND score_date <= {d:Date} "
+        "  AND symbol = {sym:String} "
+        "ORDER BY score_date DESC, version DESC LIMIT 1",
         parameters={"d": score_date, "sym": symbol},
     ).result_rows
     if not rows:
@@ -122,9 +137,9 @@ def get_optimal_params(ch, symbol: str, strategy: str):
 
 
 def get_latest_chain_snapshot(ch, symbol: str, expiry: date):
-    """Return latest snap_date with chain data for this symbol/expiry."""
+    """Return latest date with chain data for this symbol/expiry."""
     rows = ch.query(
-        "SELECT max(snap_date) FROM market.options_chain "
+        "SELECT max(toDate(timestamp)) FROM market.options_chain "
         "WHERE symbol = {sym:String} AND expiry = {exp:Date} AND ltp > 0.05",
         parameters={"sym": symbol, "exp": expiry},
     ).result_rows
@@ -136,7 +151,7 @@ def get_chain_prices(ch, symbol: str, snap_date: date, expiry: date):
     rows = ch.query(
         "SELECT strike, option_type, ltp "
         "FROM market.options_chain "
-        "WHERE symbol = {sym:String} AND snap_date = {sd:Date} "
+        "WHERE symbol = {sym:String} AND toDate(timestamp) = {sd:Date} "
         "  AND expiry = {exp:Date} AND ltp > 0.05",
         parameters={"sym": symbol, "sd": snap_date, "exp": expiry},
     ).result_rows
@@ -279,12 +294,25 @@ def insert_recommendation(ch, rec: dict):
 
 # ── Modes ─────────────────────────────────────────────────────────────────────
 
+def is_trading_holiday(ch, d: date) -> bool:
+    rows = ch.query(
+        "SELECT 1 FROM market.trading_holidays "
+        "WHERE holiday_date = {d:Date} LIMIT 1",
+        parameters={"d": d},
+    ).result_rows
+    return len(rows) > 0
+
+
 def run_recommend(ch):
     today = date.today()
     weekday = today.weekday()
 
     if weekday not in WEEKDAY_SYMBOL:
         log.info("No expiry today (weekday=%d). Nothing to recommend.", weekday)
+        return
+
+    if is_trading_holiday(ch, today):
+        log.info("Today %s is a trading holiday — no recommendation.", today)
         return
 
     symbol = WEEKDAY_SYMBOL[weekday]
@@ -308,10 +336,12 @@ def run_recommend(ch):
         log.warning("No optimal params for %s/%s — skipping", symbol, strategy)
         return
 
-    lot_size  = get_lot_size(ch, symbol)
-    max_loss  = params["avg_max_loss"]
-    risk_budget = INITIAL_CAPITAL * MAX_RISK_PCT
+    lot_size     = get_lot_size(ch, symbol)
+    max_loss     = params["avg_max_loss"]
+    capital      = get_current_capital(ch)
+    risk_budget  = capital * MAX_RISK_PCT
     lots = max(1, int(risk_budget / (max_loss * lot_size))) if max_loss > 0 else 1
+    log.info("Current capital: ₹%.0f | risk budget: ₹%.0f", capital, risk_budget)
 
     rec = build_recommendation(
         today, symbol, expiry, ch,
@@ -349,16 +379,16 @@ def run_backtest(ch):
             so.wing_m,
             sb.pnl_pts   AS spread_pnl,
             sb.max_loss
-        FROM analysis.confidence_backtest cb
+        FROM analysis.confidence_backtest FINAL cb
         -- pick best strategy params for each symbol
         JOIN (
             SELECT symbol, strategy, short_n, wing_m, sharpe_pct,
                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY sharpe_pct DESC) AS rn
-            FROM analysis.spread_optimal
+            FROM analysis.spread_optimal FINAL
             WHERE n_trades >= 10
         ) so ON so.symbol = cb.symbol AND so.rn = 1
         -- get actual P&L for those params
-        LEFT JOIN analysis.spread_backtest sb
+        LEFT JOIN analysis.spread_backtest FINAL sb
             ON sb.symbol = cb.symbol
            AND sb.expiry = cb.expiry
            AND sb.strategy = so.strategy
@@ -374,11 +404,15 @@ def run_backtest(ch):
     capital = INITIAL_CAPITAL
     sim_rows = []
 
+    # Cache lot sizes to avoid one DB round-trip per row
+    symbols_seen = {r[1] for r in rows}
+    lot_size_cache = {sym: get_lot_size(ch, sym) for sym in symbols_seen}
+
     for (expiry, symbol, entry_date, confidence, straddle_pnl,
          strategy, short_n, wing_m, spread_pnl, max_loss) in rows:
 
         confidence_pct = float(confidence) * 100 if float(confidence) <= 1.0 else float(confidence)
-        lot_size = get_lot_size(ch, symbol)
+        lot_size = lot_size_cache[symbol]
 
         skipped = 0
         pnl_pts = 0.0
@@ -436,19 +470,87 @@ def run_backtest(ch):
         )
 
 
+def run_fill_outcomes(ch):
+    """
+    Fill pnl_pts/outcome on past trade_recommendations where outcome='pending'
+    and the expiry has already passed.  Matches against spread_backtest on
+    (symbol, expiry, strategy, short_n, wing_m).
+    """
+    rows = ch.query("""
+        SELECT rec_date, symbol, expiry, strategy, short_n, wing_m
+        FROM analysis.trade_recommendations FINAL
+        WHERE outcome = 'pending' AND expiry < today()
+    """).result_rows
+
+    if not rows:
+        log.info("No pending recommendations to fill.")
+        return
+
+    filled = 0
+    for rec_date, symbol, expiry, strategy, short_n, wing_m in rows:
+        res = ch.query(
+            "SELECT pnl_pts, target FROM analysis.spread_backtest FINAL "
+            "WHERE symbol = {sym:String} AND expiry = {exp:Date} "
+            "  AND strategy = {strat:String} "
+            "  AND short_n = {sn:UInt8} AND wing_m = {wm:UInt8} "
+            "LIMIT 1",
+            parameters={
+                "sym": symbol, "exp": expiry,
+                "strat": strategy, "sn": short_n, "wm": wing_m,
+            },
+        ).result_rows
+
+        if not res:
+            continue
+
+        pnl_pts, target = res[0]
+        # Fetch lot size + lots from the existing recommendation
+        lot_res = ch.query(
+            "SELECT lots FROM analysis.trade_recommendations FINAL "
+            "WHERE rec_date = {rd:Date} AND symbol = {sym:String} LIMIT 1",
+            parameters={"rd": rec_date, "sym": symbol},
+        ).result_rows
+        lots = int(lot_res[0][0]) if lot_res else 1
+        lot_size = get_lot_size(ch, symbol)
+        pnl_amount = float(pnl_pts) * lots * lot_size
+        outcome = "win" if target else "loss"
+
+        # ReplacingMergeTree: re-insert with updated fields + new version
+        ch.command(
+            "ALTER TABLE analysis.trade_recommendations UPDATE "
+            "pnl_pts = {pnl_pts:Float32}, "
+            "pnl_amount = {pnl_amount:Float32}, "
+            "outcome = {outcome:String}, "
+            "version = toUnixTimestamp(now()) "
+            "WHERE rec_date = {rd:Date} AND symbol = {sym:String}",
+            parameters={
+                "pnl_pts": float(pnl_pts), "pnl_amount": pnl_amount,
+                "outcome": outcome, "rd": rec_date, "sym": symbol,
+            },
+        )
+        log.info("Filled %s %s %s: pnl=%.2f pts (%.0f ₹) → %s",
+                 rec_date, symbol, expiry, pnl_pts, pnl_amount, outcome)
+        filled += 1
+
+    log.info("fill_outcomes: updated %d/%d recommendations", filled, len(rows))
+
+
 def main():
     parser = argparse.ArgumentParser()
     grp = parser.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--recommend", action="store_true")
-    grp.add_argument("--backtest",  action="store_true")
+    grp.add_argument("--recommend",     action="store_true")
+    grp.add_argument("--backtest",      action="store_true")
+    grp.add_argument("--fill-outcomes", action="store_true")
     args = parser.parse_args()
 
     ch = ch_client()
 
     if args.recommend:
         run_recommend(ch)
-    else:
+    elif args.backtest:
         run_backtest(ch)
+    else:
+        run_fill_outcomes(ch)
 
 
 if __name__ == "__main__":

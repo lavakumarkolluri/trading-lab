@@ -36,8 +36,19 @@ def get_ch():
     )
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def query(sql: str) -> pd.DataFrame:
+    """Default cache: 5 min. Use query_weekly() for data that only changes on Sundays."""
+    try:
+        return get_ch().query_df(sql)
+    except Exception as e:
+        st.error(f"Query failed: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def query_weekly(sql: str) -> pd.DataFrame:
+    """1-hour cache for spread_backtest, spread_optimal, confidence_backtest — weekly writes only."""
     try:
         return get_ch().query_df(sql)
     except Exception as e:
@@ -204,7 +215,7 @@ elif page == "Confidence Scores":
 
     # ── Walk-forward backtest ─────────────────────────────────────────────────
     st.subheader("Walk-Forward Backtest Results")
-    bt = query("""
+    bt = query_weekly("""
         SELECT symbol, expiry, entry_date, atm_strike, entry_premium,
                pnl_pts, pnl_pct, target, round(confidence * 100, 1) AS confidence
         FROM analysis.confidence_backtest FINAL
@@ -390,7 +401,7 @@ elif page == "Strategy Backtests":
         "All hedge leg costs deducted from net_credit before any P&L calculation."
     )
 
-    opt = query("""
+    opt = query_weekly("""
         SELECT symbol, strategy, short_n, wing_m, n_trades,
                round(win_rate*100,1) AS win_rate,
                round(avg_pnl_pts,1) AS avg_pnl_pts,
@@ -401,7 +412,7 @@ elif page == "Strategy Backtests":
         ORDER BY symbol, strategy, sharpe DESC
     """)
 
-    spread_trades = query("""
+    spread_trades = query_weekly("""
         SELECT symbol, strategy, short_n, wing_m, expiry, entry_date,
                atm_strike, net_credit, max_loss, pnl_pts, pnl_pct, target
         FROM analysis.spread_backtest FINAL
@@ -462,7 +473,7 @@ elif page == "Strategy Backtests":
             best_bp = opt_sym[opt_sym.strategy == "bull_put"].nlargest(1, "sharpe")
             best_bc = opt_sym[opt_sym.strategy == "bear_call"].nlargest(1, "sharpe")
 
-            straddle_data = query(f"""
+            straddle_data = query_weekly(f"""
                 SELECT expiry, pnl_pts
                 FROM analysis.spread_backtest FINAL
                 WHERE symbol = '{sym_sel}' AND strategy = 'straddle'
@@ -645,7 +656,7 @@ elif page == "Live Trading":
                long_ce_strike, long_pe_strike,
                net_credit, max_loss, lots, capital_at_risk,
                confidence, pcr_bias, iv_skew, outcome
-        FROM analysis.trade_recommendations
+        FROM analysis.trade_recommendations FINAL
         ORDER BY rec_date DESC
         LIMIT 1
     """)
@@ -678,7 +689,7 @@ elif page == "Live Trading":
         SELECT rec_date, symbol, strategy, short_n, wing_m,
                net_credit, max_loss, lots,
                confidence, outcome, pnl_pts, pnl_amount
-        FROM analysis.trade_recommendations
+        FROM analysis.trade_recommendations FINAL
         ORDER BY rec_date DESC
         LIMIT 30
     """)
@@ -690,13 +701,14 @@ elif page == "Live Trading":
     sim_df = query("""
         SELECT sim_date, symbol, strategy, confidence, lots,
                pnl_pts, pnl_amount, capital_before, capital_after, skipped
-        FROM analysis.strategy_simulation
+        FROM analysis.strategy_simulation FINAL
         ORDER BY sim_date
     """)
     if sim_df.empty:
         st.info("No simulation data yet. Run `strategy_selector --backtest`.")
     else:
         sim_df["sim_date"] = pd.to_datetime(sim_df["sim_date"])
+        sim_start_capital = float(sim_df["capital_before"].iloc[0])
 
         # Capital curve
         fig = go.Figure()
@@ -705,12 +717,9 @@ elif page == "Live Trading":
             mode="lines", name="Capital (traded)",
             line=dict(color="royalblue", width=2),
         ))
-        skipped_mask = sim_df["skipped"] == 0
-        baseline = sim_df.copy()
-        # Flat baseline = rows where skipped = 1 carry capital_before
         fig.add_trace(go.Scatter(
             x=sim_df["sim_date"],
-            y=[STARTING_CAPITAL] * len(sim_df),
+            y=[sim_start_capital] * len(sim_df),
             mode="lines", name="Starting capital",
             line=dict(color="gray", width=1, dash="dash"),
         ))
@@ -727,7 +736,7 @@ elif page == "Live Trading":
             final_cap = float(sim_df["capital_after"].iloc[-1])
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Final Capital",   fmt_inr(final_cap))
-            c2.metric("Total Return",    f"{(final_cap/STARTING_CAPITAL - 1)*100:.1f}%")
+            c2.metric("Total Return",    f"{(final_cap/sim_start_capital - 1)*100:.1f}%")
             c3.metric("Trades Taken",    len(traded))
             c4.metric("Trades Skipped",  int(sim_df["skipped"].sum()))
 
@@ -738,11 +747,11 @@ elif page == "Live Trading":
         )
 
     # ── Risk parameters ───────────────────────────────────────────────────────
-    st.subheader("Risk Parameters")
+    st.subheader("Risk Parameters (Strategy Selector)")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Starting Capital",  fmt_inr(STARTING_CAPITAL))
-    c2.metric("Daily Stop (2%)",   fmt_inr(STARTING_CAPITAL * DAILY_STOP_PCT))
-    c3.metric("Capital Floor",     fmt_inr(CAPITAL_FLOOR))
+    c1.metric("Starting Capital",  fmt_inr(500_000))
+    c2.metric("Max Risk / Trade",  "2% of capital")
+    c3.metric("Capital Floor",     fmt_inr(50_000))
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 time.sleep(60)

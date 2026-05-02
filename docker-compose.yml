@@ -398,6 +398,21 @@ services:
     entrypoint: ["python", "option_backtest.py"]
     command: []
 
+  nifty_straddle_backtest:
+    build: ./pipeline
+    container_name: nifty_straddle_backtest
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "nifty_straddle_backtest.py"]
+    command: []
+
   gap_analyzer:
     build: ./pipeline
     container_name: gap_analyzer
