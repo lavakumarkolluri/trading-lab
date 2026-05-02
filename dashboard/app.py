@@ -178,7 +178,9 @@ elif page == "Confidence Scores":
     st.title("Confidence Scores — XGBoost 0DTE Straddle")
     st.caption(
         "Per-symbol XGBoost models trained on 24–28 months of weekly expiry data. "
-        "Score = probability that selling ATM straddle on next expiry will be profitable."
+        "Score = probability (0–100) that selling ATM straddle on next expiry will be profitable. "
+        "Threshold ≥55 to trade. Walk-forward OOS AUC: NIFTY≈0.55, FINNIFTY≈0.62, "
+        "BANKNIFTY≈0.47, MIDCPNIFTY≈0.44. Models are retrained weekly (Sunday)."
     )
 
     # ── Today's scores ───────────────────────────────────────────────────────

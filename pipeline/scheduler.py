@@ -73,6 +73,16 @@ def job_gap_analyzer():
     _run("gap_analyzer")
 
 
+def job_fii_dii_pipeline():
+    log.info("=== FII/DII pipeline triggered ===")
+    _run("fii_dii_pipeline")
+
+
+def job_participant_oi_pipeline():
+    log.info("=== Participant OI pipeline triggered ===")
+    _run("participant_oi_pipeline")
+
+
 def job_option_backtest():
     log.info("=== Option backtest weekly refresh triggered ===")
     _run("option_backtest")                        # buy strategy
@@ -159,12 +169,18 @@ def main():
     log.info("  Lot sizes           : Sun     05:00 UTC (10:30 IST)")
     log.info("  Confidence scorer   : Sun     05:30 UTC (11:00 IST)")
     log.info("  Strategy selector   : Sun     06:30 UTC (12:00 IST) --backtest")
-    log.info("  Strategy recommend  : Mon-Fri 10:30 UTC (16:00 IST) --recommend")
+    log.info("  Strategy recommend  : Mon-Thu 10:30 UTC (16:00 IST) --recommend")
+    log.info("  FII/DII + ParticOI  : Mon-Fri 10:45 UTC (16:15 IST) pre-feed for meta_pipeline")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
 
     # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("03:40").do(job_option_chain_intraday)
+
+    # FII/DII + Participant OI: run before meta_pipeline so data is ready
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("10:45").do(job_fii_dii_pipeline)
+        getattr(schedule.every(), day).at("10:45").do(job_participant_oi_pipeline)
 
     # Daily meta pipeline: 16:30 IST (11:00 UTC)
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):

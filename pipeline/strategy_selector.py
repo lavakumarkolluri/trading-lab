@@ -446,6 +446,9 @@ def run_backtest(ch):
             break
 
     if sim_rows:
+        # Truncate before re-insert so re-running --backtest doesn't append duplicates.
+        # ReplacingMergeTree deduplication is async and not guaranteed before next read.
+        ch.command("TRUNCATE TABLE analysis.strategy_simulation")
         ch.insert(
             "analysis.strategy_simulation",
             sim_rows,

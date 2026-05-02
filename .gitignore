@@ -2,8 +2,9 @@ __pycache__/
 *.pyc
 .env
 workspace/data/
+workspace/logs/
 *.parquet
 *.csv
-.env
 *.swp
 *.swo
+FUNDAMENTAL_DATA_SOURCES.md

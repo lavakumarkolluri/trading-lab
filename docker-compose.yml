@@ -70,6 +70,7 @@ services:
     ports:
       - "9443:9443"
     volumes:
+      # rw required — Portainer needs full daemon access to manage containers/images
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer-data:/data
     restart: unless-stopped
@@ -269,8 +270,9 @@ services:
     build: ./pipeline
     container_name: meta_pipeline
     volumes:
+      # rw required — meta_pipeline spawns sub-containers via docker compose run
       - /var/run/docker.sock:/var/run/docker.sock
-      - .:/trading-lab:ro          # ← ADD THIS
+      - .:/trading-lab:ro
     environment:
       - CH_HOST=clickhouse
       - CH_PORT=8123
@@ -626,6 +628,7 @@ services:
     build: ./pipeline
     container_name: scheduler
     volumes:
+      # rw required — scheduler spawns sub-containers via docker compose run
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/trading-lab:ro
     environment:
