@@ -517,6 +517,47 @@ elif page == "Strategy Backtests":
                                legend=dict(orientation="h", yanchor="bottom", y=1))
             st.plotly_chart(fig3, use_container_width=True)
 
+        # PCR vs strategy win rate breakdown
+        st.markdown("**Win Rate by PCR Band & Strategy** (validates directional bias thresholds)")
+        pcr_perf = query_weekly(f"""
+            SELECT
+                multiIf(s.pcr_oi < 0.8, '<0.8 (Bearish)',
+                         s.pcr_oi < 1.0, '0.8–1.0',
+                         s.pcr_oi < 1.2, '1.0–1.2',
+                         '≥1.2 (Bullish)') AS pcr_band,
+                sb.strategy,
+                round(avg(sb.target) * 100, 1)  AS win_rate,
+                count()                          AS n_trades
+            FROM analysis.spread_backtest FINAL sb
+            JOIN market.options_eod_summary FINAL s
+              ON s.symbol = sb.symbol AND s.date = sb.entry_date
+            WHERE sb.strategy IN ('iron_condor', 'bull_put', 'bear_call')
+              AND sb.symbol = '{sym_sel}'
+            GROUP BY pcr_band, sb.strategy
+            ORDER BY pcr_band, sb.strategy
+        """)
+        if not pcr_perf.empty:
+            fig_pcr = px.bar(
+                pcr_perf, x="pcr_band", y="win_rate", color="strategy",
+                barmode="group", text="win_rate",
+                labels={"pcr_band": "PCR at Entry", "win_rate": "Win Rate %", "strategy": "Strategy"},
+                color_discrete_map={
+                    "iron_condor": "#3498db", "bull_put": "#2ecc71", "bear_call": "#f39c12"
+                },
+            )
+            fig_pcr.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="50%")
+            fig_pcr.update_traces(textposition="outside")
+            fig_pcr.update_layout(height=320, yaxis_range=[0, 110],
+                                   legend=dict(orientation="h"))
+            st.plotly_chart(fig_pcr, use_container_width=True)
+            st.caption(
+                "If bull_put wins more in PCR ≥1.2 bands and bear_call in PCR <0.8, "
+                "the directional bias in strategy_selector.py is validated. "
+                "If IC consistently outperforms across all bands, use IC only."
+            )
+        else:
+            st.info("Not enough data to show PCR breakdown for this symbol yet.")
+
         # Optimal params table
         st.markdown("**Top 10 Combinations (by Sharpe)**")
         top = opt_sym[opt_sym.strategy != "straddle"].nlargest(10, "sharpe")[

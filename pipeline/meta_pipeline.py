@@ -160,16 +160,9 @@ DAILY_STEPS = [
         "skip_key":    "skip_vix",
         "soft_fail":   True,   # yfinance outage must not block the main pipeline
     },
-    {
-        "step":        5,
-        "name":        "Option Chain Pipeline",
-        "description": "Fetch NSE option chain; compute PCR, max pain, IV rank, strike recs",
-        "service":     "option_chain_pipeline",
-        "args":        [],
-        "skippable":   True,
-        "skip_key":    "skip_oc",
-        "soft_fail":   True,   # NSE API flaky; options context enriches but doesn't block
-    },
+    # Step 5 (option_chain_pipeline) retired — superseded by option_chain_historical
+    # (bhavcopy) + options_eod_summary_pipeline which run in the EOD job and cover
+    # all 4 indices. The old live scraper only covered NIFTY/BANKNIFTY.
     {
         "step":        6,
         "name":        "Event Detector",
