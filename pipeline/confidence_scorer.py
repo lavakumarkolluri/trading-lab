@@ -89,6 +89,21 @@ def get_mc():
 
 # ── Data Loading ──────────────────────────────────────────────────────────────
 
+def load_vix(ch) -> pd.DataFrame:
+    """Load daily VIX from market.nifty_live — one row per trading date."""
+    r = ch.query("""
+        SELECT toDate(timestamp) AS date, max(vix) AS vix
+        FROM market.nifty_live FINAL
+        WHERE vix > 0
+        GROUP BY date
+        ORDER BY date
+    """)
+    df = pd.DataFrame(r.result_rows, columns=["date", "vix"])
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df.set_index("date", inplace=True)
+    return df
+
+
 def load_eod_summary(ch) -> pd.DataFrame:
     """Load full options_eod_summary — market-wide NIFTY indicators."""
     r = ch.query("""
@@ -289,6 +304,7 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
     chain = load_options_chain(ch, symbol)
     eod   = load_eod_summary(ch)
     poi   = load_participant_oi(ch)
+    vix   = load_vix(ch)
 
     # All weekly expiries that appear in the chain
     expiries = sorted(chain["expiry"].unique())
@@ -326,6 +342,7 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
         row.update(extract_eod_features(eod, snap_date))
         row.update(extract_poi_features(poi, snap_date))
         row.update(temporal_features(expiry))
+        row["vix"] = float(vix.loc[snap_date, "vix"]) if snap_date in vix.index else float("nan")
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -353,6 +370,8 @@ FEATURE_COLS = [
     "fii_call_net", "fii_put_net", "fii_pcr",
     # Temporal
     "day_of_week", "week_of_month",
+    # Volatility regime
+    "vix",
 ]
 
 
@@ -544,6 +563,7 @@ def score_today(ch, mc, symbol: str) -> None:
     chain = load_options_chain(ch, symbol)
     eod   = load_eod_summary(ch)
     poi   = load_participant_oi(ch)
+    vix   = load_vix(ch)
 
     today = date.today()
     snap_dates = sorted(chain["snap_date"].unique(), reverse=True)
@@ -571,6 +591,7 @@ def score_today(ch, mc, symbol: str) -> None:
     row.update(extract_eod_features(eod, latest_snap))
     row.update(extract_poi_features(poi, latest_snap))
     row.update(temporal_features(next_expiry))
+    row["vix"] = float(vix.loc[latest_snap, "vix"]) if latest_snap in vix.index else 0.0
 
     feat_df = pd.DataFrame([row])
     meta_key = f"{MODELS_PREFIX}/{symbol}_meta.json"
