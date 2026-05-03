@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS trades.open_positions
     stoploss_inr    Float32,                         -- fixed: 1000
     scorecard_conf  Float32,                         -- confidence score at entry (0-100)
     status          LowCardinality(String),          -- open / closed
+    entry_features  String DEFAULT '{}',             -- JSON snapshot of signals at entry
     trailing_active UInt8 DEFAULT 0,                 -- 1 once target first hit
     peak_pnl_inr    Float32 DEFAULT 0,               -- highest INR profit seen
     trail_stop_inr  Float32 DEFAULT 0,               -- 75% of peak_pnl_inr

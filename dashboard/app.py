@@ -82,6 +82,7 @@ page = st.sidebar.radio("Navigate", [
     "Trade Log",
     "Market Pulse",
     "Live Trading",
+    "Paper Trades",
 ])
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Auto-refresh: 60s | Capital: {fmt_inr(STARTING_CAPITAL)}")
@@ -1202,6 +1203,144 @@ elif page == "Live Trading":
     c1.metric("Starting Capital",  fmt_inr(500_000))
     c2.metric("Max Risk / Trade",  "2% of capital")
     c3.metric("Capital Floor",     fmt_inr(50_000))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 8 — PAPER TRADES
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Paper Trades":
+    st.title("Paper Trades — Intraday Straddle Monitor")
+    st.caption("Auto paper trading: NIFTY + BANKNIFTY straddle, ₹2000 target (trailing), ₹1000 stop")
+
+    # ── Open positions ────────────────────────────────────────────────────────
+    st.subheader("Open Positions")
+    open_df = query("""
+        SELECT symbol, expiry, entry_time, strike,
+               entry_ce_ltp, entry_pe_ltp, entry_premium,
+               lot_size, target_inr, stoploss_inr,
+               trailing_active, peak_pnl_inr, trail_stop_inr,
+               scorecard_conf
+        FROM trades.open_positions FINAL
+        WHERE status = 'open'
+        ORDER BY entry_time DESC
+    """)
+    if open_df.empty:
+        st.info("No open positions right now.")
+    else:
+        for _, r in open_df.iterrows():
+            with st.container(border=True):
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Symbol",   r["symbol"])
+                c2.metric("Strike",   f"{r['strike']:.0f}")
+                c3.metric("Premium",  f"{r['entry_premium']:.1f} pts")
+                c4.metric("Conf",     f"{r['scorecard_conf']:.0f}/100")
+                c5.metric("Trailing", "Yes" if r["trailing_active"] else "No")
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Expiry",       str(r["expiry"]))
+                c2.metric("Entry CE",     f"{r['entry_ce_ltp']:.1f}")
+                c3.metric("Entry PE",     f"{r['entry_pe_ltp']:.1f}")
+                c4.metric("Peak P&L",     fmt_inr(float(r["peak_pnl_inr"])))
+                c5.metric("Trail Floor",  fmt_inr(float(r["trail_stop_inr"])))
+
+    # ── Today's completed trades ───────────────────────────────────────────────
+    st.subheader("Today's Completed Trades")
+    today_df = query("""
+        SELECT symbol, strike, expiry,
+               entry_time, exit_time, exit_reason,
+               entry_premium, exit_premium,
+               pnl_pts, pnl_inr, lot_size, scorecard_conf
+        FROM trades.trade_outcomes FINAL
+        WHERE toDate(entry_time) = today()
+        ORDER BY exit_time DESC
+    """)
+    if today_df.empty:
+        st.info("No completed trades today.")
+    else:
+        total_inr = float(today_df["pnl_inr"].sum())
+        wins  = int((today_df["pnl_inr"] > 0).sum())
+        stops = int((today_df["exit_reason"] == "stop").sum())
+        trails = int((today_df["exit_reason"] == "trail").sum())
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Today P&L",  fmt_inr(total_inr), delta_color=color(total_inr))
+        c2.metric("Trades",     len(today_df))
+        c3.metric("Wins",       wins)
+        c4.metric("Stops",      stops)
+        c5.metric("Trail Exits", trails)
+
+        display = today_df[[
+            "symbol", "strike", "entry_time", "exit_time", "exit_reason",
+            "entry_premium", "exit_premium", "pnl_pts", "pnl_inr", "scorecard_conf"
+        ]].copy()
+        display["entry_time"] = pd.to_datetime(display["entry_time"]).dt.strftime("%H:%M")
+        display["exit_time"]  = pd.to_datetime(display["exit_time"]).dt.strftime("%H:%M")
+        display["pnl_inr"]    = display["pnl_inr"].apply(lambda v: f"₹{v:.0f}")
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+    # ── Historical outcomes ────────────────────────────────────────────────────
+    st.subheader("Historical Outcomes")
+    hist_df = query("""
+        SELECT toDate(entry_time) AS trade_date,
+               symbol, strike, exit_reason,
+               entry_premium, exit_premium,
+               pnl_pts, pnl_inr, scorecard_conf
+        FROM trades.trade_outcomes FINAL
+        ORDER BY entry_time DESC
+        LIMIT 200
+    """)
+    if hist_df.empty:
+        st.info("No historical trade data yet.")
+    else:
+        hist_df["trade_date"] = pd.to_datetime(hist_df["trade_date"])
+
+        # Cumulative P&L curve
+        cum = hist_df.sort_values("trade_date").copy()
+        cum["cum_pnl"] = cum["pnl_inr"].cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=cum["trade_date"], y=cum["cum_pnl"],
+            mode="lines+markers", name="Cumulative P&L",
+            line=dict(color="royalblue", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(65,105,225,0.1)",
+        ))
+        fig.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig.update_layout(
+            height=300, title="Cumulative P&L (₹)",
+            yaxis_title="₹", xaxis_title="Date",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Summary by exit reason
+        c1, c2 = st.columns(2)
+        with c1:
+            by_reason = hist_df.groupby("exit_reason").agg(
+                trades=("pnl_inr", "count"),
+                total_inr=("pnl_inr", "sum"),
+                avg_inr=("pnl_inr", "mean"),
+                win_rate=("pnl_inr", lambda x: (x > 0).mean() * 100),
+            ).reset_index()
+            st.markdown("**By Exit Reason**")
+            st.dataframe(by_reason, use_container_width=True, hide_index=True)
+
+        with c2:
+            by_sym = hist_df.groupby("symbol").agg(
+                trades=("pnl_inr", "count"),
+                total_inr=("pnl_inr", "sum"),
+                avg_inr=("pnl_inr", "mean"),
+                win_rate=("pnl_inr", lambda x: (x > 0).mean() * 100),
+            ).reset_index()
+            st.markdown("**By Symbol**")
+            st.dataframe(by_sym, use_container_width=True, hide_index=True)
+
+        # Full trade log
+        with st.expander("Full Trade Log"):
+            st.dataframe(
+                hist_df[["trade_date","symbol","strike","exit_reason",
+                          "entry_premium","exit_premium","pnl_pts","pnl_inr","scorecard_conf"]],
+                use_container_width=True, hide_index=True,
+            )
+
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 time.sleep(60)

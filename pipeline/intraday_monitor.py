@@ -211,7 +211,8 @@ def get_open_position(ch, symbol: str) -> dict | None:
             SELECT trade_id, symbol, expiry, entry_time, strike,
                    entry_ce_ltp, entry_pe_ltp, entry_premium,
                    lot_size, target_pts, stop_pts, target_inr, stoploss_inr,
-                   scorecard_conf, trailing_active, peak_pnl_inr, trail_stop_inr
+                   scorecard_conf, trailing_active, peak_pnl_inr, trail_stop_inr,
+                   entry_features
             FROM trades.open_positions FINAL
             WHERE symbol = {sym:String} AND status = 'open'
             ORDER BY entry_time DESC
@@ -223,7 +224,8 @@ def get_open_position(ch, symbol: str) -> dict | None:
         cols = ["trade_id","symbol","expiry","entry_time","strike",
                 "entry_ce_ltp","entry_pe_ltp","entry_premium",
                 "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
-                "scorecard_conf","trailing_active","peak_pnl_inr","trail_stop_inr"]
+                "scorecard_conf","trailing_active","peak_pnl_inr","trail_stop_inr",
+                "entry_features"]
         return dict(zip(cols, r.result_rows[0]))
     except Exception as e:
         log.warning(f"[{symbol}] get_open_position failed: {e}")
@@ -251,15 +253,16 @@ def record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run=False) -> s
     stop_pts    = STOPLOSS_INR / lot_size
     entry_time  = ist_naive()
 
-    features = {
-        "strike":   snap["strike"],
-        "ce_ltp":   snap["ce_ltp"],
-        "pe_ltp":   snap["pe_ltp"],
-        "straddle": snap["straddle"],
-        "ce_iv":    snap["ce_iv"],
-        "pe_iv":    snap["pe_iv"],
-        "expiry":   str(snap["expiry"]),
-    }
+    features = json.dumps({
+        "strike":        snap["strike"],
+        "ce_ltp":        snap["ce_ltp"],
+        "pe_ltp":        snap["pe_ltp"],
+        "straddle":      snap["straddle"],
+        "ce_iv":         snap["ce_iv"],
+        "pe_iv":         snap["pe_iv"],
+        "expiry":        str(snap["expiry"]),
+        "scorecard_conf": scorecard_conf,
+    })
 
     log.info(f"[{symbol}] ENTER trade_id={trade_id[:8]} strike={snap['strike']:.0f} "
              f"premium={snap['straddle']:.1f} target={target_pts:.1f}pts "
@@ -272,12 +275,13 @@ def record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run=False) -> s
               snap["strike"], snap["ce_ltp"], snap["pe_ltp"], snap["straddle"],
               lot_size, target_pts, stop_pts, TARGET_INR, STOPLOSS_INR,
               scorecard_conf, "open",
-              0, 0.0, 0.0, entry_time]],
+              0, 0.0, 0.0, entry_time, features]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
-                          "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked"],
+                          "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
+                          "entry_features"],
         )
     return trade_id
 
@@ -298,7 +302,7 @@ def record_exit(ch, pos, current_straddle, exit_reason, dry_run=False):
               pos["entry_time"], exit_time,
               pos["strike"], pos["entry_premium"], current_straddle,
               pnl_pts, pnl_inr, pos["lot_size"], exit_reason,
-              pos["scorecard_conf"], "{}"]],
+              pos["scorecard_conf"], pos.get("entry_features", "{}")]],
             column_names=["trade_id","symbol","expiry","entry_time","exit_time",
                           "strike","entry_premium","exit_premium",
                           "pnl_pts","pnl_inr","lot_size","exit_reason",
@@ -367,7 +371,7 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
             return
 
         pnl_pts = pos["entry_premium"] - current
-        pnl_inr = pnl_pts * lot_size
+        pnl_inr = pnl_pts * pos["lot_size"]
 
         log.info(f"[{symbol}] IN-TRADE strike={pos['strike']:.0f} "
                  f"entry={pos['entry_premium']:.1f} now={current:.1f} "
@@ -407,6 +411,8 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
     # Cooldown after stop loss
     last_stop = last_stop_time(ch, symbol)
     if last_stop:
+        if not isinstance(last_stop, datetime):
+            last_stop = datetime.fromisoformat(str(last_stop))
         elapsed_m = (ist_naive() - last_stop).total_seconds() / 60
         if elapsed_m < STOP_COOLDOWN_M:
             log.info(f"[{symbol}] stop cooldown {elapsed_m:.0f}/{STOP_COOLDOWN_M} min — waiting")
