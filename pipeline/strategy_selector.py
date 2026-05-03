@@ -42,7 +42,8 @@ CH_USER = os.getenv("CH_USER", "default")
 CH_PASSWORD = os.getenv("CH_PASSWORD", "")
 
 # ── Strategy parameters ───────────────────────────────────────────────────────
-CONFIDENCE_THRESHOLD = 55.0     # minimum confidence to trade
+CONFIDENCE_THRESHOLD = 55.0     # minimum confidence to trade (used in --backtest only)
+TRADE_SCORE_THRESHOLD = 65.0    # composite score gate for --recommend
 INITIAL_CAPITAL     = 500_000.0 # ₹5 lakh starting capital
 CAPITAL_FLOOR       = 50_000.0  # halt if capital falls below this
 MAX_RISK_PCT        = 0.02      # 2% of capital per trade max loss
@@ -55,6 +56,14 @@ PCR_BEARISH = 0.8   # PCR < this → bearish sentiment → bear_call preferred
 VIX_MIN = 11.0          # skip if VIX too low (no premium worth collecting)
 VIX_MAX = 28.0          # skip if VIX too high (tail-risk events)
 IV_SKEW_THRESH = 2.0    # % — iv_skew = avg(PE_IV_OTM) − avg(CE_IV_OTM); +ve = fear/put premium
+
+# Phase 2 trade_score weights (sum = 100)
+SCORE_W_CONFIDENCE = 40   # confidence model quality
+SCORE_W_VIX        = 20   # VIX regime: sweet spot 14-22 = full, 11-13/23-28 = half
+SCORE_W_IV_RANK    = 20   # IV rank: higher = more premium to sell
+SCORE_W_ALIGNMENT  = 20   # PCR + iv_skew agreement on direction
+VIX_SWEET_LO       = 14.0
+VIX_SWEET_HI       = 22.0
 
 # Weekday → symbol mapping (0=Mon … 6=Sun)
 WEEKDAY_SYMBOL = {
@@ -127,6 +136,29 @@ def get_current_capital(ch) -> float:
     return float(rows[0][0]) if rows else INITIAL_CAPITAL
 
 
+def get_avg_win_pnl(ch, lookback: int = 30) -> float | None:
+    """Average P&L (₹) of winning trades from the last `lookback` non-skipped sim rows.
+
+    Returns None if insufficient history (< 10 trades).
+    Used as a drawdown cap: max loss per trade ≤ avg win.
+    """
+    rows = ch.query(
+        "SELECT avg(pnl_amount) FROM ("
+        "  SELECT pnl_amount FROM analysis.strategy_simulation FINAL "
+        "  WHERE skipped = 0 AND pnl_amount > 0 "
+        "  ORDER BY sim_date DESC LIMIT {n:UInt32}"
+        ")",
+        parameters={"n": lookback},
+    ).result_rows
+    val = float(rows[0][0]) if rows and rows[0][0] else None
+    # Only return once we have at least 10 trades in history
+    count_rows = ch.query(
+        "SELECT count() FROM analysis.strategy_simulation FINAL WHERE skipped = 0"
+    ).result_rows
+    n_trades = int(count_rows[0][0]) if count_rows else 0
+    return val if (val and n_trades >= 10) else None
+
+
 def get_confidence(ch, score_date: date, symbol: str):
     """Returns (confidence, pcr_bias, iv_skew, next_expiry) or None.
 
@@ -169,6 +201,59 @@ def pick_strategy(confidence: float, pcr_bias: float, iv_skew: float) -> str:
     if pcr_bear and not skew_bull:
         return "bear_call"
     return "iron_condor"
+
+
+def compute_trade_score(
+    confidence: float, vix: float | None,
+    iv_rank: float, pcr_bias: float, iv_skew: float,
+) -> tuple[float, dict]:
+    """Composite trade quality score 0-100. Returns (score, breakdown).
+
+    Components (weights sum to 100):
+      confidence  40pts — model conviction
+      vix_zone    20pts — 14-22 = sweet spot (full), 11-13/23-28 = half, else 0
+      iv_rank     20pts — proportional (more premium → higher score)
+      alignment   20pts — PCR + iv_skew both agree on direction (full),
+                          only PCR signal (half), conflict or neutral (0)
+    """
+    # Confidence component
+    conf_pct  = min(confidence, 100.0) / 100.0
+    s_conf    = conf_pct * SCORE_W_CONFIDENCE
+
+    # VIX zone component
+    if vix is None:
+        s_vix = SCORE_W_VIX * 0.5   # unknown → assume partial credit
+    elif VIX_SWEET_LO <= vix <= VIX_SWEET_HI:
+        s_vix = SCORE_W_VIX * 1.0
+    elif VIX_MIN <= vix <= VIX_MAX:
+        s_vix = SCORE_W_VIX * 0.5
+    else:
+        s_vix = 0.0
+
+    # IV rank component
+    s_ivrank = (min(iv_rank, 100.0) / 100.0) * SCORE_W_IV_RANK
+
+    # Signal alignment component
+    pcr_bull  = pcr_bias > PCR_BULLISH
+    pcr_bear  = pcr_bias < PCR_BEARISH
+    skew_bull = iv_skew > IV_SKEW_THRESH
+    skew_bear = iv_skew < -IV_SKEW_THRESH
+    if (pcr_bull and skew_bull) or (pcr_bear and skew_bear):
+        s_align = SCORE_W_ALIGNMENT * 1.0   # both agree
+    elif pcr_bull or pcr_bear:
+        s_align = SCORE_W_ALIGNMENT * 0.5   # only PCR signal
+    else:
+        s_align = 0.0                        # neutral or conflict
+
+    score = s_conf + s_vix + s_ivrank + s_align
+    breakdown = {
+        "score": round(score, 1),
+        "s_confidence": round(s_conf, 1),
+        "s_vix": round(s_vix, 1),
+        "s_iv_rank": round(s_ivrank, 1),
+        "s_alignment": round(s_align, 1),
+    }
+    return score, breakdown
 
 
 def get_optimal_params(ch, symbol: str, strategy: str):
@@ -398,23 +483,33 @@ def run_recommend(ch):
 
     confidence, pcr_bias, iv_skew, expiry = result
 
-    if confidence < CONFIDENCE_THRESHOLD:
-        log.info("Confidence %.1f < threshold %.1f — no trade for %s",
-                 confidence, CONFIDENCE_THRESHOLD, symbol)
+    # Fetch chain snapshot date early — needed for VIX and EOD signals
+    snap_date = get_latest_chain_snapshot(ch, symbol, expiry)
+    vix = get_vix(ch, snap_date) if snap_date else None
+    signals = get_eod_signals(ch, expiry, snap_date) if snap_date else {}
+    iv_rank = signals.get("iv_rank", 50.0)
+
+    # Phase 2: composite trade_score gate
+    trade_score, score_breakdown = compute_trade_score(confidence, vix, iv_rank, pcr_bias, iv_skew)
+    log.info(
+        "Trade score: %.1f/100 (conf=%.1f vix=%.1f ivrank=%.1f align=%.1f) | "
+        "VIX=%s iv_rank=%.1f pcr=%.2f iv_skew=%.2f",
+        trade_score,
+        score_breakdown["s_confidence"], score_breakdown["s_vix"],
+        score_breakdown["s_iv_rank"], score_breakdown["s_alignment"],
+        f"{vix:.1f}" if vix is not None else "n/a",
+        iv_rank, pcr_bias, iv_skew,
+    )
+    if trade_score < TRADE_SCORE_THRESHOLD:
+        log.info("Trade score %.1f < threshold %.1f — no trade for %s",
+                 trade_score, TRADE_SCORE_THRESHOLD, symbol)
         return
 
-    # VIX filter: skip trading in dead or panic market regimes
-    snap_date = get_latest_chain_snapshot(ch, symbol, expiry)
-    if snap_date is not None:
-        vix = get_vix(ch, snap_date)
-        if vix is not None:
-            log.info("VIX=%.2f (gate: %.1f–%.1f)", vix, VIX_MIN, VIX_MAX)
-            if vix < VIX_MIN or vix > VIX_MAX:
-                log.info("VIX %.2f outside [%.1f, %.1f] — no trade for %s",
-                         vix, VIX_MIN, VIX_MAX, symbol)
-                return
-        else:
-            log.warning("VIX unavailable — proceeding without VIX gate")
+    # Hard VIX gate still applies (catches extreme regimes regardless of score)
+    if vix is not None and (vix < VIX_MIN or vix > VIX_MAX):
+        log.info("VIX %.2f outside [%.1f, %.1f] — no trade for %s",
+                 vix, VIX_MIN, VIX_MAX, symbol)
+        return
 
     strategy = pick_strategy(confidence, pcr_bias, iv_skew)
     log.info("Signal: pcr=%.2f iv_skew=%.2f → strategy=%s", pcr_bias, iv_skew, strategy)
@@ -423,11 +518,8 @@ def run_recommend(ch):
         log.warning("No optimal params for %s/%s — skipping", symbol, strategy)
         return
 
-    # EOD signals for lot sizing and OI wall guard
-    signals = get_eod_signals(ch, expiry, snap_date) if snap_date else {}
-    iv_rank = signals.get("iv_rank", 50.0)
     iv_rank_mult = 0.5 + iv_rank / 100.0   # 0.5x at iv_rank=0, 1.5x at iv_rank=100
-    log.info("iv_rank=%.1f → lot_size_mult=%.2f | max_pain=%.0f | CE_wall=%.0f | PE_wall=%.0f",
+    log.info("iv_rank=%.1f → lot_mult=%.2f | max_pain=%.0f | CE_wall=%.0f | PE_wall=%.0f",
              iv_rank, iv_rank_mult,
              signals.get("max_pain_strike", 0), signals.get("ce_wall_strike", 0),
              signals.get("pe_wall_strike", 0))
@@ -438,7 +530,17 @@ def run_recommend(ch):
     risk_budget = capital * MAX_RISK_PCT
     base_lots   = int(risk_budget / (max_loss * lot_size)) if max_loss > 0 else 1
     lots        = max(1, int(base_lots * iv_rank_mult))
-    log.info("Current capital: ₹%.0f | risk budget: ₹%.0f | lots=%d (base=%d × mult=%.2f)",
+
+    # Drawdown cap: max loss per trade ≤ avg winning trade P&L
+    avg_win = get_avg_win_pnl(ch)
+    if avg_win and max_loss > 0:
+        cap_lots = max(1, int(avg_win / (max_loss * lot_size)))
+        if cap_lots < lots:
+            log.info("Drawdown cap: lots %d → %d (avg_win=₹%.0f / max_loss=₹%.0f per lot)",
+                     lots, cap_lots, avg_win, max_loss * lot_size)
+            lots = cap_lots
+
+    log.info("Capital: ₹%.0f | risk budget: ₹%.0f | lots=%d (base=%d × iv_mult=%.2f)",
              capital, risk_budget, lots, base_lots, iv_rank_mult)
 
     rec = build_recommendation(
@@ -455,9 +557,9 @@ def run_recommend(ch):
     insert_recommendation(ch, rec)
     log.info(
         "Recommendation: %s %s | strategy=%s sn=%d wm=%d | "
-        "net_credit=%.2f max_loss=%.2f lots=%d | confidence=%.1f",
+        "net_credit=%.2f max_loss=%.2f lots=%d | score=%.1f confidence=%.1f",
         symbol, expiry, strategy, params["short_n"], params["wing_m"],
-        rec["net_credit"], rec["max_loss"], lots, confidence,
+        rec["net_credit"], rec["max_loss"], lots, trade_score, confidence,
     )
 
 
@@ -504,8 +606,37 @@ def run_backtest(ch):
         log.warning("No OOS data to simulate")
         return
 
+    # Pre-fetch VIX and EOD signals for all entry_dates to avoid per-row DB queries
+    all_dates  = sorted({r[2] for r in rows})   # entry_date is index 2
+    all_expiry = sorted({r[0] for r in rows})   # expiry is index 0
+
+    d_min, d_max = all_dates[0], all_dates[-1]
+
+    vix_rows = ch.query(
+        "SELECT toDate(timestamp) AS d, argMax(vix, timestamp) AS vix "
+        "FROM market.nifty_live FINAL "
+        "WHERE toDate(timestamp) >= {d1:Date} AND toDate(timestamp) <= {d2:Date} "
+        "GROUP BY d",
+        parameters={"d1": d_min, "d2": d_max},
+    ).result_rows
+    vix_by_date = {r[0]: float(r[1]) for r in vix_rows if r[1]}
+
+    try:
+        eod_rows = ch.query(
+            "SELECT expiry, date, ifNull(iv_rank, 50), ifNull(pcr, 1.0), "
+            "       ifNull(iv_skew, 0) "
+            "FROM market.options_eod_summary FINAL "
+            "WHERE date >= {d1:Date} AND date <= {d2:Date}",
+            parameters={"d1": d_min, "d2": d_max},
+        ).result_rows
+    except Exception as e:
+        log.warning("EOD signals query failed (iv_skew may not exist): %s — using defaults", e)
+        eod_rows = []
+    eod_by_key = {(r[0], r[1]): (float(r[2]), float(r[3]), float(r[4])) for r in eod_rows}
+
     capital = INITIAL_CAPITAL
     sim_rows = []
+    win_pnls: list[float] = []   # track winning trade amounts for drawdown cap
 
     # Cache lot sizes to avoid one DB round-trip per row
     symbols_seen = {r[1] for r in rows}
@@ -517,19 +648,46 @@ def run_backtest(ch):
         confidence_pct = float(confidence) * 100 if float(confidence) <= 1.0 else float(confidence)
         lot_size = lot_size_cache[symbol]
 
+        # Resolve signals for this row
+        vix = vix_by_date.get(entry_date)
+        iv_rank, pcr_bias, iv_skew = eod_by_key.get((expiry, entry_date), (50.0, 1.0, 0.0))
+
+        # Hard VIX gate
+        if vix is not None and (vix < VIX_MIN or vix > VIX_MAX):
+            sim_rows.append([
+                entry_date, symbol, expiry,
+                strategy or "iron_condor", short_n or 0, wing_m or 0,
+                confidence_pct, 0, lot_size, 0.0, 0.0, capital, capital, 1,
+            ])
+            continue
+
+        trade_score, _ = compute_trade_score(confidence_pct, vix, iv_rank, pcr_bias, iv_skew)
+
         skipped = 0
         pnl_pts = 0.0
         pnl_amount = 0.0
         lots = 1
 
-        if confidence_pct < CONFIDENCE_THRESHOLD:
+        if trade_score < TRADE_SCORE_THRESHOLD:
             skipped = 1
         else:
-            if max_loss and float(max_loss) > 0:
-                risk_budget = capital * MAX_RISK_PCT
-                lots = max(1, int(risk_budget / (float(max_loss) * lot_size)))
-            pnl_pts   = float(spread_pnl or straddle_pnl or 0.0)
+            ml = float(max_loss) if max_loss else 0.0
+            if ml > 0:
+                iv_rank_mult = 0.5 + iv_rank / 100.0
+                risk_budget  = capital * MAX_RISK_PCT
+                base_lots    = int(risk_budget / (ml * lot_size))
+                lots         = max(1, int(base_lots * iv_rank_mult))
+
+                # Drawdown cap: max loss per trade ≤ rolling avg winning P&L
+                if len(win_pnls) >= 10:
+                    avg_win = sum(win_pnls[-30:]) / len(win_pnls[-30:])
+                    cap_lots = max(1, int(avg_win / (ml * lot_size)))
+                    lots = min(lots, cap_lots)
+
+            pnl_pts    = float(spread_pnl or straddle_pnl or 0.0)
             pnl_amount = pnl_pts * lots * lot_size
+            if pnl_amount > 0:
+                win_pnls.append(pnl_amount)
 
         capital_before = capital
         capital += pnl_amount
@@ -537,7 +695,7 @@ def run_backtest(ch):
 
         sim_rows.append([
             entry_date, symbol, expiry,
-            strategy or "straddle", short_n or 0, wing_m or 0,
+            strategy or "iron_condor", short_n or 0, wing_m or 0,
             confidence_pct, lots, lot_size,
             pnl_pts, pnl_amount,
             capital_before, capital,
