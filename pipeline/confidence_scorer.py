@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 """
-confidence_scorer.py — XGBoost confidence scorer for 0DTE option selling
+confidence_scorer.py — Multi-model confidence scorer for 0DTE option selling
 
 Strategy: sell ATM straddle on weekly expiry day, hold to settlement.
 Entry: ATM straddle premium from previous trading day EOD.
 Exit:  settlement value from expiry day EOD.
 
-Features (no lookahead — all from snapshot_date = prev trading day):
-  • options_chain    : straddle premium, PCR OI, OI concentration, CE/PE ratio
-  • options_eod_summary : IV rank, IV percentile, ATM IV, IV skew, wall distances
-  • participant_oi   : FII/client index option net positioning
-  • temporal         : day of week, week of month
-
-Target: 1 if straddle P&L > 0, else 0 (binary classification).
-Score:  predict_proba × 100 (0–100 confidence).
-
-Walk-forward: train 12 months, test 1 month, slide monthly.
+Models compared (--compare flag):
+  xgb         — XGBoost per-symbol (baseline, default)
+  lr          — Logistic Regression per-symbol (better calibrated for small n)
+  scorecard   — Rule-based (no training; thresholds on IV rank, VIX, ATR, HV ratio)
+  xgb_pooled  — XGBoost on all symbols combined (~380 rows)
+  lr_pooled   — Logistic Regression pooled
 
 Usage:
-    python confidence_scorer.py                    # all symbols, full run
-    python confidence_scorer.py --symbol NIFTY     # one symbol
-    python confidence_scorer.py --backtest-only    # no production score
-    python confidence_scorer.py --score-only       # skip backtest, score today
+    python confidence_scorer.py                          # all symbols, XGBoost
+    python confidence_scorer.py --compare                # compare all, train best
+    python confidence_scorer.py --model-type lr          # force logistic regression
+    python confidence_scorer.py --model-type scorecard   # rule-based scoring
+    python confidence_scorer.py --symbol NIFTY           # one symbol
+    python confidence_scorer.py --backtest-only          # no production score
+    python confidence_scorer.py --score-only             # skip backtest, score today
 """
 
 import io
 import json
 import logging
 import os
+import pickle
 import argparse
 from datetime import date, timedelta
 from typing import Optional
@@ -38,6 +38,9 @@ import clickhouse_connect
 from minio import Minio
 from minio.error import S3Error
 import xgboost as xgb
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, accuracy_score
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -57,8 +60,6 @@ MODELS_PREFIX = "models/confidence_scorer"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 
-# Maps option symbol → index OHLCV symbol in market.ohlcv_daily (market='nse_index')
-# FINNIFTY/MIDCPNIFTY use ^NSEI proxy — ^CNXFINANCE/^CNXMIDCAP not on yfinance
 INDEX_MAP = {
     "NIFTY":      "^NSEI",
     "BANKNIFTY":  "^NSEBANK",
@@ -66,7 +67,6 @@ INDEX_MAP = {
     "MIDCPNIFTY": "^NSEI",
 }
 
-# XGBoost hyperparams — kept conservative for small datasets (50–150 samples/symbol)
 XGB_PARAMS = dict(
     n_estimators=100,
     max_depth=3,
@@ -80,9 +80,9 @@ XGB_PARAMS = dict(
     random_state=42,
 )
 
-TRAIN_MONTHS = 12    # walk-forward training window
-TEST_MONTHS  = 1     # walk-forward test window
-MIN_TRAIN    = 25    # minimum training samples before first fold
+TRAIN_MONTHS = 12
+TEST_MONTHS  = 1
+MIN_TRAIN    = 25
 
 
 # ── Connections ───────────────────────────────────────────────────────────────
@@ -96,10 +96,104 @@ def get_mc():
     return Minio(MINIO_HOST, access_key=MINIO_USER, secret_key=MINIO_PASS, secure=False)
 
 
+# ── Model abstraction ─────────────────────────────────────────────────────────
+
+class ScorecardClassifier:
+    """Rule-based classifier — no training needed. sklearn-compatible interface."""
+
+    def fit(self, X, y):
+        return self
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        scores = X.apply(self._score, axis=1).values
+        p = np.clip(scores / 100.0, 0.0, 1.0)
+        return np.column_stack([1 - p, p])
+
+    def _score(self, row: pd.Series) -> float:
+        s = 50.0
+
+        # Premium richness: high IV rank → more premium collected → sell edge
+        iv_r = row.get("iv_rank", 50)
+        s += 12 if iv_r > 70 else (6 if iv_r > 50 else (-8 if iv_r < 25 else 0))
+
+        # Volatility regime: India VIX
+        vix = row.get("vix", 15)
+        s += 10 if vix < 13 else (4 if vix < 17 else (-8 if vix > 22 else (-16 if vix > 28 else 0)))
+
+        # Historical vol regime: ATR percentile (high = wide ranges, bad for sellers)
+        atr_p = row.get("atr_percentile", 50)
+        s += 8 if atr_p < 30 else (-8 if atr_p > 70 else 0)
+
+        # Vol acceleration: HV5/HV20 > 1.3 means vol spiking, dangerous for short gamma
+        hv_r = row.get("hv_ratio", 1.0)
+        s += -10 if hv_r > 1.3 else (6 if hv_r < 0.8 else 0)
+
+        # Options richness: IV/HV5 > 1.5 means options priced richly vs realized
+        ivhv = row.get("iv_hv5_ratio", 1.2)
+        s += 8 if ivhv > 1.5 else (-6 if ivhv < 0.8 else 0)
+
+        # Known events: data shows 77.4% win rate on event weeks (IV elevated, market stays in range)
+        if row.get("event_in_window", 0) == 1:
+            s += 4
+
+        return s
+
+
+def _make_model(model_type: str):
+    """Return an untrained model for the given model_type."""
+    if model_type in ("xgb", "xgb_pooled"):
+        return xgb.XGBClassifier(**XGB_PARAMS, verbosity=0)
+    if model_type in ("lr", "lr_pooled"):
+        return Pipeline([
+            ("sc", StandardScaler()),
+            ("lr", LogisticRegression(max_iter=2000, C=0.1,
+                                      class_weight="balanced", random_state=42)),
+        ])
+    if model_type == "scorecard":
+        return ScorecardClassifier()
+    raise ValueError(f"Unknown model_type: {model_type!r}")
+
+
+def _model_ext(model_type: str) -> str:
+    return "ubj" if model_type in ("xgb", "xgb_pooled") else "pkl"
+
+
+def _save_model(model, model_type: str, model_key: str, mc):
+    import tempfile, pathlib
+    if model_type in ("xgb", "xgb_pooled"):
+        with tempfile.NamedTemporaryFile(suffix=".ubj", delete=False) as tf:
+            tmp = tf.name
+        model.save_model(tmp)
+        mc.fput_object(MINIO_BUCKET, model_key, tmp,
+                       content_type="application/octet-stream")
+        pathlib.Path(tmp).unlink(missing_ok=True)
+    else:
+        buf = io.BytesIO(pickle.dumps(model))
+        mc.put_object(MINIO_BUCKET, model_key, buf,
+                      length=buf.getbuffer().nbytes,
+                      content_type="application/octet-stream")
+
+
+def _load_model_bytes(model_type: str, model_key: str, mc):
+    import tempfile, pathlib
+    if model_type == "scorecard":
+        return ScorecardClassifier()
+    if model_type in ("xgb", "xgb_pooled"):
+        with tempfile.NamedTemporaryFile(suffix=".ubj", delete=False) as tf:
+            tmp = tf.name
+        mc.fget_object(MINIO_BUCKET, model_key, tmp)
+        m = xgb.XGBClassifier()
+        m.load_model(tmp)
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        return m
+    # lr / lr_pooled
+    resp = mc.get_object(MINIO_BUCKET, model_key)
+    return pickle.loads(resp.read())
+
+
 # ── Data Loading ──────────────────────────────────────────────────────────────
 
 def load_vix(ch) -> pd.DataFrame:
-    """Load daily VIX from market.nifty_live — one row per trading date."""
     r = ch.query("""
         SELECT toDate(timestamp) AS date, max(vix) AS vix
         FROM market.nifty_live FINAL
@@ -113,32 +207,20 @@ def load_vix(ch) -> pd.DataFrame:
     return df
 
 
-def load_events(ch) -> pd.DataFrame:
-    """Load high-impact events from market.events as a sorted date Series."""
+def load_events(ch) -> list:
+    """Return sorted list of HIGH-impact event dates."""
     r = ch.query(
         "SELECT event_date FROM market.events FINAL "
         "WHERE impact = 'HIGH' ORDER BY event_date"
     )
-    dates = sorted({row[0] for row in r.result_rows})
-    return dates   # list of date objects
+    return sorted({row[0] for row in r.result_rows})
 
 
 def extract_event_features(event_dates: list, snap_date: date, expiry: date) -> dict:
-    """
-    Features derived from the high-impact event calendar:
-      event_in_window  — 1 if any HIGH event falls between snap_date and expiry (inclusive)
-      days_to_event    — calendar days from snap_date to the nearest upcoming event (capped 30)
-                         0 if event is within the expiry window
-    """
     window_events = [d for d in event_dates if snap_date <= d <= expiry]
     event_in_window = 1 if window_events else 0
-
     future = [d for d in event_dates if d >= snap_date]
-    if future:
-        days_to_event = min((future[0] - snap_date).days, 30)
-    else:
-        days_to_event = 30   # no known upcoming event — treat as far away
-
+    days_to_event = min((future[0] - snap_date).days, 30) if future else 30
     return {
         "event_in_window": float(event_in_window),
         "days_to_event":   float(days_to_event),
@@ -146,7 +228,6 @@ def extract_event_features(event_dates: list, snap_date: date, expiry: date) -> 
 
 
 def load_index_ohlcv(ch, index_symbol: str) -> pd.DataFrame:
-    """Load daily OHLCV for a market index from market.ohlcv_daily."""
     r = ch.query(
         "SELECT date, open, high, low, close, volume "
         "FROM market.ohlcv_daily "
@@ -162,46 +243,28 @@ def load_index_ohlcv(ch, index_symbol: str) -> pd.DataFrame:
 
 
 def compute_tech_signals(ohlcv: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute regime signals from daily OHLCV. No lookahead — all values
-    at date T use only data up to T.
-
-    Returns DataFrame (same index as ohlcv) with columns:
-      atr_percentile  — ATR(14) rank over trailing 252 days (0–100); high = volatile
-      rsi14           — RSI(14); 40–60 = range-bound, extremes = trending
-      hv5             — 5-day historical vol, annualised %
-      hv20            — 20-day historical vol, annualised %
-      hv_ratio        — hv5/hv20; >1.2 = vol accelerating, <0.8 = calming
-      supertrend_dir  — +1 uptrend / -1 downtrend (7-period, 3× ATR)
-      cpr_width_pct   — prev week CPR width as % of pivot; narrow = range expected
-    """
     hi, lo, cl = ohlcv["high"], ohlcv["low"], ohlcv["close"]
 
-    # True Range
     tr = pd.concat([
         hi - lo,
         (hi - cl.shift(1)).abs(),
         (lo - cl.shift(1)).abs(),
     ], axis=1).max(axis=1)
 
-    # ATR(14) — Wilder smoothing, percentile over trailing year
     atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
     atr_pct = atr14 / cl * 100
     atr_percentile = atr_pct.rolling(252).rank(pct=True) * 100
 
-    # RSI(14)
     delta = cl.diff()
     avg_g = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
     avg_l = (-delta).clip(lower=0).ewm(com=13, adjust=False).mean()
     rsi14 = 100 - (100 / (1 + avg_g / avg_l.replace(0, np.nan)))
 
-    # Realized vol (annualised %)
     ret  = cl.pct_change()
     hv5  = ret.rolling(5).std()  * np.sqrt(252) * 100
     hv20 = ret.rolling(20).std() * np.sqrt(252) * 100
     hv_ratio = hv5 / hv20.replace(0, np.nan)
 
-    # Supertrend(7, 3.0) — iterative to avoid lookahead
     hl2  = (hi + lo) / 2
     atr7 = tr.ewm(alpha=1/7, adjust=False).mean()
     bu   = (hl2 + 3.0 * atr7).values
@@ -219,13 +282,12 @@ def compute_tech_signals(ohlcv: pd.DataFrame) -> pd.DataFrame:
         else:                       di[i] =  di[i-1]
     supertrend_dir = pd.Series(di, index=cl.index)
 
-    # Weekly CPR width (previous week → current week)
     wk = ohlcv[["high","low","close"]].resample("W-THU").agg(
         {"high":"max","low":"min","close":"last"}
     )
     pivot      = (wk["high"] + wk["low"] + wk["close"]) / 3
     wk["cpr_w"] = ((pivot + wk["high"])/2 - (pivot + wk["low"])/2) / pivot * 100
-    wk["cpr_w"] = wk["cpr_w"].shift(1)   # use PREVIOUS week's CPR
+    wk["cpr_w"] = wk["cpr_w"].shift(1)
     daily_cpr = wk["cpr_w"].resample("D").ffill().reindex(cl.index, method="ffill")
 
     return pd.DataFrame({
@@ -240,7 +302,6 @@ def compute_tech_signals(ohlcv: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_eod_summary(ch) -> pd.DataFrame:
-    """Load full options_eod_summary — market-wide NIFTY indicators."""
     r = ch.query("""
         SELECT date, iv_rank, iv_percentile, atm_ce_iv, atm_pe_iv, iv_skew,
                pcr, nifty_spot, ce_wall_strike, pe_wall_strike
@@ -257,7 +318,6 @@ def load_eod_summary(ch) -> pd.DataFrame:
 
 
 def load_participant_oi(ch) -> pd.DataFrame:
-    """Load participant OI — FII/Client index option positioning."""
     r = ch.query("""
         SELECT date, entity,
                opt_index_call_long, opt_index_call_short,
@@ -277,7 +337,6 @@ def load_participant_oi(ch) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"]).dt.date
 
-    # Pivot to wide: one row per date
     pivoted = df.pivot_table(
         index="date", columns="entity", values=["call_net", "put_net", "pcr"]
     )
@@ -288,7 +347,6 @@ def load_participant_oi(ch) -> pd.DataFrame:
 
 
 def load_options_chain(ch, symbol: str) -> pd.DataFrame:
-    """Load all EOD options chain snapshots for a symbol."""
     r = ch.query(f"""
         SELECT toDate(timestamp) AS snap_date, expiry, strike, option_type,
                ltp, oi, volume
@@ -307,7 +365,6 @@ def load_options_chain(ch, symbol: str) -> pd.DataFrame:
 # ── Feature Extraction ────────────────────────────────────────────────────────
 
 def find_atm_strike(ce: pd.Series, pe: pd.Series) -> Optional[float]:
-    """Find ATM strike: minimum |CE_ltp - PE_ltp| with both sides liquid."""
     common = ce.index.intersection(pe.index)
     common = common[(ce.loc[common] > 0.5) & (pe.loc[common] > 0.5)]
     if len(common) < 2:
@@ -316,10 +373,7 @@ def find_atm_strike(ce: pd.Series, pe: pd.Series) -> Optional[float]:
     return float(diff.idxmin())
 
 
-def extract_chain_features(
-    chain: pd.DataFrame, snap_date: date, expiry: date
-) -> Optional[dict]:
-    """Extract LTP/OI-based features from options chain snapshot."""
+def extract_chain_features(chain, snap_date, expiry) -> Optional[dict]:
     snap = chain[(chain.snap_date == snap_date) & (chain.expiry == expiry)]
     if snap.empty:
         return None
@@ -337,36 +391,22 @@ def extract_chain_features(
     if straddle_premium < 1:
         return None
 
-    straddle_pct = straddle_premium / atm * 100
-    ce_pe_ratio  = float(ce.get(atm, 1) / max(pe.get(atm, 0.01), 0.01))
-
     total_ce_oi = float(ce_oi.sum())
     total_pe_oi = float(pe_oi.sum())
-    pcr_oi      = total_pe_oi / max(total_ce_oi, 1)
-
-    # OI concentration: top-3 strikes / total
-    oi_conc_ce = float(ce_oi.nlargest(3).sum() / max(total_ce_oi, 1))
-    oi_conc_pe = float(pe_oi.nlargest(3).sum() / max(total_pe_oi, 1))
-
-    # ATM OI ratio
-    atm_ce_oi = float(ce_oi.get(atm, 0))
-    atm_pe_oi = float(pe_oi.get(atm, 0))
-    atm_oi_ratio = atm_ce_oi / max(atm_pe_oi, 1)
 
     return {
         "atm_strike":       atm,
         "straddle_premium": straddle_premium,
-        "straddle_pct":     straddle_pct,
-        "ce_pe_ratio":      ce_pe_ratio,
-        "pcr_oi":           pcr_oi,
-        "oi_conc_ce":       oi_conc_ce,
-        "oi_conc_pe":       oi_conc_pe,
-        "atm_oi_ratio":     atm_oi_ratio,
+        "straddle_pct":     straddle_premium / atm * 100,
+        "ce_pe_ratio":      float(ce.get(atm, 1) / max(pe.get(atm, 0.01), 0.01)),
+        "pcr_oi":           total_pe_oi / max(total_ce_oi, 1),
+        "oi_conc_ce":       float(ce_oi.nlargest(3).sum() / max(total_ce_oi, 1)),
+        "oi_conc_pe":       float(pe_oi.nlargest(3).sum() / max(total_pe_oi, 1)),
+        "atm_oi_ratio":     float(ce_oi.get(atm, 0)) / max(float(pe_oi.get(atm, 0)), 1),
     }
 
 
-def extract_eod_features(eod: pd.DataFrame, snap_date: date) -> dict:
-    """Extract NIFTY market-wide IV/PCR features from EOD summary."""
+def extract_eod_features(eod, snap_date) -> dict:
     if snap_date not in eod.index:
         return {}
     row = eod.loc[snap_date]
@@ -385,8 +425,7 @@ def extract_eod_features(eod: pd.DataFrame, snap_date: date) -> dict:
     return feats
 
 
-def extract_poi_features(poi: pd.DataFrame, snap_date: date) -> dict:
-    """Extract participant OI features for snap_date."""
+def extract_poi_features(poi, snap_date) -> dict:
     if snap_date not in poi.index:
         return {}
     row = poi.loc[snap_date]
@@ -395,22 +434,15 @@ def extract_poi_features(poi: pd.DataFrame, snap_date: date) -> dict:
 
 def temporal_features(expiry: date) -> dict:
     return {
-        "day_of_week":   expiry.weekday(),      # 0=Mon, 4=Fri
+        "day_of_week":   expiry.weekday(),
         "week_of_month": (expiry.day - 1) // 7 + 1,
     }
 
 
 # ── P&L Target ────────────────────────────────────────────────────────────────
 
-def compute_pnl(
-    chain: pd.DataFrame, snap_date: date, expiry: date, atm_strike: float
-) -> Optional[float]:
-    """
-    Straddle P&L (points):
-      entry = ATM CE + PE at snap_date
-      exit  = ATM CE + PE at expiry day (settlement prices)
-    """
-    def get_ltp(d: date) -> Optional[float]:
+def compute_pnl(chain, snap_date, expiry, atm_strike) -> Optional[float]:
+    def get_ltp(d):
         rows = chain[
             (chain.snap_date == d) &
             (chain.expiry == expiry) &
@@ -424,17 +456,14 @@ def compute_pnl(
 
     entry = get_ltp(snap_date)
     exit_ = get_ltp(expiry)
-
     if entry is None or exit_ is None or entry < 1:
         return None
-
     return entry - exit_
 
 
 # ── Dataset Builder ───────────────────────────────────────────────────────────
 
-def _tech_row(tech: pd.DataFrame, snap_date: date, eod: pd.DataFrame) -> dict:
-    """Extract tech signal values for snap_date, plus IV/HV5 ratio."""
+def _tech_row(tech, snap_date, eod) -> dict:
     snap_ts = pd.Timestamp(snap_date)
     if snap_ts not in tech.index:
         return {}
@@ -457,7 +486,6 @@ def _tech_row(tech: pd.DataFrame, snap_date: date, eod: pd.DataFrame) -> dict:
 
 
 def build_dataset(ch, symbol: str) -> pd.DataFrame:
-    """Build feature matrix + P&L target for all expiry dates of a symbol."""
     log.info(f"[{symbol}] loading data…")
     chain       = load_options_chain(ch, symbol)
     eod         = load_eod_summary(ch)
@@ -468,13 +496,11 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
     ohlcv       = load_index_ohlcv(ch, index_sym)
     tech        = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
 
-    # All weekly expiries that appear in the chain
     expiries = sorted(chain["expiry"].unique())
     log.info(f"[{symbol}] {len(expiries)} expiry dates to process")
 
     rows = []
     for expiry in expiries:
-        # Find the most recent snapshot BEFORE expiry (previous trading day)
         snap_candidates = sorted(chain[
             (chain.expiry == expiry) & (chain.snap_date < expiry)
         ]["snap_date"].unique())
@@ -482,7 +508,6 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
             continue
         snap_date = snap_candidates[-1]
 
-        # Extract features
         chain_feats = extract_chain_features(chain, snap_date, expiry)
         if chain_feats is None:
             continue
@@ -493,10 +518,10 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
             continue
 
         row = {
-            "expiry":     expiry,
-            "entry_date": snap_date,
-            "pnl_pts":    pnl,
-            "pnl_pct":    pnl / chain_feats["straddle_premium"] * 100,
+            "expiry":        expiry,
+            "entry_date":    snap_date,
+            "pnl_pts":       pnl,
+            "pnl_pct":       pnl / chain_feats["straddle_premium"] * 100,
             "entry_premium": chain_feats["straddle_premium"],
             "exit_value":    chain_feats["straddle_premium"] - pnl,
         }
@@ -521,6 +546,24 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
     return df
 
 
+def build_dataset_pooled(ch) -> pd.DataFrame:
+    """Combine all 4 symbol datasets with symbol one-hot columns."""
+    dfs = []
+    for sym in SYMBOLS:
+        df = build_dataset(ch, sym)
+        if not df.empty:
+            df = df.copy()
+            df["symbol_label"] = sym
+            for s in SYMBOLS:
+                df[f"sym_{s}"] = float(s == sym)
+            dfs.append(df)
+    if not dfs:
+        return pd.DataFrame()
+    combined = pd.concat(dfs, ignore_index=True)
+    combined.sort_values("expiry", inplace=True)
+    return combined.reset_index(drop=True)
+
+
 # ── Feature Columns ───────────────────────────────────────────────────────────
 
 FEATURE_COLS = [
@@ -537,41 +580,32 @@ FEATURE_COLS = [
     "day_of_week", "week_of_month",
     # Volatility regime
     "vix",
-    # Technical regime signals (from index OHLCV)
+    # Technical regime signals
     "atr_percentile", "rsi14", "hv_ratio",
     "supertrend_dir", "cpr_width_pct", "iv_hv5_ratio",
-    # Event calendar risk
+    # Event calendar
     "event_in_window", "days_to_event",
 ]
 
+POOLED_FEATURE_COLS = FEATURE_COLS + [f"sym_{s}" for s in SYMBOLS]
 
-def get_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Return only the feature columns present in df, fill missing with 0."""
-    cols = [c for c in FEATURE_COLS if c in df.columns]
+
+def _get_features(df: pd.DataFrame, feat_cols: list) -> pd.DataFrame:
+    cols = [c for c in feat_cols if c in df.columns]
     return df[cols].fillna(0.0).astype(float)
 
 
 # ── Walk-Forward Validation ───────────────────────────────────────────────────
 
-def walk_forward_train(
-    df: pd.DataFrame, symbol: str, ch, mc
-) -> pd.DataFrame:
-    """
-    Walk-forward: for each test month, train on prior 12 months, predict test month.
-    Stores results in analysis.confidence_backtest.
-    Returns DataFrame of all OOS predictions.
-    """
+def _walk_forward_cv(df: pd.DataFrame, model_type: str,
+                     feat_cols: list) -> pd.DataFrame:
+    """Generic walk-forward CV. Returns OOS predictions (no DB writes)."""
     if len(df) < MIN_TRAIN + 5:
-        log.warning(f"[{symbol}] not enough data for walk-forward ({len(df)} rows)")
         return pd.DataFrame()
 
     df = df.copy()
     df["expiry_dt"] = pd.to_datetime(df["expiry"])
-
-    min_date = df["expiry_dt"].min()
     max_date = df["expiry_dt"].max()
-
-    # First test month starts after MIN_TRAIN samples
     first_test_start = df.iloc[MIN_TRAIN]["expiry_dt"].to_period("M").to_timestamp()
 
     all_preds = []
@@ -579,62 +613,62 @@ def walk_forward_train(
     test_start = first_test_start
 
     while test_start <= max_date:
-        test_end = test_start + pd.DateOffset(months=TEST_MONTHS)
+        test_end   = test_start + pd.DateOffset(months=TEST_MONTHS)
         train_start = test_start - pd.DateOffset(months=TRAIN_MONTHS)
 
-        train_mask = (df["expiry_dt"] >= train_start) & (df["expiry_dt"] < test_start)
-        test_mask  = (df["expiry_dt"] >= test_start) & (df["expiry_dt"] < test_end)
+        train_df = df[(df.expiry_dt >= train_start) & (df.expiry_dt < test_start)]
+        test_df  = df[(df.expiry_dt >= test_start)  & (df.expiry_dt < test_end)]
 
-        train_df = df[train_mask]
-        test_df  = df[test_mask]
-
-        if len(train_df) < 15 or len(test_df) == 0:
+        if len(train_df) < 15 or test_df.empty:
             test_start = test_end
             continue
 
-        X_train = get_features(train_df)
-        y_train = train_df["target"].values
-        X_test  = get_features(test_df)
+        cols = [c for c in feat_cols if c in train_df.columns]
+        X_tr = train_df[cols].fillna(0).astype(float)
+        y_tr = train_df["target"].values
+        X_te = test_df[cols].fillna(0).astype(float)
+        for c in X_tr.columns:
+            if c not in X_te.columns:
+                X_te[c] = 0.0
+        X_te = X_te[X_tr.columns]
 
-        # Align columns
-        for c in X_train.columns:
-            if c not in X_test.columns:
-                X_test[c] = 0.0
-        X_test = X_test[X_train.columns]
+        model = _make_model(model_type)
+        model.fit(X_tr, y_tr)
+        proba = model.predict_proba(X_te)[:, 1]
 
-        model = xgb.XGBClassifier(**XGB_PARAMS, verbosity=0)
-        model.fit(X_train, y_train)
-
-        proba = model.predict_proba(X_test)[:, 1]
-
-        pred_df = test_df[["expiry", "entry_date", "atm_strike",
-                            "entry_premium", "exit_value", "pnl_pts", "pnl_pct", "target"]].copy()
+        keep = ["expiry", "entry_date", "pnl_pts", "pnl_pct",
+                "target", "atm_strike", "entry_premium", "exit_value"]
+        if "symbol_label" in test_df.columns:
+            keep.append("symbol_label")
+        pred_df = test_df[[c for c in keep if c in test_df.columns]].copy()
         pred_df["confidence"] = proba
-        pred_df["fold"]       = fold
+        pred_df["fold"] = fold
         all_preds.append(pred_df)
-
-        auc = roc_auc_score(test_df["target"].values, proba) if len(set(test_df["target"])) > 1 else float("nan")
-        acc = accuracy_score(test_df["target"].values, proba > 0.5)
-        log.info(f"[{symbol}] fold={fold} train={len(train_df)} test={len(test_df)} AUC={auc:.3f} acc={acc:.2%}")
-
         fold += 1
         test_start = test_end
 
     if not all_preds:
         return pd.DataFrame()
+    return pd.concat(all_preds, ignore_index=True)
 
-    results = pd.concat(all_preds, ignore_index=True)
 
-    # Write to ClickHouse
+def walk_forward_train(df, symbol, ch, mc, model_type="xgb") -> pd.DataFrame:
+    """Walk-forward CV + write results to analysis.confidence_backtest."""
+    results = _walk_forward_cv(df, model_type, FEATURE_COLS)
+    if results.empty:
+        log.warning(f"[{symbol}] not enough data for walk-forward ({len(df)} rows)")
+        return results
+
     _insert_backtest_results(ch, symbol, results)
 
-    overall_auc = roc_auc_score(results["target"], results["confidence"]) \
-        if len(set(results["target"])) > 1 else float("nan")
-    log.info(
-        f"[{symbol}] walk-forward complete: {len(results)} OOS predictions, "
-        f"overall AUC={overall_auc:.3f}, win_rate={results.target.mean():.1%}, "
-        f"avg_confidence={results.confidence.mean():.2f}"
-    )
+    if len(set(results["target"])) > 1:
+        auc = roc_auc_score(results["target"], results["confidence"])
+        log.info(
+            f"[{symbol}] [{model_type}] walk-forward: {len(results)} OOS, "
+            f"AUC={auc:.3f}, win_rate={results.target.mean():.1%}, "
+            f"WinConf={results[results.target==1].confidence.mean()*100:.1f} "
+            f"LossConf={results[results.target==0].confidence.mean()*100:.1f}"
+        )
     return results
 
 
@@ -667,68 +701,120 @@ def _insert_backtest_results(ch, symbol: str, results: pd.DataFrame):
 
 # ── Final Model Training ──────────────────────────────────────────────────────
 
-def train_final_model(df: pd.DataFrame, symbol: str, mc) -> Optional[xgb.XGBClassifier]:
-    """Train on all available data and save model to MinIO."""
+def train_final_model(df, symbol, mc, model_type="xgb") -> Optional[object]:
+    """Train on all available data and save per-symbol model to MinIO."""
     if len(df) < MIN_TRAIN:
-        log.warning(f"[{symbol}] insufficient data, skipping final model")
+        log.warning(f"[{symbol}] insufficient data, skipping")
         return None
 
-    X = get_features(df)
+    cols = [c for c in FEATURE_COLS if c in df.columns]
+    X = df[cols].fillna(0).astype(float)
     y = df["target"].values
 
-    model = xgb.XGBClassifier(**XGB_PARAMS, verbosity=0)
+    model = _make_model(model_type)
     model.fit(X, y)
 
-    # Save model to MinIO (XGBoost requires a file path, not BytesIO)
-    import tempfile, pathlib
-    model_key = f"{MODELS_PREFIX}/{symbol}_model.ubj"
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".ubj", delete=False) as tf:
-            tmp_path = tf.name
-        model.save_model(tmp_path)
-        mc.fput_object(MINIO_BUCKET, model_key, tmp_path,
-                       content_type="application/octet-stream")
-        pathlib.Path(tmp_path).unlink(missing_ok=True)
-        log.info(f"[{symbol}] model saved to MinIO: {model_key}")
-    except S3Error as e:
-        log.warning(f"[{symbol}] failed to save model: {e}")
+    if model_type != "scorecard":
+        ext = _model_ext(model_type)
+        model_key = f"{MODELS_PREFIX}/{symbol}_model.{ext}"
+        try:
+            _save_model(model, model_type, model_key, mc)
+            log.info(f"[{symbol}] model saved: {model_key}")
+        except S3Error as e:
+            log.warning(f"[{symbol}] failed to save model: {e}")
+    else:
+        model_key = None
 
-    # Save feature columns used
-    meta = {"features": list(X.columns), "n_train": len(df), "win_rate": float(y.mean())}
-    meta_buf = io.BytesIO(json.dumps(meta).encode())
-    mc.put_object(
-        MINIO_BUCKET, f"{MODELS_PREFIX}/{symbol}_meta.json",
-        meta_buf, length=meta_buf.getbuffer().nbytes,
-        content_type="application/json"
-    )
-    log.info(f"[{symbol}] final model: {len(df)} samples, win_rate={y.mean():.1%}")
+    meta = {
+        "features":   cols,
+        "n_train":    len(df),
+        "win_rate":   float(y.mean()),
+        "model_type": model_type,
+        "is_pooled":  False,
+        "model_key":  model_key,
+    }
+    buf = io.BytesIO(json.dumps(meta).encode())
+    mc.put_object(MINIO_BUCKET, f"{MODELS_PREFIX}/{symbol}_meta.json",
+                  buf, length=buf.getbuffer().nbytes, content_type="application/json")
+    log.info(f"[{symbol}] final model: {model_type}, n={len(df)}, win_rate={y.mean():.1%}")
     return model
 
 
-def load_model(symbol: str, mc) -> Optional[xgb.XGBClassifier]:
-    """Load trained model from MinIO."""
-    import tempfile, pathlib
-    model_key = f"{MODELS_PREFIX}/{symbol}_model.ubj"
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".ubj", delete=False) as tf:
-            tmp_path = tf.name
-        mc.fget_object(MINIO_BUCKET, model_key, tmp_path)
-        model = xgb.XGBClassifier()
-        model.load_model(tmp_path)
-        pathlib.Path(tmp_path).unlink(missing_ok=True)
-        return model
-    except S3Error:
+def train_final_model_pooled(pooled_df, mc, model_type="xgb_pooled"):
+    """Train one pooled model for all symbols and save shared meta per-symbol."""
+    if len(pooled_df) < MIN_TRAIN:
+        log.warning("Pooled dataset too small, skipping")
         return None
+
+    cols = [c for c in POOLED_FEATURE_COLS if c in pooled_df.columns]
+    X = pooled_df[cols].fillna(0).astype(float)
+    y = pooled_df["target"].values
+
+    model = _make_model(model_type)
+    model.fit(X, y)
+
+    ext = _model_ext(model_type)
+    model_key = f"{MODELS_PREFIX}/POOLED_model.{ext}"
+    try:
+        _save_model(model, model_type, model_key, mc)
+        log.info(f"Pooled model saved: {model_key}")
+    except S3Error as e:
+        log.warning(f"Failed to save pooled model: {e}")
+
+    for sym in SYMBOLS:
+        meta = {
+            "features":   cols,
+            "n_train":    len(pooled_df),
+            "win_rate":   float(y.mean()),
+            "model_type": model_type,
+            "is_pooled":  True,
+            "model_key":  model_key,
+        }
+        buf = io.BytesIO(json.dumps(meta).encode())
+        mc.put_object(MINIO_BUCKET, f"{MODELS_PREFIX}/{sym}_meta.json",
+                      buf, length=buf.getbuffer().nbytes, content_type="application/json")
+    log.info(f"Pooled final model: {model_type}, n={len(pooled_df)}, win_rate={y.mean():.1%}")
+    return model
+
+
+def load_model(symbol: str, mc) -> tuple:
+    """Load trained model from MinIO. Returns (model, meta) or (None, None)."""
+    meta_key = f"{MODELS_PREFIX}/{symbol}_meta.json"
+    try:
+        resp = mc.get_object(MINIO_BUCKET, meta_key)
+        meta = json.loads(resp.read())
+    except S3Error:
+        return None, None
+
+    model_type = meta.get("model_type", "xgb")
+
+    if model_type == "scorecard":
+        return ScorecardClassifier(), meta
+
+    model_key = meta.get("model_key")
+    if not model_key:
+        ext = _model_ext(model_type)
+        model_key = (f"{MODELS_PREFIX}/POOLED_model.{ext}"
+                     if meta.get("is_pooled")
+                     else f"{MODELS_PREFIX}/{symbol}_model.{ext}")
+
+    try:
+        return _load_model_bytes(model_type, model_key, mc), meta
+    except S3Error:
+        return None, None
 
 
 # ── Production Scoring ────────────────────────────────────────────────────────
 
 def score_today(ch, mc, symbol: str) -> None:
-    """Score the next upcoming expiry for a symbol using the trained model."""
-    model = load_model(symbol, mc)
+    model, meta = load_model(symbol, mc)
     if model is None:
         log.warning(f"[{symbol}] no trained model found, skipping scoring")
         return
+
+    model_type = meta.get("model_type", "xgb")
+    is_pooled  = meta.get("is_pooled", False)
+    feat_cols  = meta.get("features", FEATURE_COLS)
 
     chain       = load_options_chain(ch, symbol)
     eod         = load_eod_summary(ch)
@@ -746,10 +832,7 @@ def score_today(ch, mc, symbol: str) -> None:
 
     latest_snap = snap_dates[0]
 
-    # Find next expiry after today
-    future_expiries = sorted([
-        e for e in chain["expiry"].unique() if e > today
-    ])
+    future_expiries = sorted([e for e in chain["expiry"].unique() if e > today])
     if not future_expiries:
         log.warning(f"[{symbol}] no future expiries found")
         return
@@ -770,27 +853,21 @@ def score_today(ch, mc, symbol: str) -> None:
         row.update(_tech_row(tech, latest_snap, eod))
     row.update(extract_event_features(event_dates, latest_snap, next_expiry))
 
-    feat_df = pd.DataFrame([row])
-    meta_key = f"{MODELS_PREFIX}/{symbol}_meta.json"
-    try:
-        resp   = mc.get_object(MINIO_BUCKET, meta_key)
-        meta   = json.loads(resp.read())
-        feat_cols = meta["features"]
-    except S3Error:
-        feat_cols = FEATURE_COLS
+    if is_pooled:
+        for s in SYMBOLS:
+            row[f"sym_{s}"] = float(s == symbol)
 
+    feat_df = pd.DataFrame([row])
     for c in feat_cols:
         if c not in feat_df.columns:
             feat_df[c] = 0.0
-    feat_df = feat_df[feat_cols].fillna(0.0).astype(float)
+    feat_df = feat_df[[c for c in feat_cols if c in feat_df.columns]].fillna(0.0).astype(float)
 
     confidence = float(model.predict_proba(feat_df)[0, 1]) * 100
+    expected_pnl_pct = (confidence - 50) * 1.5
 
-    # Expected P&L % (rough estimate: confidence maps to premium retention)
-    expected_pnl_pct = (confidence - 50) * 1.5  # linear mapping
-
-    log.info(f"[{symbol}] next_expiry={next_expiry} confidence={confidence:.1f} "
-             f"expected_pnl_pct={expected_pnl_pct:.1f}%")
+    log.info(f"[{symbol}] [{model_type}] next_expiry={next_expiry} "
+             f"confidence={confidence:.1f} expected_pnl_pct={expected_pnl_pct:.1f}%")
 
     features_json = json.dumps({k: round(float(v), 4) for k, v in row.items()
                                  if k in feat_cols and isinstance(v, (int, float))})
@@ -804,17 +881,89 @@ def score_today(ch, mc, symbol: str) -> None:
     log.info(f"[{symbol}] confidence score inserted: {confidence:.1f}/100")
 
 
+# ── Model Comparison ──────────────────────────────────────────────────────────
+
+def compare_models(ch, mc) -> tuple:
+    """
+    Compare XGBoost per-symbol, LR per-symbol, Scorecard, Pooled XGBoost, Pooled LR.
+    Returns (best_model_type, is_pooled) for the winner.
+    """
+    log.info("=== Building per-symbol datasets ===")
+    sym_dfs = {}
+    for sym in SYMBOLS:
+        df = build_dataset(ch, sym)
+        if not df.empty:
+            sym_dfs[sym] = df
+
+    log.info("=== Building pooled dataset ===")
+    pooled_df = build_dataset_pooled(ch)
+
+    def _auc(preds):
+        if preds.empty or len(set(preds["target"])) < 2:
+            return float("nan")
+        return roc_auc_score(preds["target"], preds["confidence"])
+
+    def _per_symbol_auc(model_type, feat_cols):
+        aucs = []
+        for sym, df in sym_dfs.items():
+            p = _walk_forward_cv(df, model_type, feat_cols)
+            a = _auc(p)
+            log.info(f"  [{sym}] {model_type}: AUC={a:.3f} n_oos={len(p)}")
+            if not np.isnan(a):
+                aucs.append(a)
+        return float(np.mean(aucs)) if aucs else float("nan")
+
+    results: dict[tuple, float] = {}
+
+    log.info("--- XGBoost per-symbol (baseline) ---")
+    results[("xgb", False)] = _per_symbol_auc("xgb", FEATURE_COLS)
+
+    log.info("--- Logistic Regression per-symbol ---")
+    results[("lr", False)] = _per_symbol_auc("lr", FEATURE_COLS)
+
+    log.info("--- Rule-based Scorecard ---")
+    results[("scorecard", False)] = _per_symbol_auc("scorecard", FEATURE_COLS)
+
+    if not pooled_df.empty:
+        log.info("--- Pooled XGBoost ---")
+        p = _walk_forward_cv(pooled_df, "xgb_pooled", POOLED_FEATURE_COLS)
+        results[("xgb_pooled", True)] = _auc(p)
+        log.info(f"  [POOLED] xgb_pooled: AUC={results[('xgb_pooled', True)]:.3f} n_oos={len(p)}")
+
+        log.info("--- Pooled Logistic Regression ---")
+        p = _walk_forward_cv(pooled_df, "lr_pooled", POOLED_FEATURE_COLS)
+        results[("lr_pooled", True)] = _auc(p)
+        log.info(f"  [POOLED] lr_pooled: AUC={results[('lr_pooled', True)]:.3f} n_oos={len(p)}")
+
+    sorted_r = sorted(results.items(),
+                      key=lambda x: x[1] if not np.isnan(x[1]) else -1,
+                      reverse=True)
+    best_key, best_auc = sorted_r[0]
+
+    print("\n" + "=" * 58)
+    print(f"  {'MODEL TYPE':<22} {'POOLED':<8} {'AVG AUC'}")
+    print("  " + "-" * 54)
+    for (mt, pooled), auc_v in sorted_r:
+        marker = " ← BEST" if (mt, pooled) == best_key else ""
+        auc_s = f"{auc_v:.3f}" if not np.isnan(auc_v) else "  n/a"
+        print(f"  {mt:<22} {'yes' if pooled else 'no':<8} {auc_s}{marker}")
+    print("=" * 58 + "\n")
+
+    best_type, is_pooled = best_key
+    log.info(f"Winner: {best_type} (pooled={is_pooled}) AUC={best_auc:.3f}")
+    return best_type, is_pooled
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_symbol(symbol: str, ch, mc, backtest_only: bool, score_only: bool):
+def run_symbol(symbol, ch, mc, backtest_only, score_only, model_type="xgb"):
     if not score_only:
         df = build_dataset(ch, symbol)
         if df.empty:
             log.warning(f"[{symbol}] empty dataset, skipping")
             return
-
-        walk_forward_train(df, symbol, ch, mc)
-        train_final_model(df, symbol, mc)
+        walk_forward_train(df, symbol, ch, mc, model_type)
+        train_final_model(df, symbol, mc, model_type)
 
     if not backtest_only:
         score_today(ch, mc, symbol)
@@ -823,24 +972,42 @@ def run_symbol(symbol: str, ch, mc, backtest_only: bool, score_only: bool):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", help="Single symbol to run (default: all)")
-    parser.add_argument("--backtest-only", action="store_true",
-                        help="Run walk-forward only, skip today's scoring")
-    parser.add_argument("--score-only", action="store_true",
-                        help="Score today only (models must already exist)")
+    parser.add_argument("--backtest-only", action="store_true")
+    parser.add_argument("--score-only", action="store_true")
+    parser.add_argument("--compare", action="store_true",
+                        help="Compare all model types, train & save the best")
+    parser.add_argument("--model-type", default="xgb",
+                        choices=["xgb", "lr", "scorecard", "xgb_pooled", "lr_pooled"],
+                        help="Model type for training (ignored when --compare)")
     args = parser.parse_args()
 
     ch = get_ch()
     mc = get_mc()
-
-    # Ensure bucket exists
     if not mc.bucket_exists(MINIO_BUCKET):
         mc.make_bucket(MINIO_BUCKET)
 
-    symbols = [args.symbol] if args.symbol else SYMBOLS
+    if args.compare:
+        best_type, is_pooled = compare_models(ch, mc)
 
+        log.info(f"Training final model: {best_type} (pooled={is_pooled})")
+        if is_pooled:
+            pooled_df = build_dataset_pooled(ch)
+            train_final_model_pooled(pooled_df, mc, best_type)
+        else:
+            target_syms = [args.symbol] if args.symbol else SYMBOLS
+            for sym in target_syms:
+                try:
+                    df = build_dataset(ch, sym)
+                    if not df.empty:
+                        train_final_model(df, sym, mc, best_type)
+                except Exception as e:
+                    log.error(f"[{sym}] failed: {e}", exc_info=True)
+        return
+
+    symbols = [args.symbol] if args.symbol else SYMBOLS
     for sym in symbols:
         try:
-            run_symbol(sym, ch, mc, args.backtest_only, args.score_only)
+            run_symbol(sym, ch, mc, args.backtest_only, args.score_only, args.model_type)
         except Exception as e:
             log.error(f"[{sym}] failed: {e}", exc_info=True)
 
