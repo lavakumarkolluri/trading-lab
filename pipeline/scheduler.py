@@ -228,7 +228,7 @@ def job_strategy_backtester():
 
 def job_confidence_scorer():
     log.info("=== Confidence scorer weekly retrain triggered ===")
-    _run("confidence_scorer")
+    _run("confidence_scorer", "--compare")
 
 
 def job_strategy_selector_recommend():
