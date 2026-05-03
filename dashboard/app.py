@@ -539,6 +539,13 @@ elif page == "Confidence Scores":
 
     # ── Walk-forward backtest ─────────────────────────────────────────────────
     st.subheader("Walk-Forward Backtest Results")
+    st.info(
+        "⚠️ **These are raw naked ATM straddle results — used only to train the ML model, not actual trades.**  \n"
+        "The model learns which days are profitable for option selling. "
+        "Large % losses (e.g. -200%) occur when the market moves beyond the collected premium — "
+        "this is why we **never take straddles live**. Actual trades use hedged spreads (IC / bull_put / bear_call) "
+        "with defined max loss. See **Live Trading → Compounding Simulation** for real strategy P&L."
+    )
     bt = query_weekly("""
         SELECT symbol, expiry, entry_date, atm_strike, entry_premium,
                pnl_pts, pnl_pct, target, round(confidence * 100, 1) AS confidence
