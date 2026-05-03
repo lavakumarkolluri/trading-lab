@@ -265,6 +265,11 @@ def job_option_chain_intraday():
     _run("option_chain_intraday")
 
 
+def job_intraday_monitor():
+    log.info("=== Intraday straddle monitor triggered ===")
+    _run("intraday_monitor")
+
+
 def job_option_chain_eod():
     """
     Daily bhavcopy chain: download → PCR/max pain → IV → OI walls/skew.
@@ -325,6 +330,7 @@ def main():
     _check_sha_drift()
     log.info("  Events pipeline     : Sun     00:00 UTC (05:30 IST) --weekly")
     log.info("  Intraday OC scraper : Mon–Fri 03:40 UTC (09:10 IST)")
+    log.info("  Intraday monitor    : Mon–Fri 03:50 UTC (09:20 IST) paper straddle")
     log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
     log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV")
     log.info("  Weekly  refresh     : Sun     00:30 UTC (06:00 IST)")
@@ -342,6 +348,10 @@ def main():
     # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("03:40").do(job_option_chain_intraday)
+
+    # Intraday straddle monitor: 09:20 IST (03:50 UTC), self-exits at 15:25 IST
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("03:50").do(job_intraday_monitor)
 
     # FII/DII + Participant OI: run before meta_pipeline so data is ready
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):

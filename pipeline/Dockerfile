@@ -73,5 +73,6 @@ COPY confidence_scorer.py .
 COPY strategy_backtester.py .
 COPY strategy_selector.py .
 COPY events_pipeline.py .
+COPY intraday_monitor.py .
 
 CMD ["python", "main.py"]

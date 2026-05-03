@@ -481,6 +481,22 @@ services:
     entrypoint: ["python", "option_chain_intraday.py"]
     command: []
 
+  intraday_monitor:
+    build: *pipeline-build
+    container_name: intraday_monitor
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "intraday_monitor.py"]
+    command: []
+
   option_chain_historical:
     build: *pipeline-build
     container_name: option_chain_historical
