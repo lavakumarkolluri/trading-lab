@@ -51,6 +51,11 @@ MAX_RISK_PCT        = 0.02      # 2% of capital per trade max loss
 PCR_BULLISH = 1.2   # PCR > this → bullish sentiment → bull_put preferred
 PCR_BEARISH = 0.8   # PCR < this → bearish sentiment → bear_call preferred
 
+# Phase 1 signal filters
+VIX_MIN = 11.0          # skip if VIX too low (no premium worth collecting)
+VIX_MAX = 28.0          # skip if VIX too high (tail-risk events)
+IV_SKEW_THRESH = 2.0    # % — iv_skew = avg(PE_IV_OTM) − avg(CE_IV_OTM); +ve = fear/put premium
+
 # Weekday → symbol mapping (0=Mon … 6=Sun)
 WEEKDAY_SYMBOL = {
     0: "MIDCPNIFTY",
@@ -67,6 +72,42 @@ def ch_client():
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_vix(ch, snap_date: date) -> float | None:
+    rows = ch.query(
+        "SELECT vix FROM market.nifty_live FINAL "
+        "WHERE toDate(timestamp) <= {d:Date} ORDER BY timestamp DESC LIMIT 1",
+        parameters={"d": snap_date},
+    ).result_rows
+    return float(rows[0][0]) if rows and rows[0][0] else None
+
+
+def get_eod_signals(ch, expiry: date, snap_date: date) -> dict:
+    """Fetch iv_rank, max_pain, OI walls for a specific expiry from EOD summary."""
+    _default = {"iv_rank": 50.0, "max_pain_strike": 0.0, "ce_wall_strike": 0.0, "pe_wall_strike": 0.0}
+    try:
+        rows = ch.query(
+            "SELECT iv_rank, max_pain_strike, "
+            "       ifNull(ce_wall_strike, 0), "
+            "       ifNull(pe_wall_strike, 0) "
+            "FROM market.options_eod_summary FINAL "
+            "WHERE expiry = {exp:Date} AND date <= {d:Date} "
+            "ORDER BY date DESC LIMIT 1",
+            parameters={"exp": expiry, "d": snap_date},
+        ).result_rows
+    except Exception as e:
+        log.warning("get_eod_signals failed (columns may not exist yet): %s", e)
+        return _default
+    if rows:
+        iv_rank, max_pain, ce_wall, pe_wall = rows[0]
+        return {
+            "iv_rank":         float(iv_rank or 50.0),
+            "max_pain_strike": float(max_pain or 0.0),
+            "ce_wall_strike":  float(ce_wall or 0.0),
+            "pe_wall_strike":  float(pe_wall or 0.0),
+        }
+    return _default
+
 
 def get_lot_size(ch, symbol: str) -> int:
     rows = ch.query(
@@ -111,10 +152,21 @@ def get_confidence(ch, score_date: date, symbol: str):
 
 
 def pick_strategy(confidence: float, pcr_bias: float, iv_skew: float) -> str:
-    """Choose spread type from confidence + market bias."""
-    if pcr_bias > PCR_BULLISH:
+    """Choose spread type from confidence + market bias.
+
+    Both PCR and iv_skew must agree for a directional trade:
+      pcr > PCR_BULLISH AND iv_skew > IV_SKEW_THRESH  → bull_put  (fear premium, puts expensive)
+      pcr < PCR_BEARISH AND iv_skew < -IV_SKEW_THRESH → bear_call (upside fear, calls expensive)
+      any conflict or neutral                          → iron_condor
+    """
+    pcr_bull  = pcr_bias > PCR_BULLISH
+    pcr_bear  = pcr_bias < PCR_BEARISH
+    skew_bull = iv_skew > IV_SKEW_THRESH   # PE IV > CE IV — put premium elevated
+    skew_bear = iv_skew < -IV_SKEW_THRESH  # CE IV > PE IV — call premium elevated
+
+    if pcr_bull and not skew_bear:
         return "bull_put"
-    if pcr_bias < PCR_BEARISH:
+    if pcr_bear and not skew_bull:
         return "bear_call"
     return "iron_condor"
 
@@ -216,8 +268,12 @@ def build_recommendation(
     rec_date: date, symbol: str, expiry: date, ch,
     confidence: float, pcr_bias: float, iv_skew: float,
     params: dict, lots: int, lot_size: int,
+    signals: dict | None = None,
 ):
-    """Assemble full recommendation dict with leg prices."""
+    """Assemble full recommendation dict with leg prices.
+
+    signals — optional dict from get_eod_signals(); used for OI wall guard.
+    """
     snap_date = get_latest_chain_snapshot(ch, symbol, expiry)
     if snap_date is None:
         return None
@@ -235,6 +291,23 @@ def build_recommendation(
     sn = params["short_n"]
     wm = params["wing_m"]
     sce, spe, lce, lpe = build_legs(strategy, atm, step, sn, wm)
+
+    # OI wall guard: short strike must be beyond the OI wall (wall buffers us from spot)
+    if signals:
+        ce_wall = signals.get("ce_wall_strike", 0.0)
+        pe_wall = signals.get("pe_wall_strike", 0.0)
+        if strategy in ("iron_condor", "bear_call") and ce_wall > 0 and sce < ce_wall:
+            log.info(
+                "OI wall guard: skipping %s %s — short_ce %.0f is inside CE wall %.0f",
+                symbol, strategy, sce, ce_wall,
+            )
+            return None
+        if strategy in ("iron_condor", "bull_put") and pe_wall > 0 and spe > pe_wall:
+            log.info(
+                "OI wall guard: skipping %s %s — short_pe %.0f is inside PE wall %.0f",
+                symbol, strategy, spe, pe_wall,
+            )
+            return None
 
     sce_price = price_leg(idx, sce, "CE")
     spe_price = price_leg(idx, spe, "PE")
@@ -330,23 +403,49 @@ def run_recommend(ch):
                  confidence, CONFIDENCE_THRESHOLD, symbol)
         return
 
+    # VIX filter: skip trading in dead or panic market regimes
+    snap_date = get_latest_chain_snapshot(ch, symbol, expiry)
+    if snap_date is not None:
+        vix = get_vix(ch, snap_date)
+        if vix is not None:
+            log.info("VIX=%.2f (gate: %.1f–%.1f)", vix, VIX_MIN, VIX_MAX)
+            if vix < VIX_MIN or vix > VIX_MAX:
+                log.info("VIX %.2f outside [%.1f, %.1f] — no trade for %s",
+                         vix, VIX_MIN, VIX_MAX, symbol)
+                return
+        else:
+            log.warning("VIX unavailable — proceeding without VIX gate")
+
     strategy = pick_strategy(confidence, pcr_bias, iv_skew)
+    log.info("Signal: pcr=%.2f iv_skew=%.2f → strategy=%s", pcr_bias, iv_skew, strategy)
     params   = get_optimal_params(ch, symbol, strategy)
     if params is None:
         log.warning("No optimal params for %s/%s — skipping", symbol, strategy)
         return
 
-    lot_size     = get_lot_size(ch, symbol)
-    max_loss     = params["avg_max_loss"]
-    capital      = get_current_capital(ch)
-    risk_budget  = capital * MAX_RISK_PCT
-    lots = max(1, int(risk_budget / (max_loss * lot_size))) if max_loss > 0 else 1
-    log.info("Current capital: ₹%.0f | risk budget: ₹%.0f", capital, risk_budget)
+    # EOD signals for lot sizing and OI wall guard
+    signals = get_eod_signals(ch, expiry, snap_date) if snap_date else {}
+    iv_rank = signals.get("iv_rank", 50.0)
+    iv_rank_mult = 0.5 + iv_rank / 100.0   # 0.5x at iv_rank=0, 1.5x at iv_rank=100
+    log.info("iv_rank=%.1f → lot_size_mult=%.2f | max_pain=%.0f | CE_wall=%.0f | PE_wall=%.0f",
+             iv_rank, iv_rank_mult,
+             signals.get("max_pain_strike", 0), signals.get("ce_wall_strike", 0),
+             signals.get("pe_wall_strike", 0))
+
+    lot_size    = get_lot_size(ch, symbol)
+    max_loss    = params["avg_max_loss"]
+    capital     = get_current_capital(ch)
+    risk_budget = capital * MAX_RISK_PCT
+    base_lots   = int(risk_budget / (max_loss * lot_size)) if max_loss > 0 else 1
+    lots        = max(1, int(base_lots * iv_rank_mult))
+    log.info("Current capital: ₹%.0f | risk budget: ₹%.0f | lots=%d (base=%d × mult=%.2f)",
+             capital, risk_budget, lots, base_lots, iv_rank_mult)
 
     rec = build_recommendation(
         today, symbol, expiry, ch,
         confidence, pcr_bias, iv_skew,
         params, lots, lot_size,
+        signals=signals,
     )
 
     if rec is None:
