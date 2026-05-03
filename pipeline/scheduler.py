@@ -246,6 +246,12 @@ def job_strategy_selector_fill_outcomes():
     _run("strategy_selector", "--fill-outcomes")
 
 
+def job_events_pipeline():
+    """Weekly refresh of FOMC/RBI/budget event calendar."""
+    log.info("=== Events pipeline weekly refresh triggered ===")
+    _run("events_pipeline")
+
+
 def job_holidays():
     """Run only on the 1st of each month."""
     if datetime.utcnow().day != 1:
@@ -317,6 +323,7 @@ def main():
 
     log.info("Scheduler started — all times UTC (git_sha=%s)", GIT_SHA)
     _check_sha_drift()
+    log.info("  Events pipeline     : Sun     00:00 UTC (05:30 IST) --weekly")
     log.info("  Intraday OC scraper : Mon–Fri 03:40 UTC (09:10 IST)")
     log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
     log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV")
@@ -349,6 +356,7 @@ def main():
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("12:30").do(job_option_chain_eod)
 
+    schedule.every().sunday.at("00:00").do(job_events_pipeline)
     schedule.every().sunday.at("00:30").do(job_weekly)
     schedule.every().sunday.at("01:00").do(job_gap_analyzer)
     schedule.every().sunday.at("02:00").do(job_option_backtest)
