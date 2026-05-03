@@ -113,6 +113,38 @@ def load_vix(ch) -> pd.DataFrame:
     return df
 
 
+def load_events(ch) -> pd.DataFrame:
+    """Load high-impact events from market.events as a sorted date Series."""
+    r = ch.query(
+        "SELECT event_date FROM market.events FINAL "
+        "WHERE impact = 'HIGH' ORDER BY event_date"
+    )
+    dates = sorted({row[0] for row in r.result_rows})
+    return dates   # list of date objects
+
+
+def extract_event_features(event_dates: list, snap_date: date, expiry: date) -> dict:
+    """
+    Features derived from the high-impact event calendar:
+      event_in_window  — 1 if any HIGH event falls between snap_date and expiry (inclusive)
+      days_to_event    — calendar days from snap_date to the nearest upcoming event (capped 30)
+                         0 if event is within the expiry window
+    """
+    window_events = [d for d in event_dates if snap_date <= d <= expiry]
+    event_in_window = 1 if window_events else 0
+
+    future = [d for d in event_dates if d >= snap_date]
+    if future:
+        days_to_event = min((future[0] - snap_date).days, 30)
+    else:
+        days_to_event = 30   # no known upcoming event — treat as far away
+
+    return {
+        "event_in_window": float(event_in_window),
+        "days_to_event":   float(days_to_event),
+    }
+
+
 def load_index_ohlcv(ch, index_symbol: str) -> pd.DataFrame:
     """Load daily OHLCV for a market index from market.ohlcv_daily."""
     r = ch.query(
@@ -427,13 +459,14 @@ def _tech_row(tech: pd.DataFrame, snap_date: date, eod: pd.DataFrame) -> dict:
 def build_dataset(ch, symbol: str) -> pd.DataFrame:
     """Build feature matrix + P&L target for all expiry dates of a symbol."""
     log.info(f"[{symbol}] loading data…")
-    chain = load_options_chain(ch, symbol)
-    eod   = load_eod_summary(ch)
-    poi   = load_participant_oi(ch)
-    vix   = load_vix(ch)
-    index_sym = INDEX_MAP.get(symbol, "^NSEI")
-    ohlcv     = load_index_ohlcv(ch, index_sym)
-    tech      = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
+    chain       = load_options_chain(ch, symbol)
+    eod         = load_eod_summary(ch)
+    poi         = load_participant_oi(ch)
+    vix         = load_vix(ch)
+    event_dates = load_events(ch)
+    index_sym   = INDEX_MAP.get(symbol, "^NSEI")
+    ohlcv       = load_index_ohlcv(ch, index_sym)
+    tech        = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
 
     # All weekly expiries that appear in the chain
     expiries = sorted(chain["expiry"].unique())
@@ -474,6 +507,7 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
         row["vix"] = float(vix.loc[snap_date, "vix"]) if snap_date in vix.index else float("nan")
         if not tech.empty:
             row.update(_tech_row(tech, snap_date, eod))
+        row.update(extract_event_features(event_dates, snap_date, expiry))
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -506,6 +540,8 @@ FEATURE_COLS = [
     # Technical regime signals (from index OHLCV)
     "atr_percentile", "rsi14", "hv_ratio",
     "supertrend_dir", "cpr_width_pct", "iv_hv5_ratio",
+    # Event calendar risk
+    "event_in_window", "days_to_event",
 ]
 
 
@@ -694,13 +730,14 @@ def score_today(ch, mc, symbol: str) -> None:
         log.warning(f"[{symbol}] no trained model found, skipping scoring")
         return
 
-    chain     = load_options_chain(ch, symbol)
-    eod       = load_eod_summary(ch)
-    poi       = load_participant_oi(ch)
-    vix       = load_vix(ch)
-    index_sym = INDEX_MAP.get(symbol, "^NSEI")
-    ohlcv     = load_index_ohlcv(ch, index_sym)
-    tech      = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
+    chain       = load_options_chain(ch, symbol)
+    eod         = load_eod_summary(ch)
+    poi         = load_participant_oi(ch)
+    vix         = load_vix(ch)
+    event_dates = load_events(ch)
+    index_sym   = INDEX_MAP.get(symbol, "^NSEI")
+    ohlcv       = load_index_ohlcv(ch, index_sym)
+    tech        = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
 
     today = date.today()
     snap_dates = sorted(chain["snap_date"].unique(), reverse=True)
@@ -731,6 +768,7 @@ def score_today(ch, mc, symbol: str) -> None:
     row["vix"] = float(vix.loc[latest_snap, "vix"]) if latest_snap in vix.index else 0.0
     if not tech.empty:
         row.update(_tech_row(tech, latest_snap, eod))
+    row.update(extract_event_features(event_dates, latest_snap, next_expiry))
 
     feat_df = pd.DataFrame([row])
     meta_key = f"{MODELS_PREFIX}/{symbol}_meta.json"
