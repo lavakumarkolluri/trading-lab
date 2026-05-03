@@ -839,8 +839,8 @@ elif page == "Strategy Backtests":
                 sb.strategy,
                 round(avg(sb.target) * 100, 1) AS win_rate,
                 count()                         AS n_trades
-            FROM analysis.spread_backtest FINAL sb
-            JOIN market.options_eod_summary FINAL s ON s.date = sb.entry_date
+            FROM analysis.spread_backtest AS sb FINAL
+            JOIN market.options_eod_summary AS s FINAL ON s.date = sb.entry_date
             WHERE sb.strategy IN ('iron_condor', 'bull_put', 'bear_call')
               AND sb.symbol = '{sym_sel}'
             GROUP BY pcr_band, sb.strategy
