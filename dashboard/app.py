@@ -76,6 +76,7 @@ if st.sidebar.button("🔄 Refresh Data"):
     st.rerun()
 page = st.sidebar.radio("Navigate", [
     "Overview",
+    "Today's Signals",
     "Confidence Scores",
     "Strategy Backtests",
     "Trade Log",
@@ -240,6 +241,256 @@ if page == "Overview":
             fail_df = pd.DataFrame(detail_rows)
             fail_df.columns = ["Service", "Date", "Error", "Duration (s)", "Git SHA", "Rows Written"]
             st.dataframe(fail_df, use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE — TODAY'S SIGNALS
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Today's Signals":
+    import json as _json
+    from datetime import date as _date
+
+    WEEKDAY_SYMBOL = {0: "MIDCPNIFTY", 1: "FINNIFTY", 2: "BANKNIFTY", 3: "NIFTY"}
+    PCR_BULLISH = 1.2; PCR_BEARISH = 0.8
+    VIX_MIN = 11.0; VIX_MAX = 28.0; VIX_SWEET_LO = 14.0; VIX_SWEET_HI = 22.0
+    IV_SKEW_THRESH = 2.0; TRADE_SCORE_THRESHOLD = 65.0
+
+    def _trade_score(conf, vix, iv_rank, pcr, iv_skew):
+        s_conf = min(conf, 100) / 100 * 40
+        if vix is None:
+            s_vix = 10.0
+        elif VIX_SWEET_LO <= vix <= VIX_SWEET_HI:
+            s_vix = 20.0
+        elif VIX_MIN <= vix <= VIX_MAX:
+            s_vix = 10.0
+        else:
+            s_vix = 0.0
+        s_ivr = min(iv_rank, 100) / 100 * 20
+        pcr_bull = pcr > PCR_BULLISH; pcr_bear = pcr < PCR_BEARISH
+        skew_bull = iv_skew > IV_SKEW_THRESH; skew_bear = iv_skew < -IV_SKEW_THRESH
+        if (pcr_bull and skew_bull) or (pcr_bear and skew_bear):
+            s_align = 20.0
+        elif pcr_bull or pcr_bear:
+            s_align = 10.0
+        else:
+            s_align = 0.0
+        return s_conf + s_vix + s_ivr + s_align, s_conf, s_vix, s_ivr, s_align
+
+    today = _date.today()
+    weekday = today.weekday()
+    symbol = WEEKDAY_SYMBOL.get(weekday)
+
+    st.title("Today's Signals")
+    if symbol is None:
+        st.info(f"No expiry today (weekday={weekday}). Markets open Mon–Thu for 0DTE signals.")
+        st.stop()
+
+    st.caption(f"Expiry symbol for today ({today.strftime('%A')}): **{symbol}**")
+
+    # ── Fetch all signals ─────────────────────────────────────────────────────
+    conf_df = query(f"""
+        SELECT confidence, next_expiry, features_json
+        FROM analysis.confidence_scores FINAL
+        WHERE score_date >= today() - 7 AND symbol = '{symbol}'
+        ORDER BY score_date DESC, version DESC LIMIT 1
+    """)
+
+    vix_df = query("""
+        SELECT vix, nifty_spot, toDate(timestamp) AS snap_date
+        FROM market.nifty_live FINAL
+        ORDER BY timestamp DESC LIMIT 1
+    """)
+
+    if conf_df.empty:
+        st.warning(f"No confidence score for {symbol} yet. Run `confidence_scorer` first.")
+        st.stop()
+
+    conf_row   = conf_df.iloc[0]
+    confidence = float(conf_row["confidence"])
+    expiry     = conf_row["next_expiry"]
+    feats      = _json.loads(conf_row["features_json"]) if conf_row["features_json"] else {}
+    pcr        = float(feats.get("pcr_oi", 1.0))
+    iv_skew_f  = float(feats.get("iv_skew", 0.0))
+
+    vix_val   = float(vix_df["vix"].iloc[0])     if not vix_df.empty else None
+    nifty_spt = float(vix_df["nifty_spot"].iloc[0]) if not vix_df.empty else None
+    snap_date = vix_df["snap_date"].iloc[0]      if not vix_df.empty else None
+
+    eod_df = query(f"""
+        SELECT iv_rank, max_pain_strike,
+               ifNull(ce_wall_strike, 0) AS ce_wall,
+               ifNull(pe_wall_strike, 0) AS pe_wall,
+               ifNull(iv_skew, 0) AS iv_skew_eod,
+               pcr AS pcr_eod
+        FROM market.options_eod_summary FINAL
+        WHERE expiry = '{expiry}'
+        ORDER BY date DESC LIMIT 1
+    """)
+
+    if not eod_df.empty:
+        eod = eod_df.iloc[0]
+        iv_rank   = float(eod["iv_rank"]   or 50.0)
+        max_pain  = float(eod["max_pain_strike"] or 0.0)
+        ce_wall   = float(eod["ce_wall"]   or 0.0)
+        pe_wall   = float(eod["pe_wall"]   or 0.0)
+        iv_skew_eod = float(eod["iv_skew_eod"] or 0.0)
+        pcr_eod   = float(eod["pcr_eod"]   or pcr)
+    else:
+        iv_rank = 50.0; max_pain = 0.0; ce_wall = 0.0; pe_wall = 0.0
+        iv_skew_eod = iv_skew_f; pcr_eod = pcr
+
+    # Use best available iv_skew
+    iv_skew = iv_skew_eod if iv_skew_eod != 0.0 else iv_skew_f
+    pcr_use = pcr_eod if pcr_eod != pcr else pcr
+
+    score, s_conf, s_vix, s_ivr, s_align = _trade_score(confidence, vix_val, iv_rank, pcr_use, iv_skew)
+
+    # ── GO / NO-GO banner ─────────────────────────────────────────────────────
+    go_signal = score >= TRADE_SCORE_THRESHOLD
+    vix_ok = vix_val is None or (VIX_MIN <= vix_val <= VIX_MAX)
+
+    if go_signal and vix_ok:
+        st.success(f"## ✅ GO — Trade {symbol} | Score: **{score:.1f} / 100**")
+    elif not vix_ok:
+        st.error(f"## 🚫 NO-GO — VIX {vix_val:.1f} outside safe range [{VIX_MIN}–{VIX_MAX}]")
+    else:
+        st.error(f"## ❌ NO-GO — Score {score:.1f} < {TRADE_SCORE_THRESHOLD} threshold")
+
+    # ── Score gauge ───────────────────────────────────────────────────────────
+    fig_gauge = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        domain={"x": [0, 1], "y": [0, 1]},
+        title={"text": "Trade Score / 100"},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "bar": {"color": "#2ecc71" if go_signal else "#e74c3c"},
+            "steps": [
+                {"range": [0, 50],   "color": "#fadbd8"},
+                {"range": [50, 65],  "color": "#fdebd0"},
+                {"range": [65, 100], "color": "#d5f5e3"},
+            ],
+            "threshold": {
+                "line": {"color": "black", "width": 3},
+                "thickness": 0.75,
+                "value": TRADE_SCORE_THRESHOLD,
+            },
+        },
+    ))
+    fig_gauge.update_layout(height=260, margin=dict(t=40, b=0, l=20, r=20))
+
+    col_gauge, col_break = st.columns([1, 2])
+    with col_gauge:
+        st.plotly_chart(fig_gauge, use_container_width=True)
+
+    with col_break:
+        st.markdown("**Score Breakdown**")
+        breakdown_data = [
+            {"Component": "Confidence",    "Score": f"{s_conf:.1f}/40",
+             "Value": f"{confidence:.1f}/100",
+             "Status": "🟢" if s_conf >= 28 else "🟡" if s_conf >= 20 else "🔴"},
+            {"Component": "VIX Zone",      "Score": f"{s_vix:.1f}/20",
+             "Value": f"{vix_val:.1f}" if vix_val else "n/a",
+             "Status": "🟢" if s_vix >= 20 else "🟡" if s_vix >= 10 else "🔴"},
+            {"Component": "IV Rank",       "Score": f"{s_ivr:.1f}/20",
+             "Value": f"{iv_rank:.0f}%",
+             "Status": "🟢" if s_ivr >= 15 else "🟡" if s_ivr >= 8 else "🔴"},
+            {"Component": "PCR+Skew Align","Score": f"{s_align:.1f}/20",
+             "Value": f"PCR={pcr_use:.2f} · skew={iv_skew:+.2f}",
+             "Status": "🟢" if s_align >= 20 else "🟡" if s_align >= 10 else "🔴"},
+        ]
+        st.dataframe(pd.DataFrame(breakdown_data), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Market snapshot ───────────────────────────────────────────────────────
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Market Snapshot**")
+        pcr_label = "Bullish 🟢" if pcr_use > PCR_BULLISH else "Bearish 🔴" if pcr_use < PCR_BEARISH else "Neutral ⚪"
+        skew_label = "Fear (PE prem) 🔴" if iv_skew > IV_SKEW_THRESH else "Greed (CE prem) 🟢" if iv_skew < -IV_SKEW_THRESH else "Balanced ⚪"
+        vix_label = ("🟢 Sweet spot" if vix_val and VIX_SWEET_LO <= vix_val <= VIX_SWEET_HI
+                     else "🟡 Borderline" if vix_val and VIX_MIN <= vix_val <= VIX_MAX
+                     else "🔴 Outside gate" if vix_val else "—")
+        iv_rank_mult = 0.5 + iv_rank / 100
+        snap_rows = [
+            {"Signal": "Nifty Spot",  "Value": f"{nifty_spt:,.0f}" if nifty_spt else "—", "Context": ""},
+            {"Signal": "VIX",         "Value": f"{vix_val:.2f}" if vix_val else "—",       "Context": vix_label},
+            {"Signal": "PCR (OI)",    "Value": f"{pcr_use:.3f}",                            "Context": pcr_label},
+            {"Signal": "IV Skew",     "Value": f"{iv_skew:+.2f}%",                          "Context": skew_label},
+            {"Signal": "IV Rank",     "Value": f"{iv_rank:.0f}%",                           "Context": f"Lot mult = {iv_rank_mult:.2f}×"},
+            {"Signal": "Max Pain",    "Value": f"{max_pain:,.0f}" if max_pain else "—",     "Context": "Gravitational strike"},
+        ]
+        st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
+
+    with col2:
+        st.markdown("**OI Wall Guard**")
+        # Show where short strikes would land vs walls
+        lot_size_df = query(f"SELECT lot_size FROM market.fo_lot_sizes WHERE symbol='{symbol}' ORDER BY effective_from DESC LIMIT 1")
+        params_df   = query_weekly(f"""
+            SELECT strategy, short_n, wing_m, avg_max_loss
+            FROM analysis.spread_optimal FINAL
+            WHERE symbol='{symbol}' AND n_trades >= 10
+            ORDER BY sharpe_pct DESC LIMIT 3
+        """)
+        if not params_df.empty:
+            # Pick strategy
+            pcr_bull = pcr_use > PCR_BULLISH; pcr_bear = pcr_use < PCR_BEARISH
+            skew_bear_b = iv_skew < -IV_SKEW_THRESH; skew_bull_b = iv_skew > IV_SKEW_THRESH
+            if pcr_bull and not skew_bear_b:   chosen_strat = "bull_put"
+            elif pcr_bear and not skew_bull_b: chosen_strat = "bear_call"
+            else:                              chosen_strat = "iron_condor"
+
+            best = params_df[params_df["strategy"] == chosen_strat]
+            if best.empty:
+                best = params_df.iloc[[0]]
+            p = best.iloc[0]
+            sn = int(p["short_n"]); wm = int(p["wing_m"])
+
+            # Get chain snapshot for step size
+            chain_df = query(f"""
+                SELECT strike FROM market.options_chain
+                WHERE symbol='{symbol}' AND expiry='{expiry}'
+                  AND option_type='CE' AND ltp > 0.05
+                ORDER BY toDate(timestamp) DESC, strike LIMIT 30
+            """)
+            if not chain_df.empty and len(chain_df) >= 2:
+                strikes = sorted(chain_df["strike"].unique())
+                diffs = [strikes[i+1]-strikes[i] for i in range(len(strikes)-1) if strikes[i+1]>strikes[i]]
+                step = float(max(set(diffs), key=diffs.count)) if diffs else 50.0
+            else:
+                step = {"NIFTY":50,"BANKNIFTY":100,"FINNIFTY":50,"MIDCPNIFTY":25}.get(symbol, 50)
+
+            spot = nifty_spt or 0
+            short_ce = spot + sn * step
+            short_pe = spot - sn * step
+
+            wall_rows = []
+            if chosen_strat in ("iron_condor", "bear_call") and ce_wall > 0:
+                ce_ok = short_ce >= ce_wall
+                wall_rows.append({
+                    "Leg": f"Short CE (~{short_ce:,.0f})",
+                    "OI Wall": f"CE wall {ce_wall:,.0f}",
+                    "Pass": "✅ Beyond wall" if ce_ok else "⛔ Inside wall",
+                })
+            if chosen_strat in ("iron_condor", "bull_put") and pe_wall > 0:
+                pe_ok = short_pe <= pe_wall
+                wall_rows.append({
+                    "Leg": f"Short PE (~{short_pe:,.0f})",
+                    "OI Wall": f"PE wall {pe_wall:,.0f}",
+                    "Pass": "✅ Beyond wall" if pe_ok else "⛔ Inside wall",
+                })
+            if wall_rows:
+                st.markdown(f"Strategy: **{chosen_strat.replace('_',' ').title()}** · sn={sn} · wm={wm}")
+                st.dataframe(pd.DataFrame(wall_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("OI wall data not available yet (run compute_oi_features).")
+        else:
+            st.info("No optimal params yet for this symbol.")
+
+    st.markdown("---")
+    st.caption(f"Data as of: snap_date={snap_date} · expiry={expiry} · "
+               f"confidence from score_date {conf_df['next_expiry'].iloc[0] if not conf_df.empty else '—'}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -847,11 +1098,12 @@ elif page == "Live Trading":
         st.info("No recommendation yet for today. Run `strategy_selector --recommend`.")
     else:
         r = rec_df.iloc[0]
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Symbol",     r["symbol"])
         c2.metric("Strategy",   r["strategy"].replace("_", " ").title())
         c3.metric("Confidence", f"{r['confidence']:.1f}/100")
-        c4.metric("Outcome",    r["outcome"].upper())
+        c4.metric("PCR Bias",   f"{r['pcr_bias']:.3f}")
+        c5.metric("IV Skew",    f"{r['iv_skew']:+.2f}%")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Net Credit",      f"{r['net_credit']:.2f} pts")
@@ -859,12 +1111,20 @@ elif page == "Live Trading":
         c3.metric("Lots",            int(r["lots"]))
         c4.metric("Capital at Risk", fmt_inr(float(r["capital_at_risk"])))
 
-        with st.expander("Leg Strikes"):
-            st.json({
-                "ATM":      r["atm_strike"],
-                "Short CE": r["short_ce_strike"], "Short PE": r["short_pe_strike"],
-                "Long CE":  r["long_ce_strike"],  "Long PE":  r["long_pe_strike"],
+        with st.expander("Leg Strikes & Signals"):
+            col_l, col_r = st.columns(2)
+            col_l.json({
+                "ATM":      int(r["atm_strike"]),
+                "Short CE": int(r["short_ce_strike"]), "Short PE": int(r["short_pe_strike"]),
+                "Long CE":  int(r["long_ce_strike"]),  "Long PE":  int(r["long_pe_strike"]),
             })
+            col_r.json({
+                "Confidence": round(float(r["confidence"]), 1),
+                "PCR Bias":   round(float(r["pcr_bias"]), 3),
+                "IV Skew":    round(float(r["iv_skew"]), 2),
+                "Outcome":    r["outcome"],
+            })
+        st.caption("➡️ Full signal breakdown available in **Today's Signals** page")
 
     # ── Past recommendations ──────────────────────────────────────────────────
     st.subheader("Recommendation History")
