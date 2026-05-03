@@ -191,6 +191,15 @@ MARKETS = {
     "forex": [
         "USDINR=X", "EURUSD=X", "GBPUSD=X", "JPYUSD=X",
         "AUDUSD=X", "CADUSD=X", "CHFUSD=X", "CNYUSD=X"
+    ],
+
+    # ── NSE Indices — for technical signal computation ─
+    # ^CNXFINANCE and ^CNXMIDCAP not available on yfinance with full history;
+    # FINNIFTY/MIDCPNIFTY signals will use ^NSEI as proxy in confidence_scorer.
+    "nse_index": [
+        "^NSEI",     # NIFTY 50
+        "^NSEBANK",  # BANK NIFTY
+        "^BSESN",    # BSE SENSEX
     ]
 }
 

@@ -130,7 +130,7 @@ def save_to_minio(minio, df, symbol, market):
     buffer.seek(0)
     size        = len(buffer.getvalue())
     today       = datetime.now().strftime("%Y-%m-%d")
-    safe_symbol = symbol.replace("=", "_").replace("&", "_")
+    safe_symbol = symbol.replace("=", "_").replace("&", "_").replace("^", "_")
     object_path = f"{market}/daily/{today}/{safe_symbol}.parquet"
     minio.put_object(
         MINIO_BUCKET, object_path,
@@ -238,4 +238,15 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys as _sys
+    if "--market" in _sys.argv:
+        _idx = _sys.argv.index("--market")
+        _filter = _sys.argv[_idx + 1]
+        import symbols as _sym
+        if _filter not in _sym.MARKETS:
+            print(f"Unknown market '{_filter}'. Available: {list(_sym.MARKETS.keys())}")
+            _sys.exit(1)
+        _target = list(_sym.MARKETS[_filter])  # snapshot before clearing
+        MARKETS.clear()
+        MARKETS[_filter] = _target
     main()
