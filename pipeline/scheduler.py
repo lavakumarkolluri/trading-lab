@@ -47,15 +47,131 @@ COMPOSE_CMD = [
     "run", "--rm",
 ]
 
+try:
+    from pipeline_utils import GIT_SHA
+    from ch_utils import ch_client as _ch_client
+    _TRACKING_OK = True
+except ImportError:
+    GIT_SHA = "unknown"
+    _TRACKING_OK = False
+
+
+def _record_run(service: str, started_at: datetime, status: str,
+                finished_at: datetime | None = None, error_msg: str = ""):
+    if not _TRACKING_OK:
+        return
+    if finished_at is None:
+        finished_at = datetime.utcnow()
+    try:
+        ch = _ch_client()
+        ch.command(
+            """
+            INSERT INTO system_meta.pipeline_runs
+                (service, started_at, finished_at, status, git_sha, error_msg)
+            VALUES (
+                {service:String}, {started_at:DateTime}, {finished_at:DateTime},
+                {status:String}, {git_sha:String}, {error_msg:String}
+            )
+            """,
+            parameters={
+                "service":     service,
+                "started_at":  started_at,
+                "finished_at": finished_at,
+                "status":      status,
+                "git_sha":     GIT_SHA,
+                "error_msg":   error_msg,
+            },
+        )
+    except Exception as e:
+        log.warning("pipeline_runs write failed for %s: %s", service, e)
+
+
+def _check_sha_drift():
+    if not _TRACKING_OK:
+        return
+    try:
+        ch = _ch_client()
+        result = ch.query(
+            "SELECT git_sha FROM system_meta.pipeline_runs FINAL "
+            "ORDER BY started_at DESC LIMIT 1"
+        )
+        if result.result_rows:
+            last_sha = result.result_rows[0][0]
+            if last_sha not in ("unknown", GIT_SHA):
+                log.warning(
+                    "GIT SHA DRIFT: image built from %s but last run used %s — "
+                    "consider running recompute if code changes affect stored data",
+                    GIT_SHA, last_sha,
+                )
+    except Exception as e:
+        log.warning("SHA drift check failed: %s", e)
+
+
+# ── Dependency map ─────────────────────────────────────────────────────────
+# Maps each service to the upstream services that must have succeeded today
+# before it is allowed to run. Missing or failed upstream → skip with 'skipped'.
+UPSTREAM_DEPS: dict[str, list[str]] = {
+    "options_eod_summary_pipeline": ["option_chain_historical"],
+    "compute_historical_iv":        ["options_eod_summary_pipeline"],
+    "compute_oi_features":          ["compute_historical_iv"],
+    "confidence_scorer":            ["compute_oi_features", "strategy_backtester"],
+    "strategy_selector":            ["confidence_scorer"],
+}
+
+
+def _upstream_ok(service: str, today_date: str) -> tuple[bool, str]:
+    """Return (ok, reason). ok=True means all upstreams succeeded today."""
+    deps = UPSTREAM_DEPS.get(service, [])
+    if not deps or not _TRACKING_OK:
+        return True, ""
+    try:
+        ch = _ch_client()
+        for dep in deps:
+            result = ch.query(
+                """
+                SELECT status FROM system_meta.pipeline_runs FINAL
+                WHERE service  = {service:String}
+                  AND run_date = {run_date:Date}
+                ORDER BY version DESC LIMIT 1
+                """,
+                parameters={"service": dep, "run_date": today_date},
+            )
+            if not result.result_rows:
+                return False, f"upstream '{dep}' has no run record for {today_date}"
+            status = result.result_rows[0][0]
+            if status != "success":
+                return False, f"upstream '{dep}' status={status} on {today_date}"
+    except Exception as e:
+        log.warning("Dependency gate check failed: %s", e)
+        return True, ""   # fail-open: don't block if we can't query
+    return True, ""
+
 
 def _run(service: str, *args: str):
     cmd = COMPOSE_CMD + [service] + list(args)
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+    ok, reason = _upstream_ok(service, today_str)
+    if not ok:
+        log.warning("SKIPPING %s — %s", service, reason)
+        started = datetime.utcnow()
+        _record_run(service, started, "skipped", error_msg=reason)
+        return
+
     log.info("Running: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=False, text=True, check=False)
+    started = datetime.utcnow()
+    try:
+        result = subprocess.run(cmd, capture_output=False, text=True, check=False)
+    except Exception as e:
+        _record_run(service, started, "failed", error_msg=str(e))
+        log.error("Command exception for %s: %s", service, e)
+        return
     if result.returncode != 0:
         log.error("Command failed (exit %d): %s", result.returncode, " ".join(cmd))
+        _record_run(service, started, "failed", error_msg=f"exit {result.returncode}")
     else:
         log.info("Done: %s", service)
+        _record_run(service, started, "success")
 
 
 def job_daily():
@@ -156,8 +272,51 @@ def job_option_chain_eod():
     _run("compute_oi_features")             # compute OI walls + IV skew + FII futures
 
 
+def _recompute_check():
+    """Print today's run status for all tracked services and exit."""
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    print(f"\nRecompute check — {today_str}")
+    print(f"{'Service':<40} {'Status':<10} {'Upstream OK'}")
+    print("-" * 70)
+    all_services = list(UPSTREAM_DEPS.keys()) + [
+        s for s in [
+            "option_chain_historical", "meta_pipeline",
+            "fii_dii_pipeline", "participant_oi_pipeline",
+            "vix_pipeline", "strategy_backtester",
+        ] if s not in UPSTREAM_DEPS
+    ]
+    if not _TRACKING_OK:
+        print("  (tracking unavailable — ch_utils not importable)")
+        return
+    try:
+        ch = _ch_client()
+        for svc in all_services:
+            result = ch.query(
+                """
+                SELECT status FROM system_meta.pipeline_runs FINAL
+                WHERE service  = {service:String}
+                  AND run_date = {run_date:Date}
+                ORDER BY version DESC LIMIT 1
+                """,
+                parameters={"service": svc, "run_date": today_str},
+            )
+            status = result.result_rows[0][0] if result.result_rows else "no record"
+            up_ok, reason = _upstream_ok(svc, today_str)
+            upstream_col = "ok" if up_ok else f"BLOCKED ({reason})"
+            print(f"  {svc:<38} {status:<10} {upstream_col}")
+    except Exception as e:
+        print(f"  Error: {e}")
+    print()
+
+
 def main():
-    log.info("Scheduler started — all times UTC")
+    import sys as _sys
+    if "--recompute-check" in _sys.argv:
+        _recompute_check()
+        return
+
+    log.info("Scheduler started — all times UTC (git_sha=%s)", GIT_SHA)
+    _check_sha_drift()
     log.info("  Intraday OC scraper : Mon–Fri 03:40 UTC (09:10 IST)")
     log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
     log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV")

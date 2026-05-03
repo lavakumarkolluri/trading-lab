@@ -46,9 +46,9 @@ def query(sql: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)
 def query_weekly(sql: str) -> pd.DataFrame:
-    """1-hour cache for spread_backtest, spread_optimal, confidence_backtest — weekly writes only."""
+    """5-min cache (same as query — renamed kept for call-site clarity)."""
     try:
         return get_ch().query_df(sql)
     except Exception as e:
@@ -71,6 +71,9 @@ def color(val: float) -> str:
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("📈 Trading Lab")
+if st.sidebar.button("🔄 Refresh Data"):
+    st.cache_data.clear()
+    st.rerun()
 page = st.sidebar.radio("Navigate", [
     "Overview",
     "Confidence Scores",
@@ -169,6 +172,74 @@ if page == "Overview":
                 runs[["strategy", "n_trades", "Win Rate", "Avg P&L", "Sharpe", "Period"]],
                 use_container_width=True, hide_index=True
             )
+
+    # ── Pipeline Health grid ─────────────────────────────────────────────────
+    st.subheader("Pipeline Health — Last 7 Days")
+
+    health_df = query("""
+        SELECT
+            service,
+            run_date,
+            status,
+            rows_written,
+            error_msg,
+            git_sha,
+            dateDiff('second', started_at, finished_at) AS duration_s
+        FROM system_meta.pipeline_runs FINAL
+        WHERE run_date >= today() - 7
+        ORDER BY run_date DESC, service
+    """)
+
+    if health_df.empty:
+        st.info("No pipeline run records yet. Runs are logged to system_meta.pipeline_runs.")
+    else:
+        health_df["run_date"] = pd.to_datetime(health_df["run_date"]).dt.date
+
+        # Build pivot: rows = service, columns = date
+        services = sorted(health_df["service"].unique())
+        dates    = sorted(health_df["run_date"].unique(), reverse=True)[:7]
+
+        STATUS_COLOUR = {
+            "success": "🟢",
+            "failed":  "🔴",
+            "running": "🟡",
+            "skipped": "⬜",
+        }
+
+        grid_rows = []
+        detail_rows = []
+        for svc in services:
+            row = {"Service": svc}
+            for d in dates:
+                cell = health_df[(health_df["service"] == svc) & (health_df["run_date"] == d)]
+                if cell.empty:
+                    row[str(d)] = "⚫"
+                else:
+                    # pick last status for the day
+                    rec = cell.sort_values("run_date").iloc[-1]
+                    icon = STATUS_COLOUR.get(rec["status"], "❓")
+                    row[str(d)] = icon
+                    if rec["status"] == "failed":
+                        detail_rows.append({
+                            "service":    svc,
+                            "date":       str(d),
+                            "error_msg":  rec["error_msg"] or "—",
+                            "duration_s": int(rec["duration_s"]),
+                            "git_sha":    rec["git_sha"],
+                            "rows":       int(rec["rows_written"]),
+                        })
+            grid_rows.append(row)
+
+        grid = pd.DataFrame(grid_rows).set_index("Service")
+        st.dataframe(grid, use_container_width=True)
+        st.caption("🟢 success  🔴 failed  🟡 running  ⬜ skipped  ⚫ no record")
+
+        # ── Failure drill-down (task 12) ─────────────────────────────────────
+        if detail_rows:
+            st.subheader("Recent Failures")
+            fail_df = pd.DataFrame(detail_rows)
+            fail_df.columns = ["Service", "Date", "Error", "Duration (s)", "Git SHA", "Rows Written"]
+            st.dataframe(fail_df, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -475,25 +546,7 @@ elif page == "Strategy Backtests":
             best_bp = opt_sym[opt_sym.strategy == "bull_put"].nlargest(1, "sharpe")
             best_bc = opt_sym[opt_sym.strategy == "bear_call"].nlargest(1, "sharpe")
 
-            straddle_data = query_weekly(f"""
-                SELECT expiry, pnl_pts
-                FROM analysis.spread_backtest FINAL
-                WHERE symbol = '{sym_sel}' AND strategy = 'straddle'
-                ORDER BY expiry
-            """)
-
             fig3 = go.Figure()
-            for label, df_src, clr in [
-                ("Straddle (no hedge)", straddle_data, "#e74c3c"),
-            ]:
-                if not df_src.empty:
-                    df_src["expiry"] = pd.to_datetime(df_src["expiry"])
-                    df_src = df_src.sort_values("expiry")
-                    fig3.add_trace(go.Scatter(
-                        x=df_src["expiry"], y=df_src["pnl_pts"].cumsum(),
-                        mode="lines", name=label, line_color=clr, line_dash="dash",
-                    ))
-
             for (strat, sn, wm), label, clr in [
                 (("iron_condor", int(best_ic["short_n"].iloc[0]), int(best_ic["wing_m"].iloc[0])),
                  "Best IC", "#3498db"),
@@ -521,16 +574,15 @@ elif page == "Strategy Backtests":
         st.markdown("**Win Rate by PCR Band & Strategy** (validates directional bias thresholds)")
         pcr_perf = query_weekly(f"""
             SELECT
-                multiIf(s.pcr_oi < 0.8, '<0.8 (Bearish)',
-                         s.pcr_oi < 1.0, '0.8–1.0',
-                         s.pcr_oi < 1.2, '1.0–1.2',
-                         '≥1.2 (Bullish)') AS pcr_band,
+                multiIf(s.pcr < 0.8, '<0.8 (Bearish)',
+                         s.pcr < 1.0, '0.8–1.0',
+                         s.pcr < 1.2, '1.0–1.2',
+                         '>=1.2 (Bullish)') AS pcr_band,
                 sb.strategy,
-                round(avg(sb.target) * 100, 1)  AS win_rate,
-                count()                          AS n_trades
+                round(avg(sb.target) * 100, 1) AS win_rate,
+                count()                         AS n_trades
             FROM analysis.spread_backtest FINAL sb
-            JOIN market.options_eod_summary FINAL s
-              ON s.symbol = sb.symbol AND s.date = sb.entry_date
+            JOIN market.options_eod_summary FINAL s ON s.date = sb.entry_date
             WHERE sb.strategy IN ('iron_condor', 'bull_put', 'bear_call')
               AND sb.symbol = '{sym_sel}'
             GROUP BY pcr_band, sb.strategy
@@ -577,41 +629,129 @@ elif page == "Strategy Backtests":
 elif page == "Trade Log":
     st.title("Trade Log")
 
-    trades = query("""
-        SELECT strategy, symbol, entry_month, exit_month,
-               hold_months, entry_px, exit_px, raw_ret, net_ret, is_open
-        FROM analysis.strategy_trades FINAL
-        ORDER BY entry_month DESC
-        LIMIT 500
-    """)
+    tab_opt, tab_pat = st.tabs(["Option Strategies", "Pattern Backtest"])
 
-    if trades.empty:
-        st.info("No trades found.")
-    else:
-        trades["P&L (₹)"]   = (trades["net_ret"] * STARTING_CAPITAL).round(0)
-        trades["Return %"]  = (trades["net_ret"] * 100).round(2)
-        trades["Status"]    = trades["is_open"].apply(lambda x: "Open" if x else "Closed")
+    # ── Tab 1: Option strategy trades (spread_backtest) ───────────────────────
+    with tab_opt:
+        opt_trades = query_weekly("""
+            SELECT
+                sb.symbol, sb.expiry, sb.entry_date, sb.strategy,
+                sb.atm_strike, sb.short_ce_strike, sb.short_pe_strike,
+                sb.long_ce_strike, sb.long_pe_strike,
+                sb.net_credit, sb.max_loss, sb.pnl_pts, sb.pnl_pct, sb.target,
+                round(s.pcr, 2)      AS pcr_at_entry,
+                round(s.iv_skew, 2)  AS iv_skew_at_entry
+            FROM analysis.spread_backtest AS sb FINAL
+            LEFT JOIN market.options_eod_summary AS s FINAL ON s.date = sb.entry_date
+            ORDER BY sb.expiry DESC
+            LIMIT 500
+        """)
+        if opt_trades.empty:
+            st.info("No option strategy trades found. Run strategy_backtester first.")
+        else:
+            opt_trades["P&L (pts)"] = opt_trades["pnl_pts"].round(1)
+            opt_trades["P&L %"]     = opt_trades["pnl_pct"].round(1)
+            opt_trades["Result"]    = opt_trades["target"].apply(lambda x: "Win" if x else "Loss")
+            opt_trades["Max Loss"]  = opt_trades["max_loss"].round(1)
+            opt_trades["Credit"]    = opt_trades["net_credit"].round(1)
 
-        # ── Filters ──────────────────────────────────────────────────────────
-        col1, col2 = st.columns(2)
-        strategies = ["All"] + trades["strategy"].unique().tolist()
-        sel_strat  = col1.selectbox("Strategy", strategies)
-        sel_status = col2.selectbox("Status", ["All", "Open", "Closed"])
+            STRATEGY_LABEL = {
+                "bull_put":    "Bull Put Spread",
+                "bear_call":   "Bear Call Spread",
+                "iron_condor": "Iron Condor",
+            }
 
-        filtered = trades.copy()
-        if sel_strat  != "All": filtered = filtered[filtered["strategy"] == sel_strat]
-        if sel_status != "All": filtered = filtered[filtered["Status"]   == sel_status]
+            def why_chosen(r):
+                pcr = r.get("pcr_at_entry", None)
+                skew = r.get("iv_skew_at_entry", None)
+                parts = []
+                if r.strategy == "bull_put":
+                    parts.append("Bullish bias")
+                    if pcr and pcr >= 1.2:
+                        parts.append(f"PCR {pcr:.2f} ≥ 1.2 (put-heavy)")
+                elif r.strategy == "bear_call":
+                    parts.append("Bearish bias")
+                    if pcr and pcr <= 0.8:
+                        parts.append(f"PCR {pcr:.2f} ≤ 0.8 (call-heavy)")
+                else:
+                    parts.append("Neutral / range-bound")
+                    if pcr:
+                        parts.append(f"PCR {pcr:.2f}")
+                if skew and abs(skew) > 0.01:
+                    parts.append(f"IV skew {skew:+.2f}")
+                return " · ".join(parts)
 
-        st.dataframe(
-            filtered[["strategy", "symbol", "entry_month", "exit_month",
-                       "Return %", "P&L (₹)", "Status"]].reset_index(drop=True),
-            use_container_width=True, hide_index=True,
-        )
+            def leg_strikes(r):
+                if r.strategy == "bull_put":
+                    return f"{int(r.short_pe_strike)}PE → {int(r.long_pe_strike)}PE hedge"
+                if r.strategy == "bear_call":
+                    return f"{int(r.short_ce_strike)}CE → {int(r.long_ce_strike)}CE hedge"
+                return (f"{int(r.short_pe_strike)}PE→{int(r.long_pe_strike)}PE  "
+                        f"{int(r.short_ce_strike)}CE→{int(r.long_ce_strike)}CE")
 
-        wins  = (filtered["net_ret"] > 0).sum()
-        total = len(filtered)
-        st.caption(f"{total} trades shown | Win rate: {wins/total*100:.1f}% | "
-                   f"Total P&L: {fmt_inr(filtered['P&L (₹)'].sum())}")
+            opt_trades["Strategy"]   = opt_trades["strategy"].map(STRATEGY_LABEL)
+            opt_trades["ATM"]        = opt_trades["atm_strike"].astype(int)
+            opt_trades["Legs"]       = opt_trades.apply(leg_strikes, axis=1)
+            opt_trades["Why Chosen"] = opt_trades.apply(why_chosen, axis=1)
+
+            c1, c2, c3 = st.columns(3)
+            sym_f   = c1.selectbox("Symbol",   ["All"] + sorted(opt_trades["symbol"].unique().tolist()), key="ol_sym")
+            strat_f = c2.selectbox("Strategy", ["All"] + sorted(opt_trades["strategy"].unique().tolist()), key="ol_str")
+            res_f   = c3.selectbox("Result",   ["All", "Win", "Loss"], key="ol_res")
+
+            f = opt_trades.copy()
+            if sym_f   != "All": f = f[f["symbol"]   == sym_f]
+            if strat_f != "All": f = f[f["strategy"] == strat_f]
+            if res_f   != "All": f = f[f["Result"]   == res_f]
+
+            wins  = (f["target"] == 1).sum()
+            total = len(f)
+            st.caption(
+                f"{total} trades | Win rate: {wins/total*100:.1f}% | "
+                f"Avg credit: {f['net_credit'].mean():.1f} pts | Avg P&L: {f['pnl_pts'].mean():.1f} pts"
+            )
+
+            st.dataframe(
+                f[["symbol", "expiry", "entry_date", "Strategy", "Why Chosen",
+                   "ATM", "Legs", "Credit", "Max Loss", "P&L (pts)", "P&L %", "Result"]].reset_index(drop=True),
+                use_container_width=True, hide_index=True,
+            )
+
+    # ── Tab 2: Pattern backtest trades (strategy_trades) ─────────────────────
+    with tab_pat:
+        st.caption("Equity pattern-based strategy backtest. These are directional stock trades, not option spreads.")
+        trades = query("""
+            SELECT strategy, symbol, entry_month, exit_month,
+                   hold_months, entry_px, exit_px, raw_ret, net_ret, is_open
+            FROM analysis.strategy_trades FINAL
+            ORDER BY entry_month DESC
+            LIMIT 500
+        """)
+        if trades.empty:
+            st.info("No pattern trades found.")
+        else:
+            trades["P&L (₹)"]  = (trades["net_ret"] * STARTING_CAPITAL).round(0)
+            trades["Return %"] = (trades["net_ret"] * 100).round(2)
+            trades["Status"]   = trades["is_open"].apply(lambda x: "Open" if x else "Closed")
+
+            col1, col2 = st.columns(2)
+            strategies = ["All"] + trades["strategy"].unique().tolist()
+            sel_strat  = col1.selectbox("Strategy", strategies, key="pt_strat")
+            sel_status = col2.selectbox("Status", ["All", "Open", "Closed"], key="pt_status")
+
+            filtered = trades.copy()
+            if sel_strat  != "All": filtered = filtered[filtered["strategy"] == sel_strat]
+            if sel_status != "All": filtered = filtered[filtered["Status"]   == sel_status]
+
+            st.dataframe(
+                filtered[["strategy", "symbol", "entry_month", "exit_month",
+                           "Return %", "P&L (₹)", "Status"]].reset_index(drop=True),
+                use_container_width=True, hide_index=True,
+            )
+            wins  = (filtered["net_ret"] > 0).sum()
+            total = len(filtered)
+            st.caption(f"{total} trades | Win rate: {wins/total*100:.1f}% | "
+                       f"Total P&L: {fmt_inr(filtered['P&L (₹)'].sum())}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

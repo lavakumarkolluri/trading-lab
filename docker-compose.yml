@@ -1,3 +1,10 @@
+# Shared build config for all pipeline services — passes current git SHA so
+# running containers know which code version they contain.
+x-pipeline-build: &pipeline-build
+  context: ./pipeline
+  args:
+    GIT_SHA: ${GIT_SHA:-unknown}
+
 services:
   vscode:
     image: codercom/code-server:latest
@@ -76,7 +83,7 @@ services:
     restart: unless-stopped
 
   pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: pipeline
     volumes:
       - ./workspace:/workspace
@@ -97,7 +104,7 @@ services:
     restart: "no"
 
   migrate:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: migrate
     volumes:
       - ./clickhouse:/clickhouse
@@ -114,7 +121,7 @@ services:
     command: ["--run"]
 
   mf_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: mf_pipeline
     environment:
       - CH_HOST=clickhouse
@@ -133,7 +140,7 @@ services:
     entrypoint: ["python", "mf_pipeline.py"]
 
   mf_aggregation:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: mf_aggregation
     environment:
       - CH_HOST=clickhouse
@@ -148,7 +155,7 @@ services:
     command: []
 
   cleanup_schemes:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: cleanup_schemes
     environment:
       - CH_HOST=clickhouse
@@ -163,7 +170,7 @@ services:
     command: []
 
   event_detector:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: event_detector
     environment:
       - CH_HOST=clickhouse
@@ -177,7 +184,7 @@ services:
     entrypoint: ["python", "event_detector.py"]
     command: []
   pattern_feature_extractor:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: pattern_feature_extractor
     environment:
       - CH_HOST=clickhouse
@@ -192,7 +199,7 @@ services:
     command: []
 
   pattern_builder:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: pattern_builder
     environment:
       - CH_HOST=clickhouse
@@ -207,7 +214,7 @@ services:
     command: []
 
   backtest_engine:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: backtest_engine
     environment:
       - CH_HOST=clickhouse
@@ -222,7 +229,7 @@ services:
     command: []
 
   star_rater:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: star_rater
     environment:
       - CH_HOST=clickhouse
@@ -237,7 +244,7 @@ services:
     command: []
 
   prediction_engine:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: prediction_engine
     environment:
       - CH_HOST=clickhouse
@@ -252,7 +259,7 @@ services:
     command: []
 
   validation_engine:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: validation_engine
     environment:
       - CH_HOST=clickhouse
@@ -267,7 +274,7 @@ services:
     command: []
 
   meta_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: meta_pipeline
     volumes:
       # rw required — meta_pipeline spawns sub-containers via docker compose run
@@ -278,7 +285,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - COMPOSE_FILE=/trading-lab/docker-compose.yml
+      - COMPOSE_FILE=/home/lavakumar/trading-lab/docker-compose.yml
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -287,7 +294,7 @@ services:
     command: []
 
   holidays_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: holidays_pipeline
     environment:
       - CH_HOST=clickhouse
@@ -302,7 +309,7 @@ services:
     command: []
 
   fii_dii_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: fii_dii_pipeline
     environment:
       - CH_HOST=clickhouse
@@ -321,7 +328,7 @@ services:
     entrypoint: ["python", "fii_dii_pipeline.py"]
 
   participant_oi_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: participant_oi_pipeline
     environment:
       - CH_HOST=clickhouse
@@ -341,7 +348,7 @@ services:
     command: []
 
   vix_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: vix_pipeline
     environment:
       - CH_HOST=clickhouse
@@ -361,7 +368,7 @@ services:
     command: []
 
   option_chain_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: option_chain_pipeline
     environment:
       - CH_HOST=clickhouse
@@ -381,7 +388,7 @@ services:
     command: []
 
   option_backtest:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: option_backtest
     environment:
       - CH_HOST=clickhouse
@@ -401,7 +408,7 @@ services:
     command: []
 
   nifty_straddle_backtest:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: nifty_straddle_backtest
     environment:
       - CH_HOST=clickhouse
@@ -416,7 +423,7 @@ services:
     command: []
 
   gap_analyzer:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: gap_analyzer
     environment:
       - CH_HOST=clickhouse
@@ -434,7 +441,7 @@ services:
     command: []
 
   option_chain_intraday:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: option_chain_intraday
     environment:
       - CH_HOST=clickhouse
@@ -455,7 +462,7 @@ services:
     command: []
 
   option_chain_historical:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: option_chain_historical
     environment:
       - CH_HOST=clickhouse
@@ -475,7 +482,7 @@ services:
     command: []
 
   options_eod_summary_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: options_eod_summary_pipeline
     environment:
       - CH_HOST=clickhouse
@@ -490,7 +497,7 @@ services:
     command: []
 
   compute_historical_iv:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: compute_historical_iv
     environment:
       - CH_HOST=clickhouse
@@ -505,7 +512,7 @@ services:
     command: []
 
   compute_oi_features:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: compute_oi_features
     environment:
       - CH_HOST=clickhouse
@@ -535,7 +542,7 @@ services:
     restart: unless-stopped
 
   lot_size_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: lot_size_pipeline
     environment:
       - CH_HOST=clickhouse
@@ -555,7 +562,7 @@ services:
     command: []
 
   strategy_backtester:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: strategy_backtester
     environment:
       - CH_HOST=clickhouse
@@ -570,7 +577,7 @@ services:
     command: []
 
   confidence_scorer:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: confidence_scorer
     environment:
       - CH_HOST=clickhouse
@@ -590,7 +597,7 @@ services:
     command: []
 
   strategy_selector:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: strategy_selector
     environment:
       - CH_HOST=clickhouse
@@ -604,8 +611,29 @@ services:
     entrypoint: ["python", "strategy_selector.py"]
     command: []
 
+  recompute:
+    build: *pipeline-build
+    container_name: recompute
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      # Use the actual host path so docker compose volume mounts resolve correctly.
+      # COMPOSE_FILE must be a host path, not an in-container path, because it is
+      # passed to the Docker daemon via the socket which runs on the host.
+      - COMPOSE_FILE=/home/lavakumar/trading-lab/docker-compose.yml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # rw: recompute calls docker compose run
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "recompute.py"]
+    command: []
+
   fundamental_pipeline:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: fundamental_pipeline
     environment:
       - CH_HOST=clickhouse
@@ -625,14 +653,14 @@ services:
     command: []
 
   scheduler:
-    build: ./pipeline
+    build: *pipeline-build
     container_name: scheduler
     volumes:
       # rw required — scheduler spawns sub-containers via docker compose run
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/trading-lab:ro
     environment:
-      - COMPOSE_FILE=/trading-lab/docker-compose.yml
+      - COMPOSE_FILE=/home/lavakumar/trading-lab/docker-compose.yml
       - TZ=UTC
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}

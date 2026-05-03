@@ -1,6 +1,11 @@
 FROM python:3.12-slim
 WORKDIR /app
 
+# Git SHA injected at build time: docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD)
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+RUN echo "${GIT_SHA}" > /app/version.txt
+
 # ── Install Docker CLI (needed by meta_pipeline.py to call docker compose) ──
 # Only the CLI is installed — no daemon. The socket is bind-mounted at runtime.
 RUN apt-get update \
@@ -24,6 +29,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Application code ─────────────────────────────────────────────────────────
 COPY ch_utils.py .
+COPY pipeline_utils.py .
+COPY recompute.py .
 COPY main.py .
 COPY symbols.py .
 COPY mf_pipeline.py .

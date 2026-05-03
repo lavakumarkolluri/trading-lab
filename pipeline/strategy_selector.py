@@ -71,7 +71,7 @@ def ch_client():
 def get_lot_size(ch, symbol: str) -> int:
     rows = ch.query(
         "SELECT lot_size FROM market.fo_lot_sizes WHERE symbol = {symbol:String} "
-        "ORDER BY effective_date DESC LIMIT 1",
+        "ORDER BY effective_from DESC LIMIT 1",
         parameters={"symbol": symbol},
     ).result_rows
     return int(rows[0][0]) if rows else 75
@@ -379,16 +379,20 @@ def run_backtest(ch):
             so.wing_m,
             sb.pnl_pts   AS spread_pnl,
             sb.max_loss
-        FROM analysis.confidence_backtest FINAL cb
-        -- pick best strategy params for each symbol
+        FROM analysis.confidence_backtest AS cb FINAL
+        -- pick best strategy params for each symbol (top sharpe per symbol)
         JOIN (
-            SELECT symbol, strategy, short_n, wing_m, sharpe_pct,
-                   ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY sharpe_pct DESC) AS rn
-            FROM analysis.spread_optimal FINAL
-            WHERE n_trades >= 10
-        ) so ON so.symbol = cb.symbol AND so.rn = 1
+            SELECT symbol, strategy, short_n, wing_m
+            FROM (
+                SELECT symbol, strategy, short_n, wing_m,
+                       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY sharpe_pct DESC) AS rn
+                FROM analysis.spread_optimal FINAL
+                WHERE n_trades >= 10
+            )
+            WHERE rn = 1
+        ) AS so ON so.symbol = cb.symbol
         -- get actual P&L for those params
-        LEFT JOIN analysis.spread_backtest FINAL sb
+        LEFT JOIN analysis.spread_backtest AS sb FINAL
             ON sb.symbol = cb.symbol
            AND sb.expiry = cb.expiry
            AND sb.strategy = so.strategy

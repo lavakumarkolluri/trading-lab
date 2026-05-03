@@ -2,7 +2,8 @@
 """
 strategy_backtester.py — Defined-risk option selling strategy backtester
 
-Strategies: Iron Condor, Bull Put Spread, Bear Call Spread, ATM Straddle (baseline)
+Strategies: Iron Condor, Bull Put Spread, Bear Call Spread
+All positions are hedged — no naked legs.
 
 For each symbol × expiry × strategy variant (short_n, wing_m):
   Entry: previous trading day EOD prices (approximates 0DTE morning entry)
@@ -12,7 +13,7 @@ P&L accounting (all hedge costs included):
   net_credit = sell_legs - buy_legs   (what you receive after paying for wings)
   exit_cost  = settle(sell_legs) - settle(buy_legs)
   pnl_pts    = net_credit - exit_cost
-  max_loss   = wing_width - net_credit   (defined risk; 0 for naked straddle)
+  max_loss   = wing_width - net_credit   (defined risk)
 
 Parameter grid:
   short_n : 1–4  steps from ATM to place short leg
@@ -119,34 +120,6 @@ def find_atm(chain: pd.DataFrame, snap_date: date, expiry: date) -> Optional[flo
     return float((ce.loc[common] - pe.loc[common]).abs().idxmin())
 
 
-def compute_straddle(idx, entry_date, expiry, atm) -> Optional[dict]:
-    """ATM straddle: sell ATM CE + ATM PE (no wings — unlimited risk)."""
-    sce = get_ltp(idx, entry_date, expiry, atm, "CE")
-    spe = get_ltp(idx, entry_date, expiry, atm, "PE")
-    if sce is None or spe is None:
-        return None
-    net_credit = sce + spe
-
-    # Settlement
-    xce = get_ltp(idx, expiry, expiry, atm, "CE") or 0.0
-    xpe = get_ltp(idx, expiry, expiry, atm, "PE") or 0.0
-    exit_cost = xce + xpe
-    pnl = net_credit - exit_cost
-
-    return dict(
-        strategy="straddle", short_n=0, wing_m=0,
-        short_ce_strike=atm, short_pe_strike=atm,
-        long_ce_strike=0.0, long_pe_strike=0.0,
-        short_ce_entry=sce, short_pe_entry=spe,
-        long_ce_entry=0.0, long_pe_entry=0.0,
-        short_ce_settle=xce, short_pe_settle=xpe,
-        long_ce_settle=0.0, long_pe_settle=0.0,
-        net_credit=net_credit, max_loss=0.0,
-        exit_cost=exit_cost, pnl_pts=pnl,
-        pnl_pct=float("nan"),
-        target=int(pnl > 0),
-    )
-
 
 def compute_iron_condor(idx, entry_date, expiry, atm,
                         step, short_n, wing_m) -> Optional[dict]:
@@ -176,13 +149,16 @@ def compute_iron_condor(idx, entry_date, expiry, atm,
     max_loss = wing_m * step - net_credit  # single-side worst case
     pnl_pct_denom = wing_m * step
 
-    # Settlement (short legs settle as liabilities, long legs as assets)
-    xsce = get_ltp(idx, expiry, expiry, sce_k, "CE") or 0.0
-    xspe = get_ltp(idx, expiry, expiry, spe_k, "PE") or 0.0
-    xlce = get_ltp(idx, expiry, expiry, lce_k, "CE") or 0.0
-    xlpe = get_ltp(idx, expiry, expiry, lpe_k, "PE") or 0.0
+    # Settlement — all 4 legs must be present; missing settlement = skip trade
+    xsce = get_ltp(idx, expiry, expiry, sce_k, "CE")
+    xspe = get_ltp(idx, expiry, expiry, spe_k, "PE")
+    xlce = get_ltp(idx, expiry, expiry, lce_k, "CE")
+    xlpe = get_ltp(idx, expiry, expiry, lpe_k, "PE")
+    if any(v is None for v in (xsce, xspe, xlce, xlpe)):
+        return None
     exit_cost = (xsce + xspe) - (xlce + xlpe)
-    pnl = net_credit - exit_cost
+    # Cap at theoretical max: bhavcopy LTP ≠ final settlement in edge cases
+    pnl = max(net_credit - exit_cost, -max_loss) if max_loss > 0 else net_credit - exit_cost
 
     return dict(
         strategy="iron_condor", short_n=short_n, wing_m=wing_m,
@@ -221,10 +197,12 @@ def compute_bull_put(idx, entry_date, expiry, atm,
         return None
     max_loss = wing_m * step - net_credit
 
-    xspe = get_ltp(idx, expiry, expiry, spe_k, "PE") or 0.0
-    xlpe = get_ltp(idx, expiry, expiry, lpe_k, "PE") or 0.0
+    xspe = get_ltp(idx, expiry, expiry, spe_k, "PE")
+    xlpe = get_ltp(idx, expiry, expiry, lpe_k, "PE")
+    if xspe is None or xlpe is None:
+        return None
     exit_cost = xspe - xlpe
-    pnl = net_credit - exit_cost
+    pnl = max(net_credit - exit_cost, -max_loss) if max_loss > 0 else net_credit - exit_cost
 
     return dict(
         strategy="bull_put", short_n=short_n, wing_m=wing_m,
@@ -263,10 +241,12 @@ def compute_bear_call(idx, entry_date, expiry, atm,
         return None
     max_loss = wing_m * step - net_credit
 
-    xsce = get_ltp(idx, expiry, expiry, sce_k, "CE") or 0.0
-    xlce = get_ltp(idx, expiry, expiry, lce_k, "CE") or 0.0
+    xsce = get_ltp(idx, expiry, expiry, sce_k, "CE")
+    xlce = get_ltp(idx, expiry, expiry, lce_k, "CE")
+    if xsce is None or xlce is None:
+        return None
     exit_cost = xsce - xlce
-    pnl = net_credit - exit_cost
+    pnl = max(net_credit - exit_cost, -max_loss) if max_loss > 0 else net_credit - exit_cost
 
     return dict(
         strategy="bear_call", short_n=short_n, wing_m=wing_m,
@@ -318,12 +298,7 @@ def process_symbol(ch, symbol: str, from_date: Optional[date] = None) -> pd.Data
         base = dict(symbol=symbol, expiry=expiry, entry_date=entry_date,
                     atm_strike=atm, strike_step=step)
 
-        # Straddle (baseline, no hedge)
-        r = compute_straddle(idx, entry_date, expiry, atm)
-        if r:
-            rows.append({**base, **r})
-
-        # IC, Bull Put, Bear Call over parameter grid
+        # Hedged strategies only — no naked positions
         for sn in range(1, SHORT_N_MAX + 1):
             for wm in range(1, WING_M_MAX + 1):
                 for fn in [compute_iron_condor, compute_bull_put, compute_bear_call]:
@@ -350,7 +325,6 @@ def insert_backtest(ch, df: pd.DataFrame):
         "net_credit", "max_loss", "exit_cost", "pnl_pts", "pnl_pct", "target",
     ]
     df = df[cols].copy()
-    # Replace NaN pnl_pct with 0 for straddle (no wing, no defined pct)
     df["pnl_pct"] = df["pnl_pct"].fillna(0.0)
     rows = [list(row) for row in df.itertuples(index=False)]
     ch.insert("analysis.spread_backtest", rows, column_names=cols)
