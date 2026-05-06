@@ -823,6 +823,21 @@ def load_model(symbol: str, mc) -> tuple:
 
 # ── Production Scoring ────────────────────────────────────────────────────────
 
+_CRITICAL_FEATURES = ["vix", "atm_ce_iv", "atm_pe_iv", "iv_rank", "iv_percentile"]
+
+def _warn_missing_features(symbol: str, row: dict) -> None:
+    """Log a warning for each critical feature that is zero or missing.
+    Zero VIX / zero IV means EOD data wasn't ready when scorer ran — scores
+    will be unreliable. This doesn't block scoring but makes the gap visible.
+    """
+    missing = [f for f in _CRITICAL_FEATURES if not row.get(f)]
+    if missing:
+        log.warning(
+            f"[{symbol}] UNRELIABLE SCORE — critical features are zero/missing: {missing}. "
+            "Run compute_oi_features first, then re-score."
+        )
+
+
 def score_today(ch, mc, symbol: str) -> None:
     model, meta = load_model(symbol, mc)
     if model is None:
@@ -879,6 +894,8 @@ def score_today(ch, mc, symbol: str) -> None:
         if c not in feat_df.columns:
             feat_df[c] = 0.0
     feat_df = feat_df[[c for c in feat_cols if c in feat_df.columns]].fillna(0.0).astype(float)
+
+    _warn_missing_features(symbol, row)
 
     confidence = float(model.predict_proba(feat_df)[0, 1]) * 100
     expected_pnl_pct = (confidence - 50) * 1.5

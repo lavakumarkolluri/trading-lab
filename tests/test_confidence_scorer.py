@@ -74,6 +74,35 @@ def test_compare_calls_score_today_for_single_symbol():
         mock_score.assert_called_once_with(ch, mc, "NIFTY")
 
 
+# ── _warn_missing_features ───────────────────────────────────────────────────
+
+def test_warn_missing_features_fires_when_vix_zero(caplog):
+    """_warn_missing_features must warn when VIX is 0 — means EOD data wasn't ready."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="confidence_scorer"):
+        cs._warn_missing_features("NIFTY", {"vix": 0.0, "atm_ce_iv": 0.0,
+                                             "atm_pe_iv": 0.0, "iv_rank": 0.0,
+                                             "iv_percentile": 0.0})
+    assert "UNRELIABLE SCORE" in caplog.text
+    assert "vix" in caplog.text
+
+
+def test_warn_missing_features_silent_when_data_present(caplog):
+    """_warn_missing_features must not warn when all critical features are populated."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="confidence_scorer"):
+        cs._warn_missing_features("NIFTY", {"vix": 18.5, "atm_ce_iv": 17.2,
+                                             "atm_pe_iv": 15.8, "iv_rank": 24.7,
+                                             "iv_percentile": 71.4})
+    assert "UNRELIABLE SCORE" not in caplog.text
+
+
+def test_critical_features_list_includes_vix_and_iv():
+    """_CRITICAL_FEATURES must include vix and IV columns — these drive model quality."""
+    for col in ("vix", "atm_ce_iv", "atm_pe_iv", "iv_rank"):
+        assert col in cs._CRITICAL_FEATURES, f"{col} missing from _CRITICAL_FEATURES"
+
+
 # ── SYMBOLS list sanity ───────────────────────────────────────────────────────
 
 def test_symbols_includes_nifty_and_banknifty():
