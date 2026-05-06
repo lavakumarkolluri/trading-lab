@@ -1227,16 +1227,50 @@ elif page == "Paper Trades":
         st.info("No open positions right now.")
     else:
         for _, r in open_df.iterrows():
+            sym    = r["symbol"]
+            strike = float(r["strike"])
+            expiry = r["expiry"]
+
+            # Live mark-to-market from intraday chain (best-effort)
+            mark_df = query("""
+                SELECT sumIf(ltp, option_type='CE') + sumIf(ltp, option_type='PE') AS curr
+                FROM market.options_chain
+                WHERE symbol   = %(sym)s
+                  AND strike   = %(strike)s
+                  AND expiry   = %(expiry)s
+                  AND toDate(timestamp) = today()
+                  AND timestamp = (
+                      SELECT max(timestamp) FROM market.options_chain
+                      WHERE symbol = %(sym)s AND toDate(timestamp) = today()
+                  )
+                GROUP BY symbol
+                HAVING curr > 0
+            """, params={"sym": sym, "strike": strike, "expiry": str(expiry)})
+
+            curr_straddle  = float(mark_df["curr"].iloc[0]) if not mark_df.empty else None
+            entry_premium  = float(r["entry_premium"])
+            lot_size       = int(r["lot_size"])
+            if curr_straddle is not None:
+                unreal_pts = entry_premium - curr_straddle
+                unreal_inr = unreal_pts * lot_size
+            else:
+                unreal_pts = unreal_inr = None
+
             with st.container(border=True):
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Symbol",   r["symbol"])
-                c2.metric("Strike",   f"{r['strike']:.0f}")
-                c3.metric("Premium",  f"{r['entry_premium']:.1f} pts")
+                c1, c2, c3, c4, c5, c6 = st.columns(6)
+                c1.metric("Symbol",   sym)
+                c2.metric("Strike",   f"{strike:.0f}")
+                c3.metric("Premium",  f"{entry_premium:.1f} pts")
                 c4.metric("Conf",     f"{r['scorecard_conf']:.0f}/100")
                 c5.metric("Trailing", "Yes" if r["trailing_active"] else "No")
+                if unreal_inr is not None:
+                    c6.metric("Unrealized P&L", fmt_inr(unreal_inr),
+                              delta=f"{unreal_pts:+.1f} pts")
+                else:
+                    c6.metric("Unrealized P&L", "—")
 
                 c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Expiry",       str(r["expiry"]))
+                c1.metric("Expiry",       str(expiry))
                 c2.metric("Entry CE",     f"{r['entry_ce_ltp']:.1f}")
                 c3.metric("Entry PE",     f"{r['entry_pe_ltp']:.1f}")
                 c4.metric("Peak P&L",     fmt_inr(float(r["peak_pnl_inr"])))

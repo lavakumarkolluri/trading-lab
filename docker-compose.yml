@@ -46,7 +46,7 @@ services:
       - "9009:9000"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-      - ./clickhouse/config/default-user.xml:/etc/clickhouse-server/users.d/default-user.xml
+      - ./clickhouse/config/default-user.xml:/etc/clickhouse-server/users.d/trading-lab-user.xml
     environment:
       CH_PASSWORD: ${CH_PASSWORD}
     ulimits:
@@ -285,7 +285,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - COMPOSE_FILE=/home/lavakumar/trading-lab/docker-compose.yml
+      - COMPOSE_FILE=/trading-lab/docker-compose.yml
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -302,8 +302,8 @@ services:
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
       - MINIO_HOST=minio:9000
-      - MINIO_USER=${MINIO_USER:-admin}
-      - MINIO_PASSWORD=${MINIO_PASSWORD:-password123}
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -655,10 +655,8 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      # Use the actual host path so docker compose volume mounts resolve correctly.
-      # COMPOSE_FILE must be a host path, not an in-container path, because it is
-      # passed to the Docker daemon via the socket which runs on the host.
-      - COMPOSE_FILE=/home/lavakumar/trading-lab/docker-compose.yml
+      # In-container path: project is bind-mounted at /trading-lab:ro
+      - COMPOSE_FILE=/trading-lab/docker-compose.yml
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock  # rw: recompute calls docker compose run
     depends_on:
@@ -696,7 +694,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/trading-lab:ro
     environment:
-      - COMPOSE_FILE=/home/lavakumar/trading-lab/docker-compose.yml
+      - COMPOSE_FILE=/trading-lab/docker-compose.yml
       - TZ=UTC
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}

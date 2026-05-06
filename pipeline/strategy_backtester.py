@@ -28,7 +28,7 @@ Usage:
 import os
 import logging
 import argparse
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 import numpy as np
@@ -37,6 +37,23 @@ import clickhouse_connect
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+GIT_SHA = os.getenv("GIT_SHA", "unknown")
+
+
+def _record_run(ch, status: str, started_at: datetime, error_msg: str = ""):
+    try:
+        ch.command(
+            """INSERT INTO system_meta.pipeline_runs
+               (service, started_at, finished_at, status, git_sha, error_msg)
+               VALUES ({svc:String},{start:DateTime},{end:DateTime},{st:String},{sha:String},{err:String})""",
+            parameters={"svc": "strategy_backtester", "start": started_at,
+                        "end": datetime.utcnow(), "st": status,
+                        "sha": GIT_SHA, "err": error_msg},
+        )
+    except Exception as e:
+        log.warning("pipeline_runs write failed: %s", e)
+
 
 CH_HOST = os.getenv("CH_HOST", "clickhouse")
 CH_PORT = int(os.getenv("CH_PORT", "8123"))
@@ -382,25 +399,31 @@ def main():
     from_date = date.fromisoformat(args.from_date) if args.from_date else None
     symbols   = [args.symbol] if args.symbol else SYMBOLS
 
-    all_frames = []
-    for sym in symbols:
-        try:
-            df = process_symbol(ch, sym, from_date)
-            if df.empty:
-                continue
-            insert_backtest(ch, df)
-            all_frames.append(df)
-        except Exception as e:
-            log.error(f"[{sym}] failed: {e}", exc_info=True)
+    started_at = datetime.utcnow()
+    try:
+        all_frames = []
+        for sym in symbols:
+            try:
+                df = process_symbol(ch, sym, from_date)
+                if df.empty:
+                    continue
+                insert_backtest(ch, df)
+                all_frames.append(df)
+            except Exception as e:
+                log.error(f"[{sym}] failed: {e}", exc_info=True)
 
-    if all_frames:
-        combined = pd.concat(all_frames, ignore_index=True)
-        try:
-            compute_and_insert_optimal(ch, combined)
-        except Exception as e:
-            log.error(f"optimal computation failed: {e}", exc_info=True)
+        if all_frames:
+            combined = pd.concat(all_frames, ignore_index=True)
+            try:
+                compute_and_insert_optimal(ch, combined)
+            except Exception as e:
+                log.error(f"optimal computation failed: {e}", exc_info=True)
 
-    log.info("strategy_backtester done")
+        log.info("strategy_backtester done")
+        _record_run(ch, "success", started_at)
+    except Exception as e:
+        log.error(f"strategy_backtester fatal: {e}", exc_info=True)
+        _record_run(ch, "failed", started_at, str(e))
 
 
 if __name__ == "__main__":

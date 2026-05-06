@@ -189,11 +189,12 @@ def get_current_straddle(ch, symbol: str, expiry: date, strike: float) -> float 
 
 
 def get_scorecard_confidence(ch, symbol: str) -> float:
-    """Get latest confidence score for symbol."""
+    """Get latest confidence score for symbol, must be within last 7 days."""
     try:
         r = ch.query("""
             SELECT confidence FROM analysis.confidence_scores FINAL
             WHERE symbol = {sym:String}
+              AND score_date >= today() - 7
             ORDER BY score_date DESC
             LIMIT 1
         """, parameters={"sym": symbol})
@@ -317,18 +318,19 @@ def record_exit(ch, pos, current_straddle, exit_reason, dry_run=False):
               pos["target_inr"], pos["stoploss_inr"],
               pos["scorecard_conf"], "closed",
               int(pos["trailing_active"]), float(pos["peak_pnl_inr"]),
-              float(pos["trail_stop_inr"]), exit_time]],
+              float(pos["trail_stop_inr"]), exit_time, pos.get("entry_features", "{}")]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
-                          "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked"],
+                          "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
+                          "entry_features"],
         )
 
 
 def update_trail(ch, pos, pnl_inr, dry_run=False):
     """Update peak_pnl_inr and trail_stop_inr for a position in trailing mode."""
-    peak   = max(float(pos["peak_pnl_inr"]), pnl_inr)
+    peak   = max(float(pos["peak_pnl_inr"]), pnl_inr, TARGET_INR)
     trail  = peak * TRAIL_PCT
     now    = ist_naive()
 
@@ -343,12 +345,13 @@ def update_trail(ch, pos, pnl_inr, dry_run=False):
               pos["lot_size"], pos["target_pts"], pos["stop_pts"],
               pos["target_inr"], pos["stoploss_inr"],
               pos["scorecard_conf"], "open",
-              1, peak, trail, now]],
+              1, peak, trail, now, pos.get("entry_features", "{}")]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
-                          "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked"],
+                          "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
+                          "entry_features"],
         )
     return peak, trail
 
@@ -408,11 +411,13 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
         log.info(f"[{symbol}] outside entry window ({t}) — no action")
         return
 
-    # Cooldown after stop loss
+    # Cooldown after stop loss — exit_time written as ist_naive() so comparison is IST vs IST
     last_stop = last_stop_time(ch, symbol)
     if last_stop:
         if not isinstance(last_stop, datetime):
             last_stop = datetime.fromisoformat(str(last_stop))
+        if last_stop.tzinfo is not None:
+            last_stop = last_stop.astimezone(IST).replace(tzinfo=None)
         elapsed_m = (ist_naive() - last_stop).total_seconds() / 60
         if elapsed_m < STOP_COOLDOWN_M:
             log.info(f"[{symbol}] stop cooldown {elapsed_m:.0f}/{STOP_COOLDOWN_M} min — waiting")
@@ -423,7 +428,12 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
         log.warning(f"[{symbol}] no intraday snapshot available — skipping")
         return
 
-    age_s = (ist_naive() - snap["timestamp"]).total_seconds()
+    # ClickHouse returns UTC-naive datetime; convert to IST-naive before age check
+    snap_ts = snap["timestamp"]
+    if not isinstance(snap_ts, datetime):
+        snap_ts = datetime.fromisoformat(str(snap_ts))
+    snap_ts_ist = snap_ts + timedelta(hours=5, minutes=30)
+    age_s = (ist_naive() - snap_ts_ist).total_seconds()
     if age_s > 20 * 60:  # snapshot older than 20 min is stale
         log.warning(f"[{symbol}] snapshot is {age_s/60:.0f} min old — skipping")
         return

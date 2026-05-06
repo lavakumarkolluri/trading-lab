@@ -127,20 +127,22 @@ def load_atm_options(ch, d: date, spot: float) -> pd.DataFrame:
 
     # Near-term expiry
     expiry_row = ch.query(
-        f"SELECT min(expiry) FROM market.options_chain "
-        f"WHERE symbol='NIFTY' AND toDate(timestamp)='{d}' AND expiry >= '{d}'"
+        "SELECT min(expiry) FROM market.options_chain "
+        "WHERE symbol='NIFTY' AND toDate(timestamp)={d:Date} AND expiry >= {d:Date}",
+        parameters={"d": d},
     ).result_rows
     if not expiry_row or expiry_row[0][0] is None:
         return pd.DataFrame()
     expiry = expiry_row[0][0]
 
     df = ch.query_df(
-        f"SELECT strike, option_type, ltp "
-        f"FROM market.options_chain FINAL "
-        f"WHERE symbol='NIFTY' AND toDate(timestamp)='{d}' "
-        f"  AND expiry='{expiry}' "
-        f"  AND strike BETWEEN {lo} AND {hi} "
-        f"  AND ltp > {MIN_PRICE}"
+        "SELECT strike, option_type, ltp "
+        "FROM market.options_chain FINAL "
+        "WHERE symbol='NIFTY' AND toDate(timestamp)={d:Date} "
+        "  AND expiry={expiry:Date} "
+        "  AND strike BETWEEN {lo:Float64} AND {hi:Float64} "
+        "  AND ltp > {min_price:Float64}",
+        parameters={"d": d, "expiry": expiry, "lo": lo, "hi": hi, "min_price": MIN_PRICE},
     )
     df["expiry"] = expiry
     return df
@@ -260,8 +262,9 @@ def main():
 
     log.info("Loading dates from market.options_eod_summary...")
     rows = ch.query(
-        f"SELECT date FROM market.options_eod_summary FINAL "
-        f"WHERE date >= '{from_date}' ORDER BY date"
+        "SELECT date FROM market.options_eod_summary FINAL "
+        "WHERE date >= {from_date:Date} ORDER BY date",
+        parameters={"from_date": from_date},
     ).result_rows
     dates = [r[0] for r in rows]
     log.info(f"  {len(dates)} dates to process")

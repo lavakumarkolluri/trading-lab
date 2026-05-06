@@ -54,6 +54,7 @@ try:
 except ImportError:
     GIT_SHA = "unknown"
     _TRACKING_OK = False
+    log.warning("pipeline_utils/ch_utils not importable — pipeline_runs tracking disabled")
 
 
 def _record_run(service: str, started_at: datetime, status: str,
@@ -339,8 +340,9 @@ def main():
     log.info("  MF      pipeline    : Sun     03:00 UTC (08:30 IST)")
     log.info("  Fundamentals        : Sun     04:30 UTC (10:00 IST)")
     log.info("  Lot sizes           : Sun     05:00 UTC (10:30 IST)")
-    log.info("  Confidence scorer   : Sun     05:30 UTC (11:00 IST)")
-    log.info("  Strategy selector   : Sun     06:30 UTC (12:00 IST) --backtest")
+    log.info("  Confidence scorer   : Sun     07:00 UTC (12:30 IST) --compare (90 min after backtester)")
+    log.info("  Strategy selector   : Sun     08:00 UTC (13:30 IST) --backtest")
+    log.info("  Outcome fill-back   : Mon-Fri 14:00 UTC (19:30 IST) --fill-outcomes (marks yesterday's recommendations)")
     log.info("  Strategy recommend  : Mon-Thu 10:30 UTC (16:00 IST) --recommend")
     log.info("  FII/DII + ParticOI  : Mon-Fri 10:45 UTC (16:15 IST) pre-feed for meta_pipeline")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
@@ -374,8 +376,8 @@ def main():
     schedule.every().sunday.at("04:30").do(job_fundamental_pipeline)
     schedule.every().sunday.at("05:00").do(job_lot_size_pipeline)
     schedule.every().sunday.at("05:30").do(job_strategy_backtester)
-    schedule.every().sunday.at("06:00").do(job_confidence_scorer)
-    schedule.every().sunday.at("06:30").do(job_strategy_selector_backtest)
+    schedule.every().sunday.at("07:00").do(job_confidence_scorer)   # 90 min after backtester
+    schedule.every().sunday.at("08:00").do(job_strategy_selector_backtest)
 
     # Daily recommendation: 30 min before market open (10:30 UTC = 16:00 IST)
     for day in ("monday", "tuesday", "wednesday", "thursday"):

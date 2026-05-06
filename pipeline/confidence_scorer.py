@@ -29,7 +29,7 @@ import logging
 import os
 import pickle
 import argparse
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import numpy as np
@@ -45,6 +45,23 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+GIT_SHA = os.getenv("GIT_SHA", "unknown")
+
+
+def _record_run(ch, status: str, started_at: datetime, error_msg: str = ""):
+    try:
+        ch.command(
+            """INSERT INTO system_meta.pipeline_runs
+               (service, started_at, finished_at, status, git_sha, error_msg)
+               VALUES ({svc:String},{start:DateTime},{end:DateTime},{st:String},{sha:String},{err:String})""",
+            parameters={"svc": "confidence_scorer", "start": started_at,
+                        "end": datetime.utcnow(), "st": status,
+                        "sha": GIT_SHA, "err": error_msg},
+        )
+    except Exception as e:
+        log.warning("pipeline_runs write failed: %s", e)
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -986,32 +1003,37 @@ def main():
     if not mc.bucket_exists(MINIO_BUCKET):
         mc.make_bucket(MINIO_BUCKET)
 
-    if args.compare:
-        best_type, is_pooled = compare_models(ch, mc)
+    started_at = datetime.utcnow()
+    try:
+        if args.compare:
+            best_type, is_pooled = compare_models(ch, mc)
 
-        log.info(f"Training final model: {best_type} (pooled={is_pooled})")
-        if is_pooled:
-            pooled_df = build_dataset_pooled(ch)
-            train_final_model_pooled(pooled_df, mc, best_type)
+            log.info(f"Training final model: {best_type} (pooled={is_pooled})")
+            if is_pooled:
+                pooled_df = build_dataset_pooled(ch)
+                train_final_model_pooled(pooled_df, mc, best_type)
+            else:
+                target_syms = [args.symbol] if args.symbol else SYMBOLS
+                for sym in target_syms:
+                    try:
+                        df = build_dataset(ch, sym)
+                        if not df.empty:
+                            train_final_model(df, sym, mc, best_type)
+                    except Exception as e:
+                        log.error(f"[{sym}] failed: {e}", exc_info=True)
         else:
-            target_syms = [args.symbol] if args.symbol else SYMBOLS
-            for sym in target_syms:
+            symbols = [args.symbol] if args.symbol else SYMBOLS
+            for sym in symbols:
                 try:
-                    df = build_dataset(ch, sym)
-                    if not df.empty:
-                        train_final_model(df, sym, mc, best_type)
+                    run_symbol(sym, ch, mc, args.backtest_only, args.score_only, args.model_type)
                 except Exception as e:
                     log.error(f"[{sym}] failed: {e}", exc_info=True)
-        return
 
-    symbols = [args.symbol] if args.symbol else SYMBOLS
-    for sym in symbols:
-        try:
-            run_symbol(sym, ch, mc, args.backtest_only, args.score_only, args.model_type)
-        except Exception as e:
-            log.error(f"[{sym}] failed: {e}", exc_info=True)
-
-    log.info("confidence_scorer done")
+        log.info("confidence_scorer done")
+        _record_run(ch, "success", started_at)
+    except Exception as e:
+        log.error(f"confidence_scorer fatal: {e}", exc_info=True)
+        _record_run(ch, "failed", started_at, str(e))
 
 
 if __name__ == "__main__":
