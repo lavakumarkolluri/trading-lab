@@ -63,3 +63,33 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## 5. Branching & CI/CD
+
+**All changes go to `stage` first. `master` is production — never commit directly.**
+
+```
+stage  →  CI tests pass  →  auto-merge to master  (daily 17:00 UTC Mon–Fri)
+```
+
+### Rules
+- Work on `stage` branch. Push features/fixes there.
+- GitHub Actions runs `tests/` on every push to `stage` and on daily schedule.
+- If all 21 tests pass, the workflow auto-merges `stage` → `master` and tags the release.
+- Never `git push origin master` directly (except emergency hotfixes with explicit user approval).
+
+### When something breaks in prod
+1. Write a failing test that reproduces the bug (`tests/test_*.py`).
+2. Fix the code.
+3. Confirm the test now passes.
+4. Push to `stage` — CI will promote to `master`.
+5. **This is not optional.** Every prod breakage must produce a new test. No exceptions.
+
+### Test locations
+- `tests/test_docker_compose.py` — compose file structure, config mounts, credentials
+- `tests/test_migrations.py` — SQL file numbering, syntax validity
+- `tests/test_intraday_monitor.py` — trailing stop, timezone, column schema
+- `tests/test_compute_oi_features.py` — DataFrame duplicate column regression
+
+### Adding new tests
+When you add a new pipeline or fix a prod bug, add tests that would have caught the breakage. Tests must run offline (no live ClickHouse). Use `unittest.mock.MagicMock` for DB calls.

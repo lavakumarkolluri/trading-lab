@@ -279,7 +279,7 @@ def main():
             if "fii_fut_net_3d" not in pf_cols:
                 ch.command("ALTER TABLE analysis.pattern_features ADD COLUMN IF NOT EXISTS fii_fut_net_3d Float64 DEFAULT 0")
                 log.info("  Added fii_fut_net_3d column to pattern_features")
-            pf_insert = pf[[c for c in pf_cols + ["fii_fut_net_3d"] if c in pf.columns]]
+            pf_insert = pf[[c for c in list(dict.fromkeys(pf_cols + ["fii_fut_net_3d"])) if c in pf.columns]]
             ch.insert_df("analysis.pattern_features", pf_insert)
             log.info(f"  Updated {len(pf_insert)} pattern_feature rows with FII futures data")
 

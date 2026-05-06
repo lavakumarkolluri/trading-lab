@@ -1231,21 +1231,21 @@ elif page == "Paper Trades":
             strike = float(r["strike"])
             expiry = r["expiry"]
 
-            # Live mark-to-market from intraday chain (best-effort)
-            mark_df = query("""
+            # Live mark-to-market from intraday chain (best-effort, values are internal/trusted)
+            mark_df = query(f"""
                 SELECT sumIf(ltp, option_type='CE') + sumIf(ltp, option_type='PE') AS curr
                 FROM market.options_chain
-                WHERE symbol   = %(sym)s
-                  AND strike   = %(strike)s
-                  AND expiry   = %(expiry)s
+                WHERE symbol   = '{sym}'
+                  AND strike   = {strike}
+                  AND expiry   = '{expiry}'
                   AND toDate(timestamp) = today()
                   AND timestamp = (
                       SELECT max(timestamp) FROM market.options_chain
-                      WHERE symbol = %(sym)s AND toDate(timestamp) = today()
+                      WHERE symbol = '{sym}' AND toDate(timestamp) = today()
                   )
                 GROUP BY symbol
                 HAVING curr > 0
-            """, params={"sym": sym, "strike": strike, "expiry": str(expiry)})
+            """)
 
             curr_straddle  = float(mark_df["curr"].iloc[0]) if not mark_df.empty else None
             entry_premium  = float(r["entry_premium"])

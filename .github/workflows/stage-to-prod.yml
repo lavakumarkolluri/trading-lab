@@ -1,0 +1,61 @@
+name: Stage → Prod
+
+on:
+  push:
+    branches: [stage]
+  schedule:
+    # Daily Mon–Fri at 17:00 UTC (22:30 IST) — after EOD pipelines finish
+    - cron: '0 17 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Run test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: stage
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --timeout=30
+
+  merge-to-master:
+    name: Auto-merge stage → master
+    needs: test
+    runs-on: ubuntu-latest
+    if: ${{ success() }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Merge stage into master
+        run: |
+          git fetch origin
+          git checkout master
+          git merge --no-ff origin/stage \
+            -m "auto: merge stage → master [CI passed $(date -u +%Y-%m-%d)]"
+          git push origin master
+
+      - name: Tag the release
+        run: |
+          TAG="prod-$(date -u +%Y%m%d-%H%M)"
+          git tag "$TAG"
+          git push origin "$TAG"
