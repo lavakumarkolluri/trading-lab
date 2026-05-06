@@ -23,7 +23,7 @@ import os
 import math
 import logging
 import argparse
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import numpy as np
@@ -297,5 +297,44 @@ def main():
         print(f"{str(r[0]):>12} {r[1]:>8.0f} {r[2]:>8.0f} {r[3]:>7.2f} {r[4]:>7.3f}")
 
 
+GIT_SHA = os.getenv("GIT_SHA", "unknown")
+
+
+def _record_run(ch, status: str, started_at: datetime, error_msg: str = ""):
+    try:
+        ch.command(
+            """INSERT INTO system_meta.pipeline_runs
+               (service, started_at, finished_at, status, git_sha, error_msg)
+               VALUES ({svc:String},{start:DateTime},{end:DateTime},{st:String},{sha:String},{err:String})""",
+            parameters={"svc": "compute_oi_features", "start": started_at,
+                        "end": datetime.now(timezone.utc).replace(tzinfo=None),
+                        "st": status, "sha": GIT_SHA, "err": error_msg},
+        )
+    except Exception as e:
+        log.warning("pipeline_runs write failed: %s", e)
+
+
 if __name__ == "__main__":
-    main()
+    _started = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        main()
+        _ch = clickhouse_connect.get_client(
+            host=os.getenv("CH_HOST", "clickhouse"),
+            port=int(os.getenv("CH_PORT", "8123")),
+            username=os.getenv("CH_USER", "default"),
+            password=os.getenv("CH_PASSWORD", ""),
+        )
+        _record_run(_ch, "success", _started)
+    except Exception as _e:
+        log.error(f"compute_oi_features fatal: {_e}", exc_info=True)
+        try:
+            _ch = clickhouse_connect.get_client(
+                host=os.getenv("CH_HOST", "clickhouse"),
+                port=int(os.getenv("CH_PORT", "8123")),
+                username=os.getenv("CH_USER", "default"),
+                password=os.getenv("CH_PASSWORD", ""),
+            )
+            _record_run(_ch, "failed", _started, str(_e))
+        except Exception:
+            pass
+        raise
