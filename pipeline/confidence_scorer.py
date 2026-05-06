@@ -1009,11 +1009,11 @@ def main():
             best_type, is_pooled = compare_models(ch, mc)
 
             log.info(f"Training final model: {best_type} (pooled={is_pooled})")
+            target_syms = [args.symbol] if args.symbol else SYMBOLS
             if is_pooled:
                 pooled_df = build_dataset_pooled(ch)
                 train_final_model_pooled(pooled_df, mc, best_type)
             else:
-                target_syms = [args.symbol] if args.symbol else SYMBOLS
                 for sym in target_syms:
                     try:
                         df = build_dataset(ch, sym)
@@ -1021,6 +1021,14 @@ def main():
                             train_final_model(df, sym, mc, best_type)
                     except Exception as e:
                         log.error(f"[{sym}] failed: {e}", exc_info=True)
+
+            # Always score today after training so intraday_monitor has fresh scores
+            log.info("Scoring today after model update...")
+            for sym in target_syms:
+                try:
+                    score_today(ch, mc, sym)
+                except Exception as e:
+                    log.error(f"[{sym}] score_today failed: {e}", exc_info=True)
         else:
             symbols = [args.symbol] if args.symbol else SYMBOLS
             for sym in symbols:

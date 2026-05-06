@@ -1,0 +1,34 @@
+<clickhouse>
+    <!-- Cap system log tables to 7 days / 500MB each to prevent disk bloat -->
+    <query_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <max_size_rows>1000000</max_size_rows>
+        <reserved_size_rows>10000</reserved_size_rows>
+        <buffer_size_rows_flush_threshold>100000</buffer_size_rows_flush_threshold>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </query_log>
+    <text_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <max_size_rows>500000</max_size_rows>
+    </text_log>
+    <trace_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <max_size_rows>500000</max_size_rows>
+    </trace_log>
+    <part_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <max_size_rows>500000</max_size_rows>
+    </part_log>
+    <metric_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <max_size_rows>500000</max_size_rows>
+    </metric_log>
+    <asynchronous_metric_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <max_size_rows>500000</max_size_rows>
+    </asynchronous_metric_log>
+    <processors_profile_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+        <max_size_rows>500000</max_size_rows>
+    </processors_profile_log>
+</clickhouse>

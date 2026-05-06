@@ -47,6 +47,7 @@ services:
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - ./clickhouse/config/default-user.xml:/etc/clickhouse-server/users.d/trading-lab-user.xml
+      - ./clickhouse/config/log-retention.xml:/etc/clickhouse-server/config.d/log-retention.xml
     environment:
       CH_PASSWORD: ${CH_PASSWORD}
     ulimits:
