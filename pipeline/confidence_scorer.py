@@ -133,9 +133,10 @@ class ScorecardClassifier:
         iv_r = row.get("iv_rank", 50)
         s += 12 if iv_r > 70 else (6 if iv_r > 50 else (-8 if iv_r < 25 else 0))
 
-        # Volatility regime: India VIX
+        # Volatility regime: India VIX (0 means missing data — treat as neutral)
         vix = row.get("vix", 15)
-        s += 10 if vix < 13 else (4 if vix < 17 else (-8 if vix > 22 else (-16 if vix > 28 else 0)))
+        if vix > 0:
+            s += 10 if vix < 13 else (4 if vix < 17 else (-8 if vix > 22 else (-16 if vix > 28 else 0)))
 
         # Historical vol regime: ATR percentile (high = wide ranges, bad for sellers)
         atr_p = row.get("atr_percentile", 50)
@@ -145,9 +146,10 @@ class ScorecardClassifier:
         hv_r = row.get("hv_ratio", 1.0)
         s += -10 if hv_r > 1.3 else (6 if hv_r < 0.8 else 0)
 
-        # Options richness: IV/HV5 > 1.5 means options priced richly vs realized
+        # Options richness: IV/HV5 > 1.5 means options priced richly vs realized (0 = missing)
         ivhv = row.get("iv_hv5_ratio", 1.2)
-        s += 8 if ivhv > 1.5 else (-6 if ivhv < 0.8 else 0)
+        if ivhv > 0:
+            s += 8 if ivhv > 1.5 else (-6 if ivhv < 0.8 else 0)
 
         # Known events: data shows 77.4% win rate on event weeks (IV elevated, market stays in range)
         if row.get("event_in_window", 0) == 1:
@@ -988,6 +990,34 @@ def compare_models(ch, mc) -> tuple:
     return best_type, is_pooled
 
 
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+
+def _check_upstream_pipelines(ch) -> None:
+    """Warn if compute_oi_features or strategy_backtester haven't run today.
+    Scoring without fresh upstream data produces unreliable results (VIX/IV=0).
+    """
+    try:
+        result = ch.query_df("""
+            SELECT service, max(started_at) AS last_run
+            FROM system_meta.pipeline_runs
+            WHERE service IN ('compute_oi_features', 'strategy_backtester')
+              AND status = 'success'
+            GROUP BY service
+        """)
+        today = date.today()
+        for _, row in result.iterrows():
+            last = row["last_run"].date() if hasattr(row["last_run"], "date") else None
+            if last != today:
+                log.warning(
+                    f"[preflight] {row['service']} last ran on {last}, not today ({today}). "
+                    "Scores may use stale OI/IV data — run compute_oi_features first."
+                )
+            else:
+                log.info(f"[preflight] {row['service']} ✓ ran today")
+    except Exception as e:
+        log.warning(f"[preflight] could not check upstream pipelines: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_symbol(symbol, ch, mc, backtest_only, score_only, model_type="xgb"):
@@ -1019,6 +1049,8 @@ def main():
     mc = get_mc()
     if not mc.bucket_exists(MINIO_BUCKET):
         mc.make_bucket(MINIO_BUCKET)
+
+    _check_upstream_pipelines(ch)
 
     started_at = datetime.utcnow()
     try:
