@@ -77,15 +77,13 @@ def test_clickhouse_healthcheck_tests_auth(compose):
     )
 
 
-def test_clickhouse_has_official_password_env(compose):
-    """CH must set CLICKHOUSE_PASSWORD (official env) in addition to CH_PASSWORD.
-    from_env XML resolution can fail silently on container recreate; the official
-    env var sets the password directly via the entrypoint as belt-and-suspenders."""
+def test_clickhouse_has_ch_password_env(compose):
+    """CH must set CH_PASSWORD env var — used by from_env in trading-lab-user.xml."""
     ch = compose["services"].get("clickhouse", {})
     env = ch.get("environment", {})
     env_keys = list(env.keys()) if isinstance(env, dict) else [e.split("=")[0] for e in env]
-    assert "CLICKHOUSE_PASSWORD" in env_keys, (
-        "ClickHouse must set CLICKHOUSE_PASSWORD env var for reliable auth on recreate"
+    assert "CH_PASSWORD" in env_keys, (
+        "ClickHouse must set CH_PASSWORD env var (read by from_env in trading-lab-user.xml)"
     )
 
 
