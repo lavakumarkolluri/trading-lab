@@ -39,7 +39,7 @@ services:
     restart: unless-stopped
 
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:26.4
     container_name: clickhouse
     ports:
       - "8123:8123"
@@ -50,15 +50,20 @@ services:
       - ./clickhouse/config/log-retention.xml:/etc/clickhouse-server/config.d/log-retention.xml
     environment:
       CH_PASSWORD: ${CH_PASSWORD}
+      # Official CH env var — sets default user password directly via entrypoint,
+      # independent of from_env XML resolution. Belt-and-suspenders against recreate races.
+      CLICKHOUSE_PASSWORD: ${CH_PASSWORD}
     ulimits:
       nofile:
         soft: 262144
         hard: 262144
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
-      interval: 5s
-      timeout: 3s
+      # Tests actual auth, not just /ping — /ping returns 200 even with wrong password
+      test: ["CMD", "clickhouse-client", "--password", "${CH_PASSWORD}", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
       retries: 10
+      start_period: 30s
     restart: unless-stopped
 
   jupyter:
