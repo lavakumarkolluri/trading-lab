@@ -62,6 +62,43 @@ def test_compose_file_env_is_container_path(compose):
                 )
 
 
+def test_clickhouse_healthcheck_tests_auth(compose):
+    """CH healthcheck must test auth (clickhouse-client), not just /ping.
+    /ping returns 200 even with wrong password — dependent containers would
+    start and fail with auth error 194, as happened May 7-10 2026."""
+    ch = compose["services"].get("clickhouse", {})
+    hc = ch.get("healthcheck", {})
+    test_cmd = str(hc.get("test", ""))
+    assert "clickhouse-client" in test_cmd, (
+        "CH healthcheck must use clickhouse-client to verify auth, not wget /ping"
+    )
+    assert "password" in test_cmd.lower(), (
+        "CH healthcheck must pass --password to actually test authentication"
+    )
+
+
+def test_clickhouse_has_official_password_env(compose):
+    """CH must set CLICKHOUSE_PASSWORD (official env) in addition to CH_PASSWORD.
+    from_env XML resolution can fail silently on container recreate; the official
+    env var sets the password directly via the entrypoint as belt-and-suspenders."""
+    ch = compose["services"].get("clickhouse", {})
+    env = ch.get("environment", {})
+    env_keys = list(env.keys()) if isinstance(env, dict) else [e.split("=")[0] for e in env]
+    assert "CLICKHOUSE_PASSWORD" in env_keys, (
+        "ClickHouse must set CLICKHOUSE_PASSWORD env var for reliable auth on recreate"
+    )
+
+
+def test_clickhouse_image_is_pinned(compose):
+    """CH image must be pinned to a specific version, not :latest.
+    :latest can pull a breaking change silently."""
+    ch = compose["services"].get("clickhouse", {})
+    image = ch.get("image", "")
+    assert ":latest" not in image, (
+        f"ClickHouse image must be pinned (e.g. 26.4), not :latest. Got: {image}"
+    )
+
+
 def test_all_pipeline_services_have_clickhouse_dependency(compose):
     """Pipeline run-once services must wait for clickhouse to be healthy."""
     # Long-running daemons (scheduler, dashboard) manage their own retry/reconnect;
