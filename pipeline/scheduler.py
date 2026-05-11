@@ -111,10 +111,27 @@ def _compose(args: list, timeout: int = 300):
     subprocess.run(_COMPOSE_BASE + args, check=False, timeout=timeout)
 
 
+_DEPLOY_SHA_FILE = "/tmp/auto_deploy_last_sha"
+
+
+def _get_last_deployed_sha() -> str:
+    """Read the last SHA we deployed from origin/master; empty string if unknown."""
+    try:
+        with open(_DEPLOY_SHA_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def _save_deployed_sha(sha: str) -> None:
+    with open(_DEPLOY_SHA_FILE, "w") as f:
+        f.write(sha)
+
+
 def job_auto_deploy():
     """
-    Pull latest master from GitHub, detect changed files, rebuild affected
-    images, and restart services — all without any manual intervention.
+    Poll origin/master every 15 min. On new commits, detect changed files,
+    rebuild affected images, and self-restart — without touching the local branch.
 
     Rebuild rules:
       pipeline/**               → rebuild pipeline image → self-exit (restart policy
@@ -126,17 +143,10 @@ def job_auto_deploy():
       docker-compose.yml        → docker compose up -d (apply config changes)
       anything else             → log only
 
-    Runs every 15 minutes. No-op if already on latest commit.
+    Never merges or checks out — safe to run while local branch is on stage.
     """
     try:
-        # ── Current HEAD ─────────────────────────────────────────────────────
-        r = _git(["rev-parse", "HEAD"])
-        if r.returncode != 0:
-            log.warning("AUTO-DEPLOY: git rev-parse HEAD failed — is %s a git repo?", _GIT_DIR)
-            return
-        old_sha = r.stdout.strip()
-
-        # ── Fetch latest master ───────────────────────────────────────────────
+        # ── Fetch latest master (no working-tree changes) ─────────────────────
         if _GITHUB_TOKEN:
             remote = (
                 f"https://{_GITHUB_TOKEN}@github.com/"
@@ -151,6 +161,17 @@ def job_auto_deploy():
             return
 
         new_sha = _git(["rev-parse", "origin/master"]).stdout.strip()
+        if not new_sha:
+            log.warning("AUTO-DEPLOY: could not resolve origin/master SHA")
+            return
+
+        old_sha = _get_last_deployed_sha()
+        if not old_sha:
+            # First run — record current master, nothing to deploy yet
+            _save_deployed_sha(new_sha)
+            log.info("AUTO-DEPLOY: initialised — tracking origin/master at %s", new_sha[:8])
+            return
+
         if old_sha == new_sha:
             return  # already up to date
 
@@ -162,14 +183,7 @@ def job_auto_deploy():
         log.info("AUTO-DEPLOY: %d file(s) changed: %s",
                  len(changed), ", ".join(changed[:15]))
 
-        # ── Fast-forward merge ────────────────────────────────────────────────
-        merge = _git(["merge", "--ff-only", "origin/master"])
-        if merge.returncode != 0:
-            log.warning("AUTO-DEPLOY: merge failed (diverged history?): %s",
-                        merge.stderr.strip()[:200])
-            return
-
-        log.info("AUTO-DEPLOY: merged to %s", new_sha[:8])
+        _save_deployed_sha(new_sha)
 
         # ── Rebuild dashboard if its infra files changed ──────────────────────
         dashboard_infra = {"dashboard/Dockerfile", "dashboard/requirements.txt"}
