@@ -704,6 +704,21 @@ services:
     entrypoint: ["python", "fundamental_pipeline.py"]
     command: []
 
+  monthly_breakout_backtest:
+    build: *pipeline-build
+    container_name: monthly_breakout_backtest
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "monthly_breakout_backtest.py"]
+    command: []
+
   data_freshness_check:
     build: *pipeline-build
     container_name: data_freshness_check

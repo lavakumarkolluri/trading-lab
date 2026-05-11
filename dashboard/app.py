@@ -83,6 +83,7 @@ page = st.sidebar.radio("Navigate", [
     "Market Pulse",
     "Live Trading",
     "Paper Trades",
+    "Breakout Backtest",
     "Data Freshness",
 ])
 st.sidebar.markdown("---")
@@ -1373,6 +1374,186 @@ elif page == "Paper Trades":
             st.dataframe(
                 hist_df[["trade_date","symbol","strike","exit_reason",
                           "entry_premium","exit_premium","pnl_pts","pnl_inr","scorecard_conf"]],
+                use_container_width=True, hide_index=True,
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Breakout Backtest":
+    st.title("Monthly Breakout — Hypothesis Backtest")
+    st.caption(
+        "Entry: monthly close > max(high) of prior 3 months · "
+        "Exit: 2× target OR daily close < prior week's low · "
+        "Universe: Indian market (178 stocks, 1996–present)"
+    )
+
+    trades = query("""
+        SELECT symbol, entry_date, exit_date, entry_price, exit_price,
+               exit_reason, holding_days, return_pct, xirr_annualized
+        FROM analysis.monthly_breakout_trades FINAL
+        ORDER BY entry_date
+    """)
+
+    if trades.empty:
+        st.warning("No backtest results yet. Run: `docker compose run --rm monthly_breakout_backtest`")
+    else:
+        trades["entry_date"] = pd.to_datetime(trades["entry_date"])
+        trades["exit_date"]  = pd.to_datetime(trades["exit_date"])
+        trades["xirr_pct"]   = trades["xirr_annualized"] * 100
+
+        n          = len(trades)
+        n_target   = (trades["exit_reason"] == "target").sum()
+        n_stop     = (trades["exit_reason"] == "stop").sum()
+        avg_ret    = trades["return_pct"].mean()
+        med_ret    = trades["return_pct"].median()
+        avg_hold   = trades["holding_days"].mean()
+        med_xirr   = trades["xirr_pct"].median()
+
+        # Monthly Sharpe
+        trades["exit_month"] = trades["exit_date"].dt.to_period("M")
+        monthly_ret = trades.groupby("exit_month")["return_pct"].mean()
+        all_months  = pd.period_range(monthly_ret.index.min(), monthly_ret.index.max(), freq="M")
+        monthly_ret = monthly_ret.reindex(all_months, fill_value=0.0)
+        sharpe = (monthly_ret.mean() / monthly_ret.std() * 12 ** 0.5) if monthly_ret.std() > 0 else 0
+
+        # ── KPI row ───────────────────────────────────────────────────────────
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Total trades", f"{n:,}")
+        c2.metric("Win rate (2×)", f"{n_target/n*100:.1f}%")
+        c3.metric("Avg return", f"{avg_ret:.2f}%", delta=f"med {med_ret:.2f}%")
+        c4.metric("Avg hold", f"{avg_hold:.0f}d")
+        c5.metric("Median XIRR", f"{med_xirr:.1f}%")
+        c6.metric("Sharpe", f"{sharpe:.2f}")
+
+        verdict = "POSITIVE" if avg_ret > 0 and sharpe > 0.5 else ("MARGINAL" if avg_ret > 0 else "NEGATIVE")
+        color   = {"POSITIVE": "success", "MARGINAL": "warning", "NEGATIVE": "error"}[verdict]
+        getattr(st, color)(
+            f"Verdict: **{verdict}** — "
+            f"{n_target} trades hit 2× target ({n_target/n*100:.1f}%), "
+            f"{n_stop} stopped out ({n_stop/n*100:.1f}%). "
+            f"Median return {med_ret:.2f}%, Sharpe {sharpe:.2f}."
+        )
+
+        st.markdown("---")
+
+        # ── Return distribution ───────────────────────────────────────────────
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.subheader("Return distribution")
+            fig_dist = go.Figure()
+            for reason, color_val in [("target", "#4caf50"), ("stop", "#f44336")]:
+                sub = trades[trades["exit_reason"] == reason]["return_pct"]
+                fig_dist.add_trace(go.Histogram(
+                    x=sub, name=reason.capitalize(),
+                    marker_color=color_val, opacity=0.7,
+                    xbins=dict(size=2),
+                ))
+            fig_dist.update_layout(
+                barmode="overlay",
+                xaxis_title="Return (%)", yaxis_title="Trades",
+                legend=dict(x=0.7, y=0.95),
+                height=350, margin=dict(t=20, b=40),
+                plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                font_color="white",
+            )
+            st.plotly_chart(fig_dist, use_container_width=True)
+
+        with col_b:
+            st.subheader("Holding period distribution")
+            fig_hold = go.Figure()
+            for reason, color_val in [("target", "#4caf50"), ("stop", "#f44336")]:
+                sub = trades[trades["exit_reason"] == reason]["holding_days"]
+                fig_hold.add_trace(go.Histogram(
+                    x=sub, name=reason.capitalize(),
+                    marker_color=color_val, opacity=0.7,
+                    xbins=dict(size=10),
+                ))
+            fig_hold.update_layout(
+                barmode="overlay",
+                xaxis_title="Holding days", yaxis_title="Trades",
+                legend=dict(x=0.7, y=0.95),
+                height=350, margin=dict(t=20, b=40),
+                plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                font_color="white",
+            )
+            st.plotly_chart(fig_hold, use_container_width=True)
+
+        # ── Cumulative equity curve ───────────────────────────────────────────
+        st.subheader("Cumulative return (equal-weight, ₹1 per trade)")
+        trades_sorted = trades.sort_values("exit_date")
+        trades_sorted["cum_return"] = (1 + trades_sorted["return_pct"] / 100).cumprod()
+
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(
+            x=trades_sorted["exit_date"],
+            y=trades_sorted["cum_return"],
+            mode="lines",
+            line=dict(color="#2196f3", width=1.5),
+            name="Equity curve",
+        ))
+        fig_eq.add_hline(y=1.0, line_dash="dash", line_color="gray", annotation_text="Breakeven")
+        fig_eq.update_layout(
+            xaxis_title="Exit date", yaxis_title="Portfolio value (₹1 start)",
+            height=350, margin=dict(t=20, b=40),
+            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+            font_color="white",
+        )
+        st.plotly_chart(fig_eq, use_container_width=True)
+
+        # ── Annualised XIRR by year ───────────────────────────────────────────
+        st.subheader("Median XIRR by entry year")
+        trades["entry_year"] = trades["entry_date"].dt.year
+        yearly = trades.groupby("entry_year").agg(
+            trades=("return_pct", "count"),
+            median_xirr=("xirr_pct", "median"),
+            win_rate=("exit_reason", lambda x: (x == "target").mean() * 100),
+        ).reset_index()
+
+        fig_yr = go.Figure()
+        fig_yr.add_trace(go.Bar(
+            x=yearly["entry_year"],
+            y=yearly["median_xirr"],
+            marker_color=yearly["median_xirr"].apply(lambda v: "#4caf50" if v > 0 else "#f44336"),
+            name="Median XIRR %",
+            text=yearly["trades"].apply(lambda v: f"{v}t"),
+            textposition="outside",
+        ))
+        fig_yr.update_layout(
+            xaxis_title="Entry year", yaxis_title="Median XIRR (%)",
+            height=350, margin=dict(t=30, b=40),
+            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+            font_color="white",
+        )
+        st.plotly_chart(fig_yr, use_container_width=True)
+
+        # ── Top winning and losing stocks ─────────────────────────────────────
+        col_w, col_l = st.columns(2)
+        sym_stats = trades.groupby("symbol").agg(
+            trades=("return_pct", "count"),
+            avg_ret=("return_pct", "mean"),
+            win_rate=("exit_reason", lambda x: (x == "target").mean() * 100),
+        ).reset_index().sort_values("avg_ret", ascending=False)
+
+        with col_w:
+            st.subheader("Top 10 symbols by avg return")
+            st.dataframe(sym_stats.head(10)[["symbol", "trades", "avg_ret", "win_rate"]]
+                         .rename(columns={"avg_ret": "avg_ret_%", "win_rate": "win_%"})
+                         .round(2),
+                         use_container_width=True, hide_index=True)
+        with col_l:
+            st.subheader("Bottom 10 symbols")
+            st.dataframe(sym_stats.tail(10)[["symbol", "trades", "avg_ret", "win_rate"]]
+                         .rename(columns={"avg_ret": "avg_ret_%", "win_rate": "win_%"})
+                         .round(2),
+                         use_container_width=True, hide_index=True)
+
+        with st.expander("All trades"):
+            st.dataframe(
+                trades[["symbol", "entry_date", "exit_date", "holding_days",
+                         "entry_price", "exit_price", "return_pct", "xirr_pct", "exit_reason"]]
+                .sort_values("entry_date", ascending=False)
+                .round(2),
                 use_container_width=True, hide_index=True,
             )
 
