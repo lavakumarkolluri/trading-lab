@@ -222,10 +222,29 @@ def compute_sharpe(trades_df: pd.DataFrame) -> float:
     return (mean_r / std_r) * (12 ** 0.5)   # annualized
 
 
+def fetch_quality_symbols(ch) -> set:
+    """
+    Return symbols that pass fundamental quality gate:
+      - PE > 0 (profitable, not loss-making)
+      - ROE > 5%
+      - profit_margins > 0
+    Symbols not in fundamental_snapshot are excluded (no data = unknown quality).
+    """
+    result = ch.query(
+        "SELECT symbol FROM market.fundamental_snapshot FINAL "
+        "WHERE pe_ratio > 0 AND roe > 0.05 AND profit_margins > 0"
+    )
+    quality = {row[0] for row in result.result_rows}
+    log.info("Quality filter: %d symbols pass (PE>0, ROE>5%%, margins>0)", len(quality))
+    return quality
+
+
 def run_backtest(ch) -> pd.DataFrame:
     daily = fetch_daily(ch)
-    symbols = daily["symbol"].unique()
-    log.info("Running backtest on %d symbols...", len(symbols))
+    quality = fetch_quality_symbols(ch)
+    all_symbols = daily["symbol"].unique()
+    symbols = [s for s in all_symbols if s in quality]
+    log.info("Universe: %d → %d after quality filter", len(all_symbols), len(symbols))
 
     all_trades = []
     for i, sym in enumerate(symbols, 1):
