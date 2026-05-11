@@ -77,13 +77,16 @@ def test_clickhouse_healthcheck_tests_auth(compose):
     )
 
 
-def test_clickhouse_has_ch_password_env(compose):
-    """CH must set CH_PASSWORD env var — used by from_env in trading-lab-user.xml."""
+def test_clickhouse_has_required_password_envs(compose):
+    """CH must set both CH_PASSWORD and CLICKHOUSE_PASSWORD.
+    v26 entrypoint disables network access for default user if CLICKHOUSE_PASSWORD
+    is absent — from_env XML config alone is not sufficient."""
     ch = compose["services"].get("clickhouse", {})
     env = ch.get("environment", {})
     env_keys = list(env.keys()) if isinstance(env, dict) else [e.split("=")[0] for e in env]
-    assert "CH_PASSWORD" in env_keys, (
-        "ClickHouse must set CH_PASSWORD env var (read by from_env in trading-lab-user.xml)"
+    assert "CH_PASSWORD" in env_keys, "CH_PASSWORD missing — used by from_env in trading-lab-user.xml"
+    assert "CLICKHOUSE_PASSWORD" in env_keys, (
+        "CLICKHOUSE_PASSWORD missing — v26 entrypoint disables network access without it"
     )
 
 
