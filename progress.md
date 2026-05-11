@@ -16,9 +16,9 @@
 
 ## PERFORMANCE
 
-### PERF-002 🟡 🔲 OPEN — SIP XIRR O(n × months) dominant runtime
+### PERF-002 🟡 ✅ FIXED — SIP XIRR O(n × months) dominant runtime
 **File:** `pipeline/mf_compute_returns.py`
-**Fix:** Pre-compute monthly cash flows, forward-fill within month. Deferred — not blocking.
+**Fix:** Compute XIRR once per unique calendar month using pre-built nav_map + binary search; forward-fill within month. ~20× speedup (10yr dataset: <1s vs ~20s). Fixed 2026-05-11.
 
 ---
 
