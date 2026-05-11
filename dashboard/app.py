@@ -83,6 +83,7 @@ page = st.sidebar.radio("Navigate", [
     "Market Pulse",
     "Live Trading",
     "Paper Trades",
+    "Data Freshness",
 ])
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Auto-refresh: 60s | Capital: {fmt_inr(STARTING_CAPITAL)}")
@@ -1374,6 +1375,159 @@ elif page == "Paper Trades":
                           "entry_premium","exit_premium","pnl_pts","pnl_inr","scorecard_conf"]],
                 use_container_width=True, hide_index=True,
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Data Freshness":
+    from datetime import date as _date, timedelta as _td
+    st.title("Data Freshness")
+    st.caption("Staleness thresholds: OHLCV 3d · Options chain 4d · VIX 4d · MF NAV 5d · Per-symbol lag 10d vs market max")
+
+    today = _date.today()
+
+    # ── Source-level freshness ────────────────────────────────────────────────
+    st.subheader("Source freshness")
+
+    ohlcv_df = query(
+        "SELECT market, max(date) as last_date FROM market.ohlcv_daily FINAL GROUP BY market ORDER BY market"
+    )
+    mf_df = query("SELECT max(date) as last_date FROM market.mf_nav FINAL")
+    vix_df = query("SELECT max(toDate(timestamp)) as last_date FROM market.nifty_live FINAL")
+    chain_df = query(
+        "SELECT symbol, max(toDate(timestamp)) as last_date "
+        "FROM market.options_chain FINAL WHERE toHour(timestamp) = 15 GROUP BY symbol ORDER BY symbol"
+    )
+
+    THRESHOLDS = {
+        "ohlcv":   3,
+        "mf_nav":  5,
+        "vix":     4,
+        "options": 4,
+    }
+
+    rows = []
+
+    for _, r in ohlcv_df.iterrows():
+        last = r["last_date"]
+        if hasattr(last, "date"):
+            last = last.date()
+        stale = (today - last).days
+        rows.append({
+            "Source": f"ohlcv_daily [{r['market']}]",
+            "Last date": str(last),
+            "Days stale": stale,
+            "Threshold": THRESHOLDS["ohlcv"],
+            "Status": "OK" if stale <= THRESHOLDS["ohlcv"] else "STALE",
+        })
+
+    if not mf_df.empty:
+        last = mf_df.iloc[0]["last_date"]
+        if hasattr(last, "date"):
+            last = last.date()
+        stale = (today - last).days
+        rows.append({
+            "Source": "mf_nav",
+            "Last date": str(last),
+            "Days stale": stale,
+            "Threshold": THRESHOLDS["mf_nav"],
+            "Status": "OK" if stale <= THRESHOLDS["mf_nav"] else "STALE",
+        })
+
+    if not vix_df.empty:
+        last = vix_df.iloc[0]["last_date"]
+        if hasattr(last, "date"):
+            last = last.date()
+        stale = (today - last).days
+        rows.append({
+            "Source": "nifty_live (VIX)",
+            "Last date": str(last),
+            "Days stale": stale,
+            "Threshold": THRESHOLDS["vix"],
+            "Status": "OK" if stale <= THRESHOLDS["vix"] else "STALE",
+        })
+
+    for _, r in chain_df.iterrows():
+        last = r["last_date"]
+        if hasattr(last, "date"):
+            last = last.date()
+        stale = (today - last).days
+        rows.append({
+            "Source": f"options_chain [{r['symbol']}]",
+            "Last date": str(last),
+            "Days stale": stale,
+            "Threshold": THRESHOLDS["options"],
+            "Status": "OK" if stale <= THRESHOLDS["options"] else "STALE",
+        })
+
+    src_df = pd.DataFrame(rows)
+
+    def _color_status(val):
+        return "background-color: #1a3a1a; color: #4caf50" if val == "OK" else "background-color: #3a1a1a; color: #f44336"
+
+    def _color_stale(val):
+        if val <= 1:
+            return "color: #4caf50"
+        if val <= 4:
+            return "color: #ff9800"
+        return "color: #f44336"
+
+    styled = (
+        src_df.style
+        .applymap(_color_status, subset=["Status"])
+        .applymap(_color_stale, subset=["Days stale"])
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    n_stale = (src_df["Status"] == "STALE").sum()
+    if n_stale == 0:
+        st.success("All sources are fresh")
+    else:
+        st.error(f"{n_stale} source(s) are stale — auto-fix runs daily at 19:00 IST")
+
+    # ── Per-symbol lag table ──────────────────────────────────────────────────
+    st.subheader("Symbols lagging >10 days behind market max")
+    sym_df = query("""
+        SELECT market, symbol, last_date, market_max,
+               toInt32(dateDiff('day', last_date, market_max)) as days_behind
+        FROM (
+          SELECT market, symbol, max(date) as last_date
+          FROM market.ohlcv_daily FINAL GROUP BY market, symbol
+        ) t
+        JOIN (
+          SELECT market, max(date) as market_max
+          FROM market.ohlcv_daily FINAL GROUP BY market
+        ) m USING (market)
+        WHERE dateDiff('day', last_date, market_max) > 10
+        ORDER BY market, days_behind DESC
+        LIMIT 200
+    """)
+    if sym_df.empty:
+        st.success("No symbols lagging behind their market")
+    else:
+        st.warning(f"{len(sym_df)} symbol(s) lagging — may need manual investigation")
+        st.dataframe(sym_df, use_container_width=True, hide_index=True)
+
+    # ── Pipeline run history ──────────────────────────────────────────────────
+    st.subheader("Recent pipeline runs (last 7 days)")
+    runs_df = query("""
+        SELECT service, run_date, status, duration_s, error_msg
+        FROM system_meta.pipeline_runs FINAL
+        WHERE run_date >= today() - 7
+        ORDER BY run_date DESC, service
+    """)
+    if runs_df.empty:
+        st.info("No pipeline run records found")
+    else:
+        def _run_color(val):
+            if val == "success":
+                return "background-color: #1a3a1a; color: #4caf50"
+            if val == "partial_failure":
+                return "background-color: #3a2a0a; color: #ff9800"
+            return "background-color: #3a1a1a; color: #f44336"
+        st.dataframe(
+            runs_df.style.applymap(_run_color, subset=["status"]),
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
