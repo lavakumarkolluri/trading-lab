@@ -112,3 +112,27 @@ def test_all_pipeline_services_have_clickhouse_dependency(compose):
         deps = svc.get("depends_on", {})
         if isinstance(deps, dict):
             assert "clickhouse" in deps, f"Service '{name}' missing depends_on clickhouse"
+
+
+def test_long_running_services_have_healthcheck(compose):
+    """OPS-012: intraday_monitor and option_chain_intraday must have healthchecks.
+    Without them, a hung container looks healthy to Docker — no alert fires."""
+    for svc_name in ("intraday_monitor", "option_chain_intraday"):
+        svc = compose["services"].get(svc_name, {})
+        hc = svc.get("healthcheck", {})
+        assert hc, f"Service '{svc_name}' has no healthcheck — OPS-012"
+        test_cmd = str(hc.get("test", ""))
+        assert "heartbeat" in test_cmd, (
+            f"Service '{svc_name}' healthcheck must check heartbeat file, got: {test_cmd}"
+        )
+
+
+def test_migration_055_ttl_file_exists():
+    """OPS-010: migration 055 adding TTL to market.options_chain must exist."""
+    import os, glob
+    migrations_dir = os.path.join(os.path.dirname(__file__), "..", "clickhouse", "migrations")
+    files = glob.glob(os.path.join(migrations_dir, "055_*.sql"))
+    assert files, "Migration 055 (options_chain TTL) not found — OPS-010"
+    with open(files[0]) as f:
+        content = f.read()
+    assert "TTL" in content.upper(), "Migration 055 must contain TTL clause"

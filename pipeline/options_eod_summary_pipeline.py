@@ -66,21 +66,34 @@ def _has_symbol_col(ch) -> bool:
     return "symbol" in cols
 
 
+_VALID_SYMBOL_RE = __import__("re").compile(r"^[A-Z]{2,20}$")
+
+
+def _validate_symbol(symbol: str) -> str:
+    if not _VALID_SYMBOL_RE.match(symbol):
+        raise ValueError(f"Invalid symbol: {symbol!r}")
+    return symbol
+
+
 def fetch_dates(ch, symbol: str, from_date: date) -> list[date]:
+    _validate_symbol(symbol)
     rows = ch.query(
-        f"SELECT DISTINCT toDate(timestamp) as d "
-        f"FROM market.options_chain "
-        f"WHERE symbol='{symbol}' AND toDate(timestamp) >= '{from_date}' "
-        f"ORDER BY d"
+        "SELECT DISTINCT toDate(timestamp) as d "
+        "FROM market.options_chain "
+        "WHERE symbol={sym:String} AND toDate(timestamp) >= {fd:Date} "
+        "ORDER BY d",
+        parameters={"sym": symbol, "fd": from_date},
     ).result_rows
     return [r[0] for r in rows]
 
 
 def fetch_chain_for_date(ch, symbol: str, d: date) -> pd.DataFrame:
+    _validate_symbol(symbol)
     df = ch.query_df(
-        f"SELECT expiry, strike, option_type, ltp, oi, iv "
-        f"FROM market.options_chain FINAL "
-        f"WHERE symbol='{symbol}' AND toDate(timestamp)='{d}' AND oi > 0"
+        "SELECT expiry, strike, option_type, ltp, oi, iv "
+        "FROM market.options_chain FINAL "
+        "WHERE symbol={sym:String} AND toDate(timestamp)={d:Date} AND oi > 0",
+        parameters={"sym": symbol, "d": d},
     )
     return df
 
@@ -239,8 +252,9 @@ def main():
 
         # Skip already computed dates
         done = ch.query(
-            f"SELECT DISTINCT date FROM market.options_eod_summary FINAL "
-            f"WHERE date >= '{from_date}'"
+            "SELECT DISTINCT date FROM market.options_eod_summary FINAL "
+            "WHERE date >= {fd:Date}",
+            parameters={"fd": from_date},
         ).result_rows
         done_dates = {r[0] for r in done}
         dates = [d for d in dates if d not in done_dates]

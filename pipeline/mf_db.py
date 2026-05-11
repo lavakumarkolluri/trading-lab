@@ -75,14 +75,14 @@ def fetch_nav_for_scheme(ch, scheme_code: int,
     if from_date is not None:
         warmup_start = from_date - timedelta(days=warmup_days)
         result = ch.query(
-            "SELECT date, nav FROM market.mf_nav "
+            "SELECT date, nav FROM market.mf_nav FINAL "
             "WHERE scheme_code = {code:UInt32} AND date >= {d:Date} "
             "ORDER BY date",
             parameters={"code": scheme_code, "d": warmup_start}
         )
     else:
         result = ch.query(
-            "SELECT date, nav FROM market.mf_nav "
+            "SELECT date, nav FROM market.mf_nav FINAL "
             "WHERE scheme_code = {code:UInt32} "
             "ORDER BY date",
             parameters={"code": scheme_code}

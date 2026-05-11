@@ -168,11 +168,15 @@ def fetch_yfinance(from_date: date, to_date: date) -> pd.DataFrame:
     nifty_raw = _flatten(nifty_raw)
 
     df = pd.DataFrame({"vix": vix_raw["Close"]})
-    df["nifty_spot"] = nifty_raw["Close"] if not nifty_raw.empty else 0.0
+    df["nifty_spot"] = nifty_raw["Close"] if not nifty_raw.empty else float("nan")
     df.index = pd.to_datetime(df.index).date
     df.index.name = "date"
     df = df.dropna(subset=["vix"])
     df = df[df["vix"] > 0]
+    zero_spot = (df["nifty_spot"].isna() | (df["nifty_spot"] <= 0)).sum()
+    if zero_spot > 0:
+        log.warning(f"{zero_spot} rows have missing/zero nifty_spot — filling 0.0 for storage")
+    df["nifty_spot"] = df["nifty_spot"].fillna(0.0)
     return df.reset_index()
 
 
@@ -183,16 +187,22 @@ def insert_nifty_live(ch, df: pd.DataFrame):
         return
     now_ts = int(datetime.now().timestamp())
     rows = []
+    skipped = 0
     for _, row in df.iterrows():
+        spot = float(row.get("nifty_spot") or 0.0)
+        if spot <= 0:
+            skipped += 1
         dt = datetime(row["date"].year, row["date"].month, row["date"].day, 10, 0, 0)
         rows.append({
             "timestamp":       dt,
-            "nifty_spot":      float(row.get("nifty_spot") or 0.0),
+            "nifty_spot":      spot,
             "vix":             float(row["vix"]),
             "pcr":             0.0,
             "advance_decline": 0.0,
             "version":         now_ts,
         })
+    if skipped:
+        log.warning(f"{skipped} rows inserted with nifty_spot=0 (yfinance returned no data)")
     ch.insert_df("market.nifty_live", pd.DataFrame(rows))
     log.info(f"Inserted {len(rows)} rows → market.nifty_live")
 
