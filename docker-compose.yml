@@ -585,6 +585,10 @@ services:
     container_name: dashboard
     ports:
       - "8501:8501"
+    volumes:
+      # Mount app.py directly so edits are picked up by Streamlit hot-reload
+      # without rebuilding the image.
+      - ./dashboard/app.py:/app/app.py:ro
     environment:
       - CH_HOST=clickhouse
       - CH_PORT=8123
