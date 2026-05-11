@@ -74,5 +74,6 @@ COPY strategy_backtester.py .
 COPY strategy_selector.py .
 COPY events_pipeline.py .
 COPY intraday_monitor.py .
+COPY data_freshness_check.py .
 
 CMD ["python", "main.py"]

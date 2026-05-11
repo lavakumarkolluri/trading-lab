@@ -347,6 +347,12 @@ def job_option_chain_eod():
     _run("vix_pipeline")                    # VIX + market regime (required by confidence_scorer)
 
 
+def job_data_freshness_check():
+    """Daily data quality watchdog — runs after EOD pipelines complete."""
+    log.info("=== Data freshness check triggered ===")
+    _run("data_freshness_check")
+
+
 def _startup_recovery():
     """
     On scheduler restart, check if today's critical EOD jobs were missed.
@@ -453,6 +459,7 @@ def main():
     log.info("  Lot sizes           : Sun     05:00 UTC (10:30 IST)")
     log.info("  Confidence scorer   : Sun     07:00 UTC (12:30 IST) --compare (90 min after backtester)")
     log.info("  Strategy selector   : Sun     08:00 UTC (13:30 IST) --backtest")
+    log.info("  Data freshness check: Mon-Fri 13:30 UTC (19:00 IST) auto-fix stale sources")
     log.info("  Outcome fill-back   : Mon-Fri 14:00 UTC (19:30 IST) --fill-outcomes (marks yesterday's recommendations)")
     log.info("  Strategy recommend  : Mon-Thu 10:30 UTC (16:00 IST) --recommend")
     log.info("  FII/DII + ParticOI  : Mon-Fri 10:45 UTC (16:15 IST) pre-feed for meta_pipeline")
@@ -494,6 +501,10 @@ def main():
     # Daily recommendation: 30 min before market open (10:30 UTC = 16:00 IST)
     for day in ("monday", "tuesday", "wednesday", "thursday"):
         getattr(schedule.every(), day).at("10:30").do(job_strategy_selector_recommend)
+
+    # Data freshness watchdog: after all EOD pipelines (13:30 UTC = 19:00 IST)
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("13:30").do(job_data_freshness_check)
 
     # Outcome fill-back: after EOD pipeline (14:00 UTC = 19:30 IST)
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):

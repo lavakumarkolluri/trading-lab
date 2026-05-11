@@ -392,8 +392,9 @@ def main():
         return
 
     today = date.today()
-    # Default: don't include today (market may still be open / bhavcopy not yet published)
-    to_date   = date.fromisoformat(args.to_date) if args.to_date else today - timedelta(days=1)
+    # Include today when running after market close (bhavcopy published by ~17:00 IST = 11:30 UTC).
+    # If NSE hasn't published yet, download_bhavcopy returns None → "no file" skip, which is safe.
+    to_date   = date.fromisoformat(args.to_date) if args.to_date else today
     from_date = (date.fromisoformat(args.from_date) if args.from_date
                  else today - timedelta(days=LOOKBACK_DAYS))
 
