@@ -98,9 +98,11 @@ def _record_run(service: str, started_at: datetime, status: str,
 
 def _git(args: list, timeout: int = 30) -> subprocess.CompletedProcess:
     """Run a git command inside the project directory."""
+    env = os.environ.copy()
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
     return subprocess.run(
-        ["git", "-C", _GIT_DIR] + args,
-        capture_output=True, text=True, timeout=timeout,
+        ["git", "-C", _GIT_DIR, "-c", f"safe.directory={_GIT_DIR}"] + args,
+        capture_output=True, text=True, timeout=timeout, env=env,
     )
 
 
