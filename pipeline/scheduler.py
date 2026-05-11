@@ -37,14 +37,23 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+import sys
+
 _COMPOSE_FILE = os.getenv("COMPOSE_FILE", "docker-compose.yml")
 _PROJECT_DIR  = os.path.dirname(_COMPOSE_FILE) if "/" in _COMPOSE_FILE else "."
+_GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+_GIT_DIR      = _PROJECT_DIR  # /trading-lab inside container
 
 COMPOSE_CMD = [
     "docker", "compose",
     "-f", _COMPOSE_FILE,
     "--project-directory", _PROJECT_DIR,
     "run", "--rm",
+]
+_COMPOSE_BASE = [
+    "docker", "compose",
+    "-f", _COMPOSE_FILE,
+    "--project-directory", _PROJECT_DIR,
 ]
 
 try:
@@ -87,25 +96,105 @@ def _record_run(service: str, started_at: datetime, status: str,
         log.warning("pipeline_runs write failed for %s: %s", service, e)
 
 
-def _check_sha_drift():
-    if not _TRACKING_OK:
-        return
+def _git(args: list, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run a git command inside the project directory."""
+    return subprocess.run(
+        ["git", "-C", _GIT_DIR] + args,
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _compose(args: list, timeout: int = 300):
+    """Run a docker compose command (build / up -d / etc.)."""
+    subprocess.run(_COMPOSE_BASE + args, check=False, timeout=timeout)
+
+
+def job_auto_deploy():
+    """
+    Pull latest master from GitHub, detect changed files, rebuild affected
+    images, and restart services — all without any manual intervention.
+
+    Rebuild rules:
+      pipeline/**               → rebuild pipeline image → self-exit (restart policy
+                                   brings new scheduler up; one-shot services pick up
+                                   new image on next scheduled run automatically)
+      dashboard/Dockerfile      → rebuild + restart dashboard container
+      dashboard/requirements.txt→ rebuild + restart dashboard container
+      dashboard/app.py          → no-op (volume-mounted, Streamlit hot-reloads)
+      docker-compose.yml        → docker compose up -d (apply config changes)
+      anything else             → log only
+
+    Runs every 15 minutes. No-op if already on latest commit.
+    """
     try:
-        ch = _ch_client()
-        result = ch.query(
-            "SELECT git_sha FROM system_meta.pipeline_runs FINAL "
-            "ORDER BY started_at DESC LIMIT 1"
-        )
-        if result.result_rows:
-            last_sha = result.result_rows[0][0]
-            if last_sha not in ("unknown", GIT_SHA):
-                log.warning(
-                    "GIT SHA DRIFT: image built from %s but last run used %s — "
-                    "consider running recompute if code changes affect stored data",
-                    GIT_SHA, last_sha,
-                )
+        # ── Current HEAD ─────────────────────────────────────────────────────
+        r = _git(["rev-parse", "HEAD"])
+        if r.returncode != 0:
+            log.warning("AUTO-DEPLOY: git rev-parse HEAD failed — is %s a git repo?", _GIT_DIR)
+            return
+        old_sha = r.stdout.strip()
+
+        # ── Fetch latest master ───────────────────────────────────────────────
+        if _GITHUB_TOKEN:
+            remote = (
+                f"https://{_GITHUB_TOKEN}@github.com/"
+                f"lavakumarkolluri/trading-lab.git"
+            )
+        else:
+            remote = "origin"
+
+        fetch = _git(["fetch", remote, "master:refs/remotes/origin/master"], timeout=45)
+        if fetch.returncode != 0:
+            log.warning("AUTO-DEPLOY: git fetch failed: %s", fetch.stderr.strip()[:200])
+            return
+
+        new_sha = _git(["rev-parse", "origin/master"]).stdout.strip()
+        if old_sha == new_sha:
+            return  # already up to date
+
+        log.info("AUTO-DEPLOY: new commit detected %s → %s", old_sha[:8], new_sha[:8])
+
+        # ── Identify changed files ────────────────────────────────────────────
+        diff = _git(["diff", "--name-only", old_sha, new_sha])
+        changed = [f.strip() for f in diff.stdout.strip().splitlines() if f.strip()]
+        log.info("AUTO-DEPLOY: %d file(s) changed: %s",
+                 len(changed), ", ".join(changed[:15]))
+
+        # ── Fast-forward merge ────────────────────────────────────────────────
+        merge = _git(["merge", "--ff-only", "origin/master"])
+        if merge.returncode != 0:
+            log.warning("AUTO-DEPLOY: merge failed (diverged history?): %s",
+                        merge.stderr.strip()[:200])
+            return
+
+        log.info("AUTO-DEPLOY: merged to %s", new_sha[:8])
+
+        # ── Rebuild dashboard if its infra files changed ──────────────────────
+        dashboard_infra = {"dashboard/Dockerfile", "dashboard/requirements.txt"}
+        if any(f in dashboard_infra for f in changed):
+            log.info("AUTO-DEPLOY: rebuilding dashboard image...")
+            _compose(["build", "dashboard"])
+            _compose(["up", "-d", "dashboard"])
+            log.info("AUTO-DEPLOY: dashboard rebuilt and restarted")
+
+        # ── Apply compose config changes ──────────────────────────────────────
+        if "docker-compose.yml" in changed:
+            log.info("AUTO-DEPLOY: docker-compose.yml changed — applying with up -d...")
+            _compose(["up", "-d", "--remove-orphans"])
+
+        # ── Rebuild pipeline image and self-restart ───────────────────────────
+        pipeline_changed = any(f.startswith("pipeline/") for f in changed)
+        if pipeline_changed:
+            log.info("AUTO-DEPLOY: pipeline code changed — rebuilding image...")
+            _compose(["build", "scheduler"])   # scheduler = pipeline image
+            log.info("AUTO-DEPLOY: rebuild done — exiting for self-restart "
+                     "(restart: unless-stopped will bring up new image)")
+            sys.exit(0)
+
+    except SystemExit:
+        raise
     except Exception as e:
-        log.warning("SHA drift check failed: %s", e)
+        log.error("AUTO-DEPLOY: unexpected error: %s", e, exc_info=True)
 
 
 # ── Dependency map ─────────────────────────────────────────────────────────
@@ -444,7 +533,6 @@ def main():
         return
 
     log.info("Scheduler started — all times UTC (git_sha=%s)", GIT_SHA)
-    _check_sha_drift()
     _startup_recovery()
     log.info("  Events pipeline     : Sun     00:00 UTC (05:30 IST) --weekly")
     log.info("  Intraday OC scraper : Mon–Fri 03:40 UTC (09:10 IST)")
@@ -464,6 +552,7 @@ def main():
     log.info("  Strategy recommend  : Mon-Thu 10:30 UTC (16:00 IST) --recommend")
     log.info("  FII/DII + ParticOI  : Mon-Fri 10:45 UTC (16:15 IST) pre-feed for meta_pipeline")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
+    log.info("  Auto-deploy         : every 15 min — git pull + rebuild on change")
 
     # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
@@ -512,6 +601,10 @@ def main():
 
     # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
     schedule.every().day.at("04:00").do(job_holidays)
+
+    # Auto-deploy: pull master every 15 min, rebuild+restart if code changed
+    schedule.every(15).minutes.do(job_auto_deploy)
+    job_auto_deploy()  # check immediately on startup too
 
     while True:
         schedule.run_pending()
