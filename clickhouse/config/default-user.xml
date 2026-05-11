@@ -1,7 +1,8 @@
 <clickhouse>
   <users>
     <default>
-      <password from_env="CH_PASSWORD"/>
+      <!-- Password set via CLICKHOUSE_PASSWORD env var by the entrypoint script.
+           Defining it here too causes exit code 91 conflict in v26. -->
       <networks>
         <ip>127.0.0.1</ip>
         <ip>::1</ip>
