@@ -85,6 +85,7 @@ page = st.sidebar.radio("Navigate", [
     "Paper Trades",
     "Breakout Backtest",
     "Data Freshness",
+    "Fundamentals",
 ])
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Auto-refresh: 60s | Capital: {fmt_inr(STARTING_CAPITAL)}")
@@ -1709,6 +1710,94 @@ elif page == "Data Freshness":
             runs_df.style.applymap(_run_color, subset=["status"]),
             use_container_width=True, hide_index=True,
         )
+
+
+elif page == "Fundamentals":
+    st.title("Fundamentals")
+    st.caption("Quality screen: PE > 0, ROE > 5%, positive margins = quality stock. Data from market.fundamental_snapshot.")
+
+    fund_df = query(
+        "SELECT symbol, pe_ratio, pb_ratio, roe, roa, profit_margins, "
+        "       gross_margins, operating_margins, free_cashflow, total_debt, "
+        "       market_cap, eps_ttm, date "
+        "FROM market.fundamental_snapshot FINAL "
+        "ORDER BY market_cap DESC"
+    )
+
+    if fund_df.empty:
+        st.warning("No fundamental data found. Run fundamental_pipeline first.")
+    else:
+        # ── Quality score ─────────────────────────────────────────────────────
+        fund_df["quality"] = (
+            (fund_df["pe_ratio"] > 0).astype(int) +
+            (fund_df["roe"] > 0.05).astype(int) +
+            (fund_df["profit_margins"] > 0).astype(int) +
+            (fund_df["free_cashflow"] > 0).astype(int)
+        )
+
+        # ── KPIs ─────────────────────────────────────────────────────────────
+        c1, c2, c3, c4 = st.columns(4)
+        quality_pass = (fund_df["quality"] >= 3).sum()
+        c1.metric("Total stocks", len(fund_df))
+        c2.metric("Quality ≥3/4", int(quality_pass))
+        c3.metric("Profitable (PE>0)", int((fund_df["pe_ratio"] > 0).sum()))
+        c4.metric("Positive FCF", int((fund_df["free_cashflow"] > 0).sum()))
+
+        st.markdown("---")
+
+        # ── Filters ───────────────────────────────────────────────────────────
+        col_f1, col_f2 = st.columns(2)
+        min_quality = col_f1.slider("Min quality score (0–4)", 0, 4, 0)
+        search = col_f2.text_input("Search symbol", "")
+
+        display = fund_df[fund_df["quality"] >= min_quality].copy()
+        if search:
+            display = display[display["symbol"].str.contains(search.upper(), na=False)]
+
+        # ── Format for display ────────────────────────────────────────────────
+        def _pct(v):
+            return f"{v*100:.1f}%" if v and abs(v) < 100 else ("—" if not v else f"{v:.1f}x")
+
+        display_cols = display[["symbol", "pe_ratio", "pb_ratio", "roe", "profit_margins",
+                                 "free_cashflow", "market_cap", "quality", "date"]].copy()
+        display_cols.columns = ["Symbol", "PE", "PB", "ROE", "Net Margin",
+                                  "FCF (₹)", "Mkt Cap (₹)", "Quality", "As of"]
+        display_cols["ROE"] = display_cols["ROE"].apply(lambda v: f"{v*100:.1f}%")
+        display_cols["Net Margin"] = display_cols["Net Margin"].apply(lambda v: f"{v*100:.1f}%")
+        display_cols["FCF (₹)"] = display_cols["FCF (₹)"].apply(
+            lambda v: f"{'▲' if v > 0 else '▼'} {abs(v)/1e7:.0f}Cr" if v else "—"
+        )
+        display_cols["Mkt Cap (₹)"] = display_cols["Mkt Cap (₹)"].apply(
+            lambda v: f"{v/1e9:.0f}B" if v else "—"
+        )
+        display_cols["PE"] = display_cols["PE"].apply(
+            lambda v: f"{v:.1f}" if v > 0 else "—"
+        )
+
+        def _color_quality(val):
+            if val == 4: return "background-color: #1a7a3a; color: white"
+            if val == 3: return "background-color: #4a9a5a; color: white"
+            if val == 2: return "background-color: #7a7a2a; color: white"
+            return "background-color: #7a2a2a; color: white"
+
+        st.dataframe(
+            display_cols.style.applymap(_color_quality, subset=["Quality"]),
+            use_container_width=True, hide_index=True,
+        )
+
+        st.markdown("---")
+        # ── Quality distribution chart ────────────────────────────────────────
+        import plotly.express as px
+        q_counts = fund_df["quality"].value_counts().sort_index().reset_index()
+        q_counts.columns = ["Quality Score", "Count"]
+        q_counts["Label"] = q_counts["Quality Score"].map(
+            {0: "0 – Avoid", 1: "1 – Weak", 2: "2 – Fair", 3: "3 – Good", 4: "4 – Quality"}
+        )
+        fig = px.bar(q_counts, x="Label", y="Count",
+                     color="Quality Score",
+                     color_continuous_scale=["#7a2a2a", "#7a4a2a", "#7a7a2a", "#4a9a5a", "#1a7a3a"],
+                     title="Fundamental Quality Distribution")
+        st.plotly_chart(fig, use_container_width=True)
 
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────

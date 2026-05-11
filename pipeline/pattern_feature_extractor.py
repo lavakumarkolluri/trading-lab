@@ -63,7 +63,7 @@ MAX_WORKERS       = 8
 BATCH_SIZE        = 100       # log progress every N events
 HISTORY_DAYS      = 300       # days of OHLCV to fetch per symbol for rolling windows
 MIN_HISTORY_ROWS  = 30        # skip if fewer rows available before event date
-FEATURE_VERSION   = "v2"   # v2 adds pcr, iv_rank, iv_percentile, max_pain_dist_pct
+FEATURE_VERSION   = "v3"   # v3 adds pe_ratio, pb_ratio, roe, profit_margins, fcf_positive
 
 # ── SEC-004: input validation ──────────────────────────
 _SAFE_SYMBOL = re.compile(r'^[A-Za-z0-9._\-&=]{1,30}$')
@@ -405,7 +405,12 @@ def compute_features(df_hist: pd.DataFrame,
                      pcr: float = 0.0,
                      iv_rank: float = 0.0,
                      iv_percentile: float = 0.0,
-                     max_pain_dist_pct: float = 0.0) -> dict | None:
+                     max_pain_dist_pct: float = 0.0,
+                     pe_ratio: float = 0.0,
+                     pb_ratio: float = 0.0,
+                     roe: float = 0.0,
+                     profit_margins: float = 0.0,
+                     fcf_positive: int = 0) -> dict | None:
     """
     Compute full feature vector from OHLCV history up to (event_date - 1).
     Returns None if insufficient data.
@@ -462,6 +467,13 @@ def compute_features(df_hist: pd.DataFrame,
         "return_20d":     compute_return_nd(close, 20),
         "drawdown_pct":   compute_drawdown(close, 252),
 
+        # ── Fundamental quality ───────────────────────
+        "pe_ratio":       pe_ratio,
+        "pb_ratio":       pb_ratio,
+        "roe":            roe,
+        "profit_margins": profit_margins,
+        "fcf_positive":   fcf_positive,
+
         # ── Housekeeping ──────────────────────────────
         "feature_version": FEATURE_VERSION,
         "computed_at":     datetime.now(),
@@ -485,6 +497,7 @@ FEATURE_COLS = [
     "vix_level", "vix_regime", "nifty_trend_5d", "fii_net_3d",
     "pcr", "iv_rank", "iv_percentile", "max_pain_dist_pct",
     "return_5d", "return_20d", "drawdown_pct",
+    "pe_ratio", "pb_ratio", "roe", "profit_margins", "fcf_positive",
     "feature_version", "computed_at", "version",
 ]
 
@@ -565,6 +578,33 @@ def fetch_options_cache(ch) -> dict:
         return {}
 
 
+def fetch_fundamental_cache(ch) -> dict:
+    """
+    Load latest fundamental snapshot per symbol from market.fundamental_snapshot.
+    Returns {symbol: {pe_ratio, pb_ratio, roe, profit_margins, fcf_positive}}.
+    Falls back gracefully to empty dict if table has no data.
+    """
+    try:
+        result = ch.query(
+            "SELECT symbol, pe_ratio, pb_ratio, roe, profit_margins, free_cashflow "
+            "FROM market.fundamental_snapshot FINAL"
+        )
+        cache = {}
+        for row in result.result_rows:
+            sym, pe, pb, roe, margins, fcf = row
+            cache[sym] = {
+                "pe_ratio":       float(pe or 0.0),
+                "pb_ratio":       float(pb or 0.0),
+                "roe":            float(roe or 0.0),
+                "profit_margins": float(margins or 0.0),
+                "fcf_positive":   int((fcf or 0.0) > 0),
+            }
+        return cache
+    except Exception as e:
+        log.warning("Could not load fundamental cache: %s", e)
+        return {}
+
+
 def get_options_for_date(options_cache: dict, d: date) -> dict:
     return options_cache.get(d, {
         "pcr": 0.0, "iv_rank": 0.0, "iv_percentile": 0.0,
@@ -614,6 +654,7 @@ def process_symbol_events(symbol: str,
                           nifty_5d_cache: dict,
                           fii_net_cache: dict,
                           options_cache: dict,
+                          fundamental_cache: dict,
                           idx: int,
                           total: int):
     ch = get_ch_client()
@@ -659,6 +700,7 @@ def process_symbol_events(symbol: str,
                     / opt["nifty_spot"] * 100, 4
                 )
 
+            fund = fundamental_cache.get(symbol, {})
             feat = compute_features(
                 df_slice, symbol, market, event_date,
                 vix_level, vix_regime, nifty_5d, fii_net3d,
@@ -666,6 +708,11 @@ def process_symbol_events(symbol: str,
                 iv_rank=opt["iv_rank"],
                 iv_percentile=opt["iv_percentile"],
                 max_pain_dist_pct=mp_dist,
+                pe_ratio=fund.get("pe_ratio", 0.0),
+                pb_ratio=fund.get("pb_ratio", 0.0),
+                roe=fund.get("roe", 0.0),
+                profit_margins=fund.get("profit_margins", 0.0),
+                fcf_positive=fund.get("fcf_positive", 0),
             )
 
             if feat is None:
@@ -895,6 +942,11 @@ def main():
     log.info(f"Options cache     : {len(options_cache)} dates "
              f"({'live data' if options_cache else 'empty — run option_chain_pipeline'})")
 
+    log.info("Building fundamental cache...")
+    fundamental_cache = fetch_fundamental_cache(ch)
+    log.info(f"Fundamental cache : {len(fundamental_cache)} symbols "
+             f"({'loaded' if fundamental_cache else 'empty — fundamentals will be 0'})")
+
     # Group events by symbol for efficient OHLCV fetching
     # (one OHLCV fetch per symbol, covers all its event dates)
     symbol_groups = {}
@@ -912,7 +964,7 @@ def main():
             symbol, market, event_dates,
             vix_cache, regime_cache,
             nifty_5d_cache, fii_net_cache,
-            options_cache,
+            options_cache, fundamental_cache,
             idx, total
         )
 
