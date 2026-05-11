@@ -8,3 +8,5 @@ workspace/logs/
 *.swp
 *.swo
 FUNDAMENTAL_DATA_SOURCES.md
+.claude/
+.venv/
