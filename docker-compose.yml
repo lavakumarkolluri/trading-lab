@@ -484,6 +484,12 @@ services:
       minio:
         condition: service_healthy
     restart: "no"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /tmp/intraday_heartbeat && [ $(( $(date +%s) - $(cat /tmp/intraday_heartbeat) )) -lt 1200 ]"]
+      interval: 5m
+      timeout: 10s
+      retries: 2
+      start_period: 10m
     entrypoint: ["python", "option_chain_intraday.py"]
     command: []
 
@@ -500,6 +506,12 @@ services:
       clickhouse:
         condition: service_healthy
     restart: "no"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /tmp/intraday_heartbeat && [ $(( $(date +%s) - $(cat /tmp/intraday_heartbeat) )) -lt 1200 ]"]
+      interval: 5m
+      timeout: 10s
+      retries: 2
+      start_period: 10m
     entrypoint: ["python", "intraday_monitor.py"]
     command: []
 

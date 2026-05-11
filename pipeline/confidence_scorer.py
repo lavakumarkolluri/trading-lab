@@ -249,7 +249,7 @@ def extract_event_features(event_dates: list, snap_date: date, expiry: date) -> 
 def load_index_ohlcv(ch, index_symbol: str) -> pd.DataFrame:
     r = ch.query(
         "SELECT date, open, high, low, close, volume "
-        "FROM market.ohlcv_daily "
+        "FROM market.ohlcv_daily FINAL "
         "WHERE market='nse_index' AND symbol={sym:String} "
         "ORDER BY date",
         parameters={"sym": index_symbol},
@@ -1069,7 +1069,9 @@ def main():
                         if not df.empty:
                             train_final_model(df, sym, mc, best_type)
                     except Exception as e:
-                        log.error(f"[{sym}] failed: {e}", exc_info=True)
+                        log.error(f"[{sym}] training failed: {e}", exc_info=True)
+                        _record_run(ch, "partial_failure", started_at,
+                                    f"symbol={sym}: {e}")
 
             # Always score today after training so intraday_monitor has fresh scores
             log.info("Scoring today after model update...")
@@ -1078,6 +1080,8 @@ def main():
                     score_today(ch, mc, sym)
                 except Exception as e:
                     log.error(f"[{sym}] score_today failed: {e}", exc_info=True)
+                    _record_run(ch, "partial_failure", started_at,
+                                f"score_today symbol={sym}: {e}")
         else:
             symbols = [args.symbol] if args.symbol else SYMBOLS
             for sym in symbols:
@@ -1085,6 +1089,8 @@ def main():
                     run_symbol(sym, ch, mc, args.backtest_only, args.score_only, args.model_type)
                 except Exception as e:
                     log.error(f"[{sym}] failed: {e}", exc_info=True)
+                    _record_run(ch, "partial_failure", started_at,
+                                f"symbol={sym}: {e}")
 
         log.info("confidence_scorer done")
         _record_run(ch, "success", started_at)

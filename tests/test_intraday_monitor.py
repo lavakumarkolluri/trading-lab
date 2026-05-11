@@ -22,8 +22,9 @@ TRAIL_PCT    = monitor.TRAIL_PCT       # 0.75
 
 # ── Trailing stop ──────────────────────────────────────────────────────────────
 
-def test_trail_floor_never_below_target():
-    """update_trail: peak must always be >= TARGET_INR even on first activation."""
+def test_trail_peak_tracks_actual_pnl_not_clamped():
+    """BUG-007: peak must be max(existing_peak, current_pnl) only — no TARGET_INR clamp.
+    Removing TARGET_INR from max() ensures peak reflects reality."""
     pos = {
         "trade_id": "test-id", "symbol": "NIFTY", "expiry": "2026-05-07",
         "entry_time": datetime.now(UTC).replace(tzinfo=None), "strike": 24000.0,
@@ -37,8 +38,8 @@ def test_trail_floor_never_below_target():
     ch = MagicMock()
     # P&L is exactly at target (2000), just activated
     peak, trail = monitor.update_trail(ch, pos, pnl_inr=2000.0, dry_run=True)
-    assert peak == TARGET_INR
-    assert trail == TARGET_INR * TRAIL_PCT
+    assert peak == 2000.0
+    assert trail == 2000.0 * TRAIL_PCT
 
 
 def test_trail_peak_grows_with_pnl():

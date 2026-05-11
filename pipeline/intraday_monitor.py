@@ -27,6 +27,7 @@ Usage:
 import json
 import logging
 import os
+import signal
 import time
 import uuid
 import argparse
@@ -67,6 +68,23 @@ CH_HOST = os.getenv("CH_HOST", "clickhouse")
 CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
+
+def _assert_env(*names: str):
+    missing = [n for n in names if not os.getenv(n)]
+    if missing:
+        raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
+
+
+_SHUTDOWN = False
+
+
+def _sigterm_handler(signum, frame):
+    global _SHUTDOWN
+    log.info("SIGTERM received — finishing current tick then exiting")
+    _SHUTDOWN = True
+
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
 # ── Connections ───────────────────────────────────────────────────────────────
@@ -330,7 +348,7 @@ def record_exit(ch, pos, current_straddle, exit_reason, dry_run=False):
 
 def update_trail(ch, pos, pnl_inr, dry_run=False):
     """Update peak_pnl_inr and trail_stop_inr for a position in trailing mode."""
-    peak   = max(float(pos["peak_pnl_inr"]), pnl_inr, TARGET_INR)
+    peak   = max(float(pos["peak_pnl_inr"]), pnl_inr)
     trail  = peak * TRAIL_PCT
     now    = ist_naive()
 
@@ -464,6 +482,7 @@ def main():
                         help="Evaluate and log signals but do not write to DB")
     args = parser.parse_args()
 
+    _assert_env("CH_PASSWORD")
     log.info("=== Intraday Straddle Monitor (paper trading) ===")
     log.info(f"Symbols        : {SYMBOLS}")
     log.info(f"Target         : ₹{TARGET_INR:.0f} → trailing at {TRAIL_PCT:.0%} of peak")
@@ -477,7 +496,7 @@ def main():
     lot_sizes = load_lot_sizes(ch)
     log.info(f"Lot sizes      : {lot_sizes}")
 
-    while ist_time() <= MONITOR_EXIT:
+    while ist_time() <= MONITOR_EXIT and not _SHUTDOWN:
         t = ist_time()
         if t < ENTRY_START:
             wait = (datetime.combine(date.today(), ENTRY_START) - ist_naive()).total_seconds()
@@ -491,8 +510,14 @@ def main():
                 tick(ch, symbol, lot_sizes, args.dry_run)
             except Exception as e:
                 log.error(f"[{symbol}] tick failed: {e}", exc_info=True)
+        # Heartbeat for Docker healthcheck
+        try:
+            with open("/tmp/intraday_heartbeat", "w") as _f:
+                _f.write(str(int(time.time())))
+        except Exception:
+            pass
 
-        if ist_time() >= MONITOR_EXIT:
+        if ist_time() >= MONITOR_EXIT or _SHUTDOWN:
             break
 
         log.info(f"Next tick in {LOOP_INTERVAL_S//60} min")

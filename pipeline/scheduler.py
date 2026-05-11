@@ -27,7 +27,7 @@ import os
 import logging
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import schedule
 
@@ -261,6 +261,68 @@ def job_holidays():
     _run("holidays_pipeline")
 
 
+def job_vix_pipeline():
+    log.info("=== VIX pipeline triggered ===")
+    _run("vix_pipeline")
+
+
+def job_cleanup():
+    """Weekly disk cleanup: MinIO intraday snapshots >30 days, workspace logs >7 days."""
+    log.info("=== Weekly cleanup triggered ===")
+    try:
+        _cleanup_minio_intraday()
+    except Exception as e:
+        log.error("MinIO cleanup failed: %s", e)
+    try:
+        _cleanup_logs()
+    except Exception as e:
+        log.error("Log cleanup failed: %s", e)
+
+
+def _cleanup_minio_intraday():
+    """Delete MinIO option_chain/intraday/ objects older than 30 days."""
+    minio_host = os.getenv("MINIO_HOST", "minio:9000")
+    minio_user = os.getenv("MINIO_USER", "admin")
+    minio_pass = os.getenv("MINIO_PASSWORD", "")
+    if not minio_pass:
+        log.warning("MINIO_PASSWORD not set — skipping MinIO cleanup")
+        return
+
+    try:
+        from minio import Minio
+        mc = Minio(minio_host, access_key=minio_user,
+                   secret_key=minio_pass, secure=False)
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        bucket = "trading-data"
+        if not mc.bucket_exists(bucket):
+            return
+        objects = mc.list_objects(bucket, prefix="option_chain/intraday/", recursive=True)
+        deleted = 0
+        for obj in objects:
+            if obj.last_modified and obj.last_modified.replace(tzinfo=None) < cutoff:
+                mc.remove_object(bucket, obj.object_name)
+                deleted += 1
+        log.info("MinIO cleanup: deleted %d intraday objects older than 30 days", deleted)
+    except ImportError:
+        log.warning("minio package not available — skipping MinIO cleanup")
+
+
+def _cleanup_logs():
+    """Truncate workspace log files older than 7 days to keep disk usage bounded."""
+    import glob as _glob
+    log_dir = os.getenv("LOG_DIR", "/trading-lab/workspace/logs")
+    cutoff = datetime.utcnow() - timedelta(days=7)
+    for path in _glob.glob(f"{log_dir}/*.log"):
+        try:
+            mtime = datetime.utcfromtimestamp(os.path.getmtime(path))
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            if mtime < cutoff or size_mb > 50:
+                open(path, "w").close()  # truncate
+                log.info("Truncated log: %s (was %.1f MB)", path, size_mb)
+        except Exception as e:
+            log.warning("Could not truncate %s: %s", path, e)
+
+
 def job_option_chain_intraday():
     log.info("=== Option chain intraday scraper triggered ===")
     _run("option_chain_intraday")
@@ -273,7 +335,7 @@ def job_intraday_monitor():
 
 def job_option_chain_eod():
     """
-    Daily bhavcopy chain: download → PCR/max pain → IV → OI walls/skew.
+    Daily bhavcopy chain: download → PCR/max pain → IV → OI walls/skew → VIX.
     Runs sequentially after NSE publishes bhavcopy (~17:30-18:00 IST).
     Each step is idempotent — safe to re-run if a step fails.
     """
@@ -282,6 +344,54 @@ def job_option_chain_eod():
     _run("options_eod_summary_pipeline")    # compute PCR + max pain
     _run("compute_historical_iv")           # compute ATM IV + iv_rank
     _run("compute_oi_features")             # compute OI walls + IV skew + FII futures
+    _run("vix_pipeline")                    # VIX + market regime (required by confidence_scorer)
+
+
+def _startup_recovery():
+    """
+    On scheduler restart, check if today's critical EOD jobs were missed.
+    Only re-triggers if we're within a 4-hour catch-up window of the expected
+    run time and today is a weekday.
+    """
+    now_utc = datetime.utcnow()
+    if now_utc.weekday() >= 5:  # weekend — no recovery
+        return
+    if not _TRACKING_OK:
+        log.warning("Startup recovery skipped — tracking unavailable")
+        return
+
+    today_str = now_utc.strftime("%Y-%m-%d")
+    # EOD chain runs at 12:30 UTC; recovery window is 12:30–16:30 UTC (4h)
+    eod_window_start = now_utc.replace(hour=12, minute=30, second=0, microsecond=0)
+    eod_window_end   = eod_window_start + timedelta(hours=4)
+
+    if not (eod_window_start <= now_utc <= eod_window_end):
+        return
+
+    try:
+        ch = _ch_client()
+        result = ch.query(
+            """
+            SELECT status FROM system_meta.pipeline_runs FINAL
+            WHERE service  = {service:String}
+              AND run_date = {run_date:Date}
+            ORDER BY version DESC LIMIT 1
+            """,
+            parameters={"service": "option_chain_historical", "run_date": today_str},
+        )
+        if result.result_rows:
+            return  # already ran today — no recovery needed
+
+        elapsed_min = (now_utc - eod_window_start).total_seconds() / 60
+        log.warning(
+            "STARTUP RECOVERY: option_chain_historical has no run record for %s "
+            "(scheduler was likely down; restarted %d min after window). "
+            "Re-triggering EOD chain now.",
+            today_str, int(elapsed_min),
+        )
+        job_option_chain_eod()
+    except Exception as e:
+        log.warning("Startup recovery check failed: %s", e)
 
 
 def _recompute_check():
@@ -329,11 +439,12 @@ def main():
 
     log.info("Scheduler started — all times UTC (git_sha=%s)", GIT_SHA)
     _check_sha_drift()
+    _startup_recovery()
     log.info("  Events pipeline     : Sun     00:00 UTC (05:30 IST) --weekly")
     log.info("  Intraday OC scraper : Mon–Fri 03:40 UTC (09:10 IST)")
     log.info("  Intraday monitor    : Mon–Fri 03:50 UTC (09:20 IST) paper straddle")
     log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
-    log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV")
+    log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV+VIX")
     log.info("  Weekly  refresh     : Sun     00:30 UTC (06:00 IST)")
     log.info("  Gap     analyzer    : Sun     01:00 UTC (06:30 IST)")
     log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
@@ -378,6 +489,7 @@ def main():
     schedule.every().sunday.at("05:30").do(job_strategy_backtester)
     schedule.every().sunday.at("07:00").do(job_confidence_scorer)   # 90 min after backtester
     schedule.every().sunday.at("08:00").do(job_strategy_selector_backtest)
+    schedule.every().sunday.at("09:00").do(job_cleanup)  # 09:00 UTC = 14:30 IST
 
     # Daily recommendation: 30 min before market open (10:30 UTC = 16:00 IST)
     for day in ("monday", "tuesday", "wednesday", "thursday"):

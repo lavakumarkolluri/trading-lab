@@ -22,6 +22,7 @@ Docker:
 import io
 import json
 import os
+import signal
 import sys
 import time
 import logging
@@ -63,6 +64,36 @@ MINIO_BUCKET = "trading-data"
 NSE_HOME   = "https://www.nseindia.com"
 NSE_OC_URL = "https://www.nseindia.com/api/option-chain-indices"
 HTTP_TIMEOUT = 20
+
+_TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+_SHUTDOWN = False
+
+
+def _sigterm_handler(signum, frame):
+    global _SHUTDOWN
+    log.info("SIGTERM received — will exit after current fetch")
+    _SHUTDOWN = True
+
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+
+
+def _send_telegram(message: str):
+    if not (_TG_TOKEN and _TG_CHAT_ID):
+        return
+    try:
+        import urllib.request, json as _json
+        payload = _json.dumps({"chat_id": _TG_CHAT_ID, "text": message}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        log.warning("Telegram alert failed: %s", e)
 
 
 # ── Clients ──────────────────────────────────────────────
@@ -214,11 +245,20 @@ def seconds_until_open() -> float:
 
 # ── Main loop ─────────────────────────────────────────────
 
+def _assert_env(*names: str):
+    missing = [n for n in names if not os.getenv(n)]
+    if missing:
+        raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Option chain intraday scraper")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and log but do not write to DB or MinIO")
     args = parser.parse_args()
+
+    if not args.dry_run:
+        _assert_env("CH_PASSWORD", "MINIO_PASSWORD")
 
     log.info("=== Option Chain Intraday Scraper ===")
     log.info(f"Symbols   : {SYMBOLS}")
@@ -241,8 +281,10 @@ def main():
     session = build_nse_session()
     last_session_refresh = time.monotonic()
     fetch_count = 0
+    session_fail_streak = 0
+    _MAX_SESSION_FAILS = 3
 
-    while ist_time() <= EXIT_AFTER:
+    while ist_time() <= EXIT_AFTER and not _SHUTDOWN:
         now_ist = ist_now()
         t = ist_time()
 
@@ -261,8 +303,19 @@ def main():
             try:
                 session = build_nse_session()
                 last_session_refresh = time.monotonic()
+                session_fail_streak = 0
             except Exception as e:
-                log.warning(f"Session refresh failed: {e} — continuing with old session")
+                session_fail_streak += 1
+                log.warning(
+                    f"Session refresh failed ({session_fail_streak}/{_MAX_SESSION_FAILS}): "
+                    f"{e} — continuing with old session"
+                )
+                if session_fail_streak >= _MAX_SESSION_FAILS:
+                    _send_telegram(
+                        f"⚠️ option_chain_intraday: NSE session refresh failed "
+                        f"{session_fail_streak} times in a row. Fetching with stale cookies."
+                    )
+                    session_fail_streak = 0  # reset after alert to avoid spam
 
         fetch_count += 1
         log.info(f"--- Snapshot {fetch_count} at {now_ist.strftime('%H:%M:%S')} IST ---")
@@ -283,6 +336,13 @@ def main():
             log.info(f"Inserted {len(all_rows)} rows → market.options_chain")
         elif args.dry_run:
             log.info(f"[DRY RUN] Would insert {len(all_rows)} rows")
+
+        # Heartbeat for Docker healthcheck
+        try:
+            with open("/tmp/intraday_heartbeat", "w") as _f:
+                _f.write(str(int(time.time())))
+        except Exception:
+            pass
 
         # Sleep until the next 3-min mark
         elapsed = (ist_now() - now_ist).total_seconds()
