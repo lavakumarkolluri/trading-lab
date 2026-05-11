@@ -744,14 +744,15 @@ services:
     build: *pipeline-build
     container_name: scheduler
     volumes:
-      # rw required — scheduler spawns sub-containers via docker compose run
+      # rw required — scheduler spawns sub-containers AND does git pull for auto-deploy
       - /var/run/docker.sock:/var/run/docker.sock
-      - .:/trading-lab:ro
+      - .:/trading-lab
     environment:
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
       - TZ=UTC
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     restart: unless-stopped
     entrypoint: ["python", "scheduler.py"]
 
