@@ -310,7 +310,7 @@ elif page == "Today's Signals":
 
     conf_row   = conf_df.iloc[0]
     confidence = float(conf_row["confidence"])
-    expiry     = conf_row["next_expiry"]
+    expiry     = str(conf_row["next_expiry"])[:10]  # strip time part — CH Date column needs 'YYYY-MM-DD'
     feats      = _json.loads(conf_row["features_json"]) if conf_row["features_json"] else {}
     pcr        = float(feats.get("pcr_oi", 1.0))
     iv_skew_f  = float(feats.get("iv_skew", 0.0))
@@ -1231,7 +1231,7 @@ elif page == "Paper Trades":
         for _, r in open_df.iterrows():
             sym    = r["symbol"]
             strike = float(r["strike"])
-            expiry = r["expiry"]
+            expiry = str(r["expiry"])[:10]  # strip time part
 
             # Live mark-to-market from intraday chain (best-effort, values are internal/trusted)
             mark_df = query(f"""
