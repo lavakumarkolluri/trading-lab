@@ -704,6 +704,23 @@ services:
     entrypoint: ["python", "fundamental_pipeline.py"]
     command: []
 
+  data_freshness_check:
+    build: *pipeline-build
+    container_name: data_freshness_check
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "data_freshness_check.py"]
+    command: []
+
   scheduler:
     build: *pipeline-build
     container_name: scheduler
