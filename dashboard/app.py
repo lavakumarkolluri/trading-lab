@@ -1805,18 +1805,23 @@ elif page == "Edge Analysis":
     import plotly.express as px
     import plotly.graph_objects as go
 
-    st.title("Edge Analysis — NIFTY Straddle")
+    st.title("Edge Analysis — Index Straddle Selling")
     st.caption(
-        "Backtested on historical NIFTY weekly expiries. "
-        "1DTE = sell ATM straddle at T-1 EOD; 0DTE = estimated open-price straddle on expiry day."
+        "Backtested on historical expiries. "
+        "1DTE = sell ATM straddle at T-1 EOD, hold to expiry. 0DTE = estimated open price straddle."
     )
 
-    with st.expander("Strategy Explained", expanded=True):
-        st.markdown("""
-**What we trade**: We sell an ATM (at-the-money) straddle on NIFTY every Tuesday expiry.
-A straddle = sell 1 CE (call option) + 1 PE (put option) at the same strike price nearest to spot.
+    sym_sel = st.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0)
 
-**Why sell?** Options decay to zero on expiry day. If NIFTY stays near our strike, both options expire worthless and we keep the full premium. We profit when the market *doesn't move much*.
+    lot_sizes = {"NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 40}
+    lot = lot_sizes.get(sym_sel, 1)
+
+    with st.expander("Strategy Explained", expanded=False):
+        st.markdown(f"""
+**What we trade**: We sell an ATM (at-the-money) straddle on {sym_sel} at its expiry day.
+A straddle = sell 1 CE (call option) + 1 PE (put option) at the same strike price nearest to spot. Lot size: **{lot} shares**.
+
+**Why sell?** Options decay to zero on expiry day. If {sym_sel} stays near our strike, both options expire worthless and we keep the full premium. We profit when the market *doesn't move much*.
 
 **The edge**: Implied Volatility (IV) — what options are priced at — tends to overestimate actual market moves. This difference (Implied - Realized) is the **Volatility Risk Premium (VRP)**. When VRP > 0, option sellers have a structural advantage.
 
@@ -1826,8 +1831,10 @@ A straddle = sell 1 CE (call option) + 1 PE (put option) at the same strike pric
 - Trailing stop: once target is hit, trail at 75% of peak profit to lock in gains
 - Entry window: 09:30–14:00 IST; forced exit at 15:20 IST (before close)
 
-**Key insight from backtest**: 71.8% of expiries end profitably for the seller (0DTE).
-High-IV environments (ATM IV > 20) show 80%+ win rates. Tuesday expiries specifically show **75.8% win rate**.
+**Key insight from backtest**:
+- **NIFTY**: 65.3% 1DTE win rate; Tuesday expiries 75.8% win
+- **BANKNIFTY**: 84.1% 1DTE win rate; VRP statistically significant (p<0.0001); Tuesday 94.4% win
+- **FINNIFTY**: 68% win rate; weaker edge but still positive expectancy
         """)
 
     ea_df = query(
@@ -1838,7 +1845,7 @@ High-IV environments (ATM IV > 20) show 80%+ win rates. Tuesday expiries specifi
         "       best_profit_pts, best_dist_from_atm, atm_profit_pts, "
         "       iv_rank, atm_iv, pcr "
         "FROM analysis.edge_analysis FINAL "
-        "WHERE symbol = 'NIFTY' "
+        f"WHERE symbol = '{sym_sel}' "
         "ORDER BY expiry_date"
     )
 
@@ -1850,21 +1857,18 @@ High-IV environments (ATM IV > 20) show 80%+ win rates. Tuesday expiries specifi
         st.subheader("Summary Statistics")
         n = len(ea_df)
         wr_1dte = ea_df["win_1dte"].mean() * 100
-        wr_0dte = ea_df["win_0dte"].mean() * 100
         avg_vrp = ea_df["vrp"].mean()
-        avg_profit_0dte = ea_df["profit_0dte_pts"].mean()
-        avg_profit_1dte = ea_df["profit_1dte_pts"].mean()
-        exp_0dte = (
-            ea_df[ea_df["win_0dte"] == 1]["profit_0dte_pts"].mean() * wr_0dte / 100
-            + ea_df[ea_df["win_0dte"] == 0]["profit_0dte_pts"].mean() * (1 - wr_0dte / 100)
-        )
+        avg_win_1  = ea_df.loc[ea_df["win_1dte"] == 1, "profit_1dte_pts"].mean()
+        avg_loss_1 = ea_df.loc[ea_df["win_1dte"] == 0, "profit_1dte_pts"].mean()
+        exp_1dte = wr_1dte / 100 * avg_win_1 + (1 - wr_1dte / 100) * avg_loss_1
+        exp_inr = exp_1dte * lot
 
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Expiries analysed", n)
-        c2.metric("0DTE win rate", f"{wr_0dte:.1f}%")
-        c3.metric("1DTE win rate", f"{wr_1dte:.1f}%")
-        c4.metric("Avg VRP", f"{avg_vrp:+.3f}%")
-        c5.metric("0DTE expectancy", f"{exp_0dte:+.0f} pts")
+        c2.metric("1DTE win rate", f"{wr_1dte:.1f}%")
+        c3.metric("Avg VRP", f"{avg_vrp:+.3f}%")
+        c4.metric("Expectancy (pts)", f"{exp_1dte:+.0f}")
+        c5.metric(f"Expectancy (₹, {lot} lot)", fmt_inr(exp_inr))
 
         st.markdown("---")
 
@@ -1968,41 +1972,37 @@ High-IV environments (ATM IV > 20) show 80%+ win rates. Tuesday expiries specifi
 
         st.markdown("---")
 
-        # ── Stop/Target calibration ────────────────────────────────────────────
-        st.subheader("Stop / Target Calibration (0DTE, % of collected premium)")
-        targets = [20, 30, 40, 50, 60, 70, 80]
-        stops   = [20, 30, 50, 80, 100]
+        # ── Stop/Target calibration (1DTE % profit) ───────────────────────────
+        st.subheader("Stop / Target Calibration (1DTE, % of collected premium)")
+        pct_col = "profit_1dte_pct"
+        if ea_df[pct_col].abs().sum() > 0:
+            targets = [20, 30, 40, 50, 60, 70, 80]
+            stops   = [20, 30, 50, 80, 100]
 
-        target_hits = []
-        for t in targets:
-            hit_pct = (ea_df["profit_0dte_pct"] >= t).mean() * 100
-            target_hits.append({"Threshold": f"Keep {t}%", "Hit Rate (%)": round(hit_pct, 1), "Type": "Target"})
+            target_hits = []
+            for t in targets:
+                hit_pct = (ea_df[pct_col] >= t).mean() * 100
+                target_hits.append({"Threshold": f"Keep {t}%", "Hit Rate (%)": round(hit_pct, 1), "Type": "Target"})
 
-        stop_hits = []
-        for s in stops:
-            breached_pct = (ea_df["profit_0dte_pct"] <= -s).mean() * 100
-            stop_hits.append({"Threshold": f"Lose {s}%", "Hit Rate (%)": round(breached_pct, 1), "Type": "Stop"})
+            stop_hits = []
+            for s in stops:
+                breached_pct = (ea_df[pct_col] <= -s).mean() * 100
+                stop_hits.append({"Threshold": f"Lose {s}%", "Hit Rate (%)": round(breached_pct, 1), "Type": "Stop"})
 
-        calib_df = pd.DataFrame(target_hits + stop_hits)
-        col_t, col_s = st.columns(2)
-        with col_t:
-            st.markdown("**Targets — how often do we keep X% of premium?**")
-            st.dataframe(calib_df[calib_df["Type"] == "Target"][["Threshold", "Hit Rate (%)"]], hide_index=True)
-        with col_s:
-            st.markdown("**Stops — how often does loss exceed X% of premium?**")
-            st.dataframe(calib_df[calib_df["Type"] == "Stop"][["Threshold", "Hit Rate (%)"]], hide_index=True)
-
-        st.info(
-            "Recommendation: Set target at 30% of premium (hits 60% of expiries) and stop at 80% of premium "
-            "(only breached 8% of expiries). This gives a ~7:1 win/loss frequency ratio."
-        )
+            calib_df = pd.DataFrame(target_hits + stop_hits)
+            col_t, col_s = st.columns(2)
+            with col_t:
+                st.markdown("**Targets — how often do we keep X% of premium?**")
+                st.dataframe(calib_df[calib_df["Type"] == "Target"][["Threshold", "Hit Rate (%)"]], hide_index=True)
+            with col_s:
+                st.markdown("**Stops — how often does loss exceed X% of premium?**")
+                st.dataframe(calib_df[calib_df["Type"] == "Stop"][["Threshold", "Hit Rate (%)"]], hide_index=True)
 
         st.markdown("---")
         # ── Raw data ──────────────────────────────────────────────────────────
         with st.expander("Raw per-expiry data"):
             show_cols = ["expiry_date", "day_of_week", "atm_iv", "iv_rank", "pcr",
-                         "profit_1dte_pts", "profit_1dte_pct", "win_1dte",
-                         "profit_0dte_pts", "profit_0dte_pct", "win_0dte", "vrp"]
+                         "profit_1dte_pts", "profit_1dte_pct", "win_1dte", "vrp"]
             st.dataframe(ea_df[show_cols].sort_values("expiry_date", ascending=False),
                          hide_index=True, use_container_width=True)
 

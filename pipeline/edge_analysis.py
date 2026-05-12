@@ -2,23 +2,19 @@
 """
 edge_analysis.py
 ────────────────
-Reverse-engineers NIFTY 0DTE straddle edge from 153 historical expiries.
-
-Five analyses:
-  1. VRP  — Does implied vol consistently exceed realized? (structural edge test)
-  2. Strike opt  — Which strike gave max profit per expiry? (ATM vs OTM bands)
-  3. Conditions  — When is edge strongest? (IV rank / VIX / PCR / day-of-week)
-  4. Stop/target — What risk params maximize expectancy? (distribution-driven)
-  5. Features    — Which signals predict profitable expiries? (Pearson r)
+Reverse-engineers straddle edge from historical expiries.
+Supports NIFTY, BANKNIFTY, FINNIFTY (and any symbol in options_chain).
 
 Two simulation modes:
-  A. 1DTE: sell at T-1 EOD, hold to expiry EOD (full week premium)
+  A. 1DTE: sell at T-1 EOD, hold to expiry EOD
   B. 0DTE: sell at estimated open on expiry day, hold to expiry EOD
 
 Usage:
-  python edge_analysis.py              # full analysis, write to CH
-  python edge_analysis.py --dry-run    # report only, no DB write
+  python edge_analysis.py                        # NIFTY, write to CH
+  python edge_analysis.py --dry-run              # report only
   python edge_analysis.py --symbol BANKNIFTY
+  python edge_analysis.py --symbol FINNIFTY
+  python edge_analysis.py --all                  # run all supported symbols
 """
 
 import argparse
@@ -40,11 +36,12 @@ CH_PORT     = int(os.getenv("CH_PORT", "8123"))
 CH_USER     = os.getenv("CH_USER", "default")
 CH_PASSWORD = os.getenv("CH_PASSWORD", "")
 
-NIFTY_STRIKE_STEP    = 50
-BANKNIFTY_STRIKE_STEP = 100
+STRIKE_STEPS = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
+DEFAULT_STRIKE_STEP  = 50
 TRADING_HOURS        = 6.25          # market hours per day
 TRADING_DAYS_YEAR    = 252
-LOT_SIZES            = {"NIFTY": 75, "BANKNIFTY": 35}
+LOT_SIZES            = {"NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 40}
+SUPPORTED_SYMBOLS    = list(STRIKE_STEPS.keys())
 
 # ── Black-Scholes straddle price ──────────────────────────────────────────────
 
@@ -93,24 +90,74 @@ def load_options_day(ch, symbol: str, snap_date: date, expiry: date) -> pd.DataF
     return df
 
 def load_eod_context(ch, symbol: str, snap_date: date, expiry: date) -> dict:
-    """Load IV rank, PCR, spot, ATM IV from options_eod_summary."""
+    """
+    Load IV rank, PCR, spot, ATM IV.
+    For NIFTY: reads options_eod_summary (pre-computed).
+    For other symbols: derives from options_chain using put-call parity.
+    """
+    if symbol == "NIFTY":
+        result = ch.query(
+            "SELECT nifty_spot, atm_strike, atm_ce_iv, atm_pe_iv, iv_rank, iv_percentile, pcr "
+            "FROM market.options_eod_summary FINAL "
+            "WHERE date={d:Date} AND expiry={exp:Date}",
+            parameters={"d": snap_date, "exp": expiry}
+        )
+        if not result.result_rows:
+            return {}
+        r = result.result_rows[0]
+        return {
+            "spot": float(r[0] or 0),
+            "atm_strike": float(r[1] or 0),
+            "atm_ce_iv": float(r[2] or 0),
+            "atm_pe_iv": float(r[3] or 0),
+            "iv_rank": float(r[4] or 0),
+            "iv_percentile": float(r[5] or 0),
+            "pcr": float(r[6] or 0),
+        }
+
+    # ── Derive context from options_chain for BANKNIFTY / FINNIFTY ──────────────
     result = ch.query(
-        "SELECT nifty_spot, atm_strike, atm_ce_iv, atm_pe_iv, iv_rank, iv_percentile, pcr "
-        "FROM market.options_eod_summary FINAL "
-        "WHERE date={d:Date} AND expiry={exp:Date}",
-        parameters={"d": snap_date, "exp": expiry}
+        "SELECT strike, option_type, ltp, oi FROM market.options_chain FINAL "
+        "WHERE symbol={sym:String} AND toDate(timestamp)={d:Date} "
+        "  AND expiry={exp:Date} AND ltp > 0.5 AND oi > 0",
+        parameters={"sym": symbol, "d": snap_date, "exp": expiry}
     )
     if not result.result_rows:
         return {}
-    r = result.result_rows[0]
+
+    df = pd.DataFrame(result.result_rows, columns=["strike", "option_type", "ltp", "oi"])
+    df["strike"] = df["strike"].astype(float)
+    df["ltp"]    = df["ltp"].astype(float)
+    df["oi"]     = df["oi"].astype(float)
+
+    # ATM = strike where |CE_ltp - PE_ltp| is minimised
+    ce = df[df["option_type"] == "CE"].set_index("strike")[["ltp", "oi"]]
+    pe = df[df["option_type"] == "PE"].set_index("strike")[["ltp", "oi"]]
+    common = ce.index.intersection(pe.index)
+    if len(common) == 0:
+        return {}
+
+    diff = (ce.loc[common, "ltp"] - pe.loc[common, "ltp"]).abs()
+    atm_strike = float(diff.idxmin())
+
+    # Spot via put-call parity: S ≈ K + C - P
+    ce_atm = float(ce.loc[atm_strike, "ltp"]) if atm_strike in ce.index else 0
+    pe_atm = float(pe.loc[atm_strike, "ltp"]) if atm_strike in pe.index else 0
+    spot = atm_strike + ce_atm - pe_atm
+
+    # PCR from OI
+    total_ce_oi = float(df[df["option_type"] == "CE"]["oi"].sum())
+    total_pe_oi = float(df[df["option_type"] == "PE"]["oi"].sum())
+    pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0.0
+
     return {
-        "spot": float(r[0] or 0),
-        "atm_strike": float(r[1] or 0),
-        "atm_ce_iv": float(r[2] or 0),
-        "atm_pe_iv": float(r[3] or 0),
-        "iv_rank": float(r[4] or 0),
-        "iv_percentile": float(r[5] or 0),
-        "pcr": float(r[6] or 0),
+        "spot": round(spot, 2),
+        "atm_strike": atm_strike,
+        "atm_ce_iv": 0.0,   # IV not in source data for BANKNIFTY/FINNIFTY
+        "atm_pe_iv": 0.0,
+        "iv_rank": 0.0,
+        "iv_percentile": 0.0,
+        "pcr": round(pcr, 4),
     }
 
 def load_fii_net(ch, as_of: date) -> float:
@@ -321,8 +368,9 @@ def print_report(df: pd.DataFrame):
     n = len(df)
     sep = "═" * 65
 
+    symbol = df["symbol"].iloc[0] if "symbol" in df.columns else "UNKNOWN"
     print(f"\n{sep}")
-    print(f"  NIFTY STRADDLE EDGE ANALYSIS  —  {n} expiries")
+    print(f"  {symbol} STRADDLE EDGE ANALYSIS  —  {n} expiries")
     print(sep)
 
     # ── 1. VRP ────────────────────────────────────────────────────────────────
@@ -511,26 +559,16 @@ def insert_results(ch, rows: list[dict]):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="NIFTY straddle edge analysis")
-    parser.add_argument("--dry-run", action="store_true", help="Print report only, no DB write")
-    parser.add_argument("--symbol", default="NIFTY", help="NIFTY or BANKNIFTY")
-    args = parser.parse_args()
+def run_symbol(ch, symbol: str, dry_run: bool):
+    step = STRIKE_STEPS.get(symbol, DEFAULT_STRIKE_STEP)
+    log.info("=== Edge Analysis: %s (step=%d) ===", symbol, step)
 
-    step = NIFTY_STRIKE_STEP if args.symbol == "NIFTY" else BANKNIFTY_STRIKE_STEP
-
-    log.info("=== Edge Analysis: %s ===", args.symbol)
-    ch = get_ch()
-
-    if not args.dry_run:
-        ensure_table(ch)
-
-    expiries = load_expiries(ch, args.symbol)
+    expiries = load_expiries(ch, symbol)
     log.info("Found %d expiry dates", len(expiries))
 
     rows = []
     for i, exp in enumerate(expiries, 1):
-        row = simulate_expiry(ch, args.symbol, exp, step)
+        row = simulate_expiry(ch, symbol, exp, step)
         if row:
             rows.append(row)
         if i % 20 == 0:
@@ -539,18 +577,35 @@ def main():
     log.info("Valid expiries: %d / %d", len(rows), len(expiries))
 
     if not rows:
-        log.error("No data — check options_chain table")
+        log.warning("No valid data for %s", symbol)
         return
 
     df = pd.DataFrame(rows)
-
     print_report(df)
 
-    if not args.dry_run:
+    if not dry_run:
         insert_results(ch, rows)
-        log.info("Results saved to analysis.edge_analysis")
+        log.info("Results saved to analysis.edge_analysis for %s", symbol)
     else:
         log.info("Dry run — DB not written")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Straddle edge analysis")
+    parser.add_argument("--dry-run", action="store_true", help="Print report only, no DB write")
+    parser.add_argument("--symbol", default="NIFTY",
+                        help=f"Symbol to analyse: {', '.join(SUPPORTED_SYMBOLS)}")
+    parser.add_argument("--all", action="store_true",
+                        help="Run analysis for all supported symbols")
+    args = parser.parse_args()
+
+    ch = get_ch()
+    if not args.dry_run:
+        ensure_table(ch)
+
+    symbols = SUPPORTED_SYMBOLS if args.all else [args.symbol]
+    for sym in symbols:
+        run_symbol(ch, sym, args.dry_run)
 
 
 if __name__ == "__main__":
