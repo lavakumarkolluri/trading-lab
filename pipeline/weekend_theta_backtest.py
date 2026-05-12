@@ -28,6 +28,7 @@ import clickhouse_connect
 import numpy as np
 import pandas as pd
 from scipy import stats
+from price_action import compute_price_action, PA_DEFAULTS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -277,6 +278,8 @@ def simulate_weekend(ch, symbol: str, friday: date, monday: date,
         "oi_ce":              fri_data["oi_ce"],
         "oi_pe":              fri_data["oi_pe"],
         "liquidity_ok":       int(fri_data["liquidity_ok"]),
+        # Price action as of Friday
+        **{k: v for k, v in compute_price_action(ch, symbol, friday).items()},
     }
 
 
@@ -354,6 +357,38 @@ def print_report(df: pd.DataFrame):
             ap = sub["profit_mon_pts"].mean()
             print(f"  {label:16s}  N={len(sub):3d}  Win={wr:.0f}%  AvgProfit={ap:+.1f}pts")
 
+    # ── Price action conditional ──────────────────────────────────────────────
+    if "pa_available" in df.columns and df["pa_available"].sum() > 3:
+        pa_df = df[df["pa_available"] == 1]
+        print(f"\n── BY PRICE ACTION (Friday close) — {len(pa_df)} weeks with data ──")
+        print(f"  {'Condition':26s}  {'N':>4s}  {'Win%':>6s}  {'AvgDecay':>10s}")
+
+        for label, lo, hi in [("Tight (<0.6×ATR)",  0, 0.6),
+                                ("Normal (0.6–1.2×)", 0.6, 1.2),
+                                ("Wide (>1.2×ATR)",   1.2, 99)]:
+            sub = pa_df[(pa_df["range_vs_atr"] >= lo) & (pa_df["range_vs_atr"] < hi)]
+            if len(sub) < 3:
+                continue
+            wr = sub["win_mon"].mean() * 100
+            ap = sub["weekend_decay_pts"].mean()
+            print(f"  {label:26s}  {len(sub):>4d}  {wr:>5.1f}%  {ap:>+10.1f}")
+
+        for label, val in [("Inside week bar", 1), ("Not inside week", 0)]:
+            sub = pa_df[pa_df["inside_bar"] == val]
+            if len(sub) < 3:
+                continue
+            wr = sub["win_mon"].mean() * 100
+            ap = sub["weekend_decay_pts"].mean()
+            print(f"  {label:26s}  {len(sub):>4d}  {wr:>5.1f}%  {ap:>+10.1f}")
+
+        for label, val in [("Above MA20", 1), ("Below MA20", 0)]:
+            sub = pa_df[pa_df["above_ma20"] == val]
+            if len(sub) < 3:
+                continue
+            wr = sub["win_mon"].mean() * 100
+            ap = sub["weekend_decay_pts"].mean()
+            print(f"  {label:26s}  {len(sub):>4d}  {wr:>5.1f}%  {ap:>+10.1f}")
+
     # ── Comparison ────────────────────────────────────────────────────────────
     print(f"\n── COMPARISON: Exit A (Mon) vs Exit B (Expiry) ──────────────")
     print(f"  Exit Mon  : {wr_mon:.1f}% win,  {exp_mon:+.1f}pts expectancy")
@@ -395,6 +430,15 @@ def ensure_table(ch):
             oi_ce             Float64 DEFAULT 0,
             oi_pe             Float64 DEFAULT 0,
             liquidity_ok      Int8    DEFAULT 0,
+            prev_range_pct    Float64 DEFAULT 0,
+            range_vs_atr      Float64 DEFAULT 0,
+            inside_bar        Int8    DEFAULT 0,
+            ma20_dist_pct     Float64 DEFAULT 0,
+            ma50_dist_pct     Float64 DEFAULT 0,
+            above_ma20        Int8    DEFAULT 0,
+            week_range_pct    Float64 DEFAULT 0,
+            consec_inside_days Int32  DEFAULT 0,
+            pa_available      Int8    DEFAULT 0,
             run_date          Date DEFAULT today()
         ) ENGINE = ReplacingMergeTree(run_date)
         ORDER BY (symbol, expiry_date)

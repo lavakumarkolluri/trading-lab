@@ -27,6 +27,7 @@ import clickhouse_connect
 import numpy as np
 import pandas as pd
 from scipy import stats
+from price_action import compute_price_action, PA_DEFAULTS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -404,6 +405,8 @@ def simulate_expiry(ch, symbol: str, expiry: date, step: int) -> dict | None:
         "oi_ce":                  round(oi_ce, 0),
         "oi_pe":                  round(oi_pe, 0),
         "liquidity_ok":           int(liq_ok),
+        # Price action (computed from T-1 OHLCV)
+        **{k: v for k, v in compute_price_action(ch, symbol, t1).items()},
     }
 
 # ── Report ────────────────────────────────────────────────────────────────────
@@ -531,16 +534,55 @@ def print_report(df: pd.DataFrame):
 
     # ── 6. Feature correlation ────────────────────────────────────────────────
     print("\n── 6. FEATURE CORRELATION WITH 1DTE WIN ──────────────────────")
-    features = ["iv_rank", "atm_iv", "pcr", "fii_net_3d", "implied_move_pct", "iv_percentile"]
-    print(f"  {'Feature':22s}  {'Pearson r':>10s}  {'p-value':>10s}  {'Signal':>8s}")
+    features = ["iv_rank", "atm_iv", "pcr", "fii_net_3d", "implied_move_pct", "iv_percentile",
+                "prev_range_pct", "range_vs_atr", "ma20_dist_pct", "week_range_pct", "consec_inside_days"]
+    print(f"  {'Feature':26s}  {'Pearson r':>10s}  {'p-value':>10s}  {'Signal':>8s}")
     for feat in features:
+        if feat not in df.columns:
+            continue
         sub = df[[feat, "win_1dte"]].dropna()
-        if len(sub) < 10:
+        if len(sub) < 10 or sub[feat].std() == 0:
             continue
         r, p = stats.pearsonr(sub[feat], sub["win_1dte"])
         direction = "↑ win" if r > 0 else "↓ win"
         sig = "**" if p < 0.05 else ("*" if p < 0.10 else "")
-        print(f"  {feat:22s}  {r:>+10.3f}  {p:>10.4f}  {direction} {sig}")
+        print(f"  {feat:26s}  {r:>+10.3f}  {p:>10.4f}  {direction} {sig}")
+
+    # ── Price action conditional edge ─────────────────────────────────────────
+    if "pa_available" in df.columns and df["pa_available"].sum() > 5:
+        pa_df = df[df["pa_available"] == 1]
+        print(f"\n── 6b. PRICE ACTION CONDITIONAL EDGE ({len(pa_df)} expiries with data) ──")
+
+        # Range compression
+        print(f"\n  By prior-day range vs ATR (compression ratio):")
+        print(f"  {'Bucket':20s}  {'N':>4s}  {'Win%':>6s}  {'AvgProfit':>10s}")
+        for label, lo, hi in [("Tight (<0.6×ATR)", 0, 0.6), ("Normal (0.6–1.2×)", 0.6, 1.2),
+                                ("Wide (>1.2×ATR)",  1.2, 99)]:
+            sub = pa_df[(pa_df["range_vs_atr"] >= lo) & (pa_df["range_vs_atr"] < hi)]
+            if len(sub) < 3:
+                continue
+            wr = sub["win_1dte"].mean() * 100
+            ap = sub["profit_1dte_pts"].mean()
+            print(f"  {label:20s}  {len(sub):>4d}  {wr:>5.1f}%  {ap:>+10.1f}")
+
+        # Inside bar
+        for label, val in [("Inside week bar", 1), ("Not inside week", 0)]:
+            sub = pa_df[pa_df["inside_bar"] == val]
+            if len(sub) < 3:
+                continue
+            wr = sub["win_1dte"].mean() * 100
+            ap = sub["profit_1dte_pts"].mean()
+            print(f"\n  {label}: N={len(sub)}, Win={wr:.1f}%, AvgProfit={ap:+.1f}pts")
+
+        # MA position
+        print(f"\n  By MA20 position:")
+        for label, val in [("Above MA20", 1), ("Below MA20", 0)]:
+            sub = pa_df[pa_df["above_ma20"] == val]
+            if len(sub) < 3:
+                continue
+            wr = sub["win_1dte"].mean() * 100
+            ap = sub["profit_1dte_pts"].mean()
+            print(f"  {label}: N={len(sub)}, Win={wr:.1f}%, AvgProfit={ap:+.1f}pts")
 
     # ── 7. Best trading conditions (combined filter) ───────────────────────────
     print("\n── 7. BEST TRADING CONDITIONS (combined) ─────────────────────")
@@ -598,6 +640,15 @@ def ensure_table(ch):
             oi_ce                Float64 DEFAULT 0,
             oi_pe                Float64 DEFAULT 0,
             liquidity_ok         Int8    DEFAULT 0,
+            prev_range_pct       Float64 DEFAULT 0,
+            range_vs_atr         Float64 DEFAULT 0,
+            inside_bar           Int8    DEFAULT 0,
+            ma20_dist_pct        Float64 DEFAULT 0,
+            ma50_dist_pct        Float64 DEFAULT 0,
+            above_ma20           Int8    DEFAULT 0,
+            week_range_pct       Float64 DEFAULT 0,
+            consec_inside_days   Int32   DEFAULT 0,
+            pa_available         Int8    DEFAULT 0,
             run_date             Date DEFAULT today()
         ) ENGINE = ReplacingMergeTree(run_date)
         ORDER BY (symbol, expiry_date)
