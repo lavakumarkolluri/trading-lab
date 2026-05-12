@@ -723,6 +723,21 @@ services:
     entrypoint: ["python", "monthly_breakout_backtest.py"]
     command: []
 
+  edge_analysis:
+    build: *pipeline-build
+    container_name: edge_analysis
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "edge_analysis.py"]
+    command: []
+
   data_freshness_check:
     build: *pipeline-build
     container_name: data_freshness_check
