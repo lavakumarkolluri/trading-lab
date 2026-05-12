@@ -192,6 +192,8 @@ def parse_all_strikes(data: dict, symbol: str, now: datetime) -> list[dict]:
                 "option_type": opt_type,
                 "ltp":         ltp,
                 "iv":          float(side.get("impliedVolatility", 0)),
+                "delta":       float(side.get("delta", 0)),
+                "theta":       float(side.get("theta", 0)),
                 "oi":          oi,
                 "oi_change":   int(side.get("changeinOpenInterest", 0)),
                 "volume":      int(side.get("totalTradedVolume", 0)),
@@ -221,7 +223,7 @@ def insert_rows(ch, rows: list[dict]):
     df = pd.DataFrame(rows)
     ch.insert_df("market.options_chain", df[[
         "symbol", "timestamp", "expiry", "strike", "option_type",
-        "ltp", "iv", "oi", "oi_change", "volume", "version",
+        "ltp", "iv", "delta", "theta", "oi", "oi_change", "volume", "version",
     ]])
 
 
