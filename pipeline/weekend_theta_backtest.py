@@ -39,6 +39,7 @@ CH_PASSWORD = os.getenv("CH_PASSWORD", "")
 
 STRIKE_STEPS     = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
 LOT_SIZES        = {"NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 40}
+MIN_OI           = {"NIFTY": 10_000, "BANKNIFTY": 3_000, "FINNIFTY": 3_000}
 SUPPORTED_SYMBOLS = list(STRIKE_STEPS.keys())
 
 
@@ -70,10 +71,37 @@ def fetch_expiries(ch, symbol: str) -> list[date]:
     return [r[0] for r in rows]
 
 
+def find_liquid_atm(df: pd.DataFrame, theoretical_atm: float,
+                    step: int, symbol: str) -> tuple[float, float, float, bool]:
+    """Pick the most liquid strike within ±3 steps of theoretical ATM."""
+    min_oi = MIN_OI.get(symbol, 5_000)
+    ce = df[df["option_type"] == "CE"].set_index("strike")
+    pe = df[df["option_type"] == "PE"].set_index("strike")
+    common = ce.index.intersection(pe.index)
+
+    best_strike, best_total_oi, liquidity_ok = theoretical_atm, 0.0, False
+    for offset in range(0, 4):
+        for sign in ([0] if offset == 0 else [1, -1]):
+            k = theoretical_atm + sign * offset * step
+            if k not in common:
+                continue
+            oi_ce = float(ce.loc[k, "oi"]) if "oi" in ce.columns else 0.0
+            oi_pe = float(pe.loc[k, "oi"]) if "oi" in pe.columns else 0.0
+            total = oi_ce + oi_pe
+            if oi_ce >= min_oi and oi_pe >= min_oi and total > best_total_oi:
+                best_total_oi = total
+                best_strike   = k
+                liquidity_ok  = True
+
+    ce_oi = float(ce.loc[best_strike, "oi"]) if best_strike in ce.index and "oi" in ce.columns else 0.0
+    pe_oi = float(pe.loc[best_strike, "oi"]) if best_strike in pe.index and "oi" in pe.columns else 0.0
+    return best_strike, ce_oi, pe_oi, liquidity_ok
+
+
 def load_straddle(ch, symbol: str, snap_date: date, expiry: date, step: int) -> dict:
     """
-    Return ATM straddle price and spot for a given snapshot date and expiry.
-    Uses put-call parity to estimate spot when options_eod_summary is unavailable.
+    Return ATM straddle price and spot. Uses liquidity-aware ATM selection:
+    picks the strike nearest to theoretical ATM that has OI above threshold on both legs.
     """
     result = ch.query(
         "SELECT strike, option_type, ltp, oi FROM market.options_chain FINAL "
@@ -95,21 +123,29 @@ def load_straddle(ch, symbol: str, snap_date: date, expiry: date, step: int) -> 
     if len(common) == 0:
         return {}
 
-    # ATM = strike with smallest |CE - PE|
-    atm_strike = float((ce.loc[common, "ltp"] - pe.loc[common, "ltp"]).abs().idxmin())
+    # Theoretical ATM via min |CE - PE| (put-call parity)
+    theoretical_atm = float((ce.loc[common, "ltp"] - pe.loc[common, "ltp"]).abs().idxmin())
+    # Apply liquidity check
+    atm_strike, oi_ce, oi_pe, liq_ok = find_liquid_atm(df, theoretical_atm, step, symbol)
+
     ce_ltp = float(ce.loc[atm_strike, "ltp"]) if atm_strike in ce.index else 0.0
     pe_ltp = float(pe.loc[atm_strike, "ltp"]) if atm_strike in pe.index else 0.0
     straddle_price = ce_ltp + pe_ltp
 
-    # Spot via put-call parity
-    spot = atm_strike + ce_ltp - pe_ltp
+    # Spot via put-call parity at theoretical ATM (more stable for spot estimation)
+    spot = theoretical_atm + (
+        float(ce.loc[theoretical_atm, "ltp"]) if theoretical_atm in ce.index else 0
+    ) - (
+        float(pe.loc[theoretical_atm, "ltp"]) if theoretical_atm in pe.index else 0
+    )
 
-    # PCR
+    # PCR from full chain OI
     total_ce_oi = float(df[df["option_type"] == "CE"]["oi"].sum())
     total_pe_oi = float(df[df["option_type"] == "PE"]["oi"].sum())
     pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0.0
 
-    # For NIFTY, override spot from options_eod_summary if available
+    # For NIFTY, prefer authoritative spot from options_eod_summary
+    iv_rank = iv_pct = atm_iv = 0.0
     if symbol == "NIFTY":
         ctx = ch.query(
             "SELECT nifty_spot, iv_rank, iv_percentile, atm_ce_iv, atm_pe_iv "
@@ -119,23 +155,26 @@ def load_straddle(ch, symbol: str, snap_date: date, expiry: date, step: int) -> 
         )
         if ctx.result_rows:
             r = ctx.result_rows[0]
-            spot    = float(r[0] or spot)
+            spot   = float(r[0] or spot)
             iv_rank = float(r[1] or 0)
             iv_pct  = float(r[2] or 0)
             atm_iv  = float(r[3] or r[4] or 0)
-        else:
-            iv_rank = iv_pct = atm_iv = 0.0
-    else:
-        iv_rank = iv_pct = atm_iv = 0.0
+
+    if not liq_ok:
+        log.debug("Low liquidity for %s %s expiry=%s (CE OI=%.0f PE OI=%.0f)",
+                  symbol, snap_date, expiry, oi_ce, oi_pe)
 
     return {
-        "straddle":   round(straddle_price, 2),
-        "spot":       round(spot, 2),
-        "atm_strike": atm_strike,
-        "pcr":        round(pcr, 4),
-        "iv_rank":    round(iv_rank, 2),
-        "iv_pct":     round(iv_pct, 2),
-        "atm_iv":     round(atm_iv, 2),
+        "straddle":     round(straddle_price, 2),
+        "spot":         round(spot, 2),
+        "atm_strike":   atm_strike,
+        "pcr":          round(pcr, 4),
+        "iv_rank":      round(iv_rank, 2),
+        "iv_pct":       round(iv_pct, 2),
+        "atm_iv":       round(atm_iv, 2),
+        "oi_ce":        round(oi_ce, 0),
+        "oi_pe":        round(oi_pe, 0),
+        "liquidity_ok": liq_ok,
     }
 
 
@@ -234,6 +273,10 @@ def simulate_weekend(ch, symbol: str, friday: date, monday: date,
         "iv_rank":            fri_data["iv_rank"],
         "atm_iv":             fri_data["atm_iv"],
         "pcr":                fri_data["pcr"],
+        # Liquidity at entry (Friday)
+        "oi_ce":              fri_data["oi_ce"],
+        "oi_pe":              fri_data["oi_pe"],
+        "liquidity_ok":       int(fri_data["liquidity_ok"]),
     }
 
 
@@ -349,6 +392,9 @@ def ensure_table(ch):
             iv_rank           Float64,
             atm_iv            Float64,
             pcr               Float64,
+            oi_ce             Float64 DEFAULT 0,
+            oi_pe             Float64 DEFAULT 0,
+            liquidity_ok      Int8    DEFAULT 0,
             run_date          Date DEFAULT today()
         ) ENGINE = ReplacingMergeTree(run_date)
         ORDER BY (symbol, expiry_date)

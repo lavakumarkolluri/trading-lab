@@ -41,6 +41,7 @@ DEFAULT_STRIKE_STEP  = 50
 TRADING_HOURS        = 6.25          # market hours per day
 TRADING_DAYS_YEAR    = 252
 LOT_SIZES            = {"NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 40}
+MIN_OI               = {"NIFTY": 10_000, "BANKNIFTY": 3_000, "FINNIFTY": 3_000}
 SUPPORTED_SYMBOLS    = list(STRIKE_STEPS.keys())
 
 # ── Black-Scholes straddle price ──────────────────────────────────────────────
@@ -116,10 +117,11 @@ def load_eod_context(ch, symbol: str, snap_date: date, expiry: date) -> dict:
         }
 
     # ── Derive context from options_chain for BANKNIFTY / FINNIFTY ──────────────
+    step = STRIKE_STEPS.get(symbol, 50)
     result = ch.query(
         "SELECT strike, option_type, ltp, oi FROM market.options_chain FINAL "
         "WHERE symbol={sym:String} AND toDate(timestamp)={d:Date} "
-        "  AND expiry={exp:Date} AND ltp > 0.5 AND oi > 0",
+        "  AND expiry={exp:Date} AND ltp > 0.5",
         parameters={"sym": symbol, "d": snap_date, "exp": expiry}
     )
     if not result.result_rows:
@@ -130,20 +132,21 @@ def load_eod_context(ch, symbol: str, snap_date: date, expiry: date) -> dict:
     df["ltp"]    = df["ltp"].astype(float)
     df["oi"]     = df["oi"].astype(float)
 
-    # ATM = strike where |CE_ltp - PE_ltp| is minimised
     ce = df[df["option_type"] == "CE"].set_index("strike")[["ltp", "oi"]]
     pe = df[df["option_type"] == "PE"].set_index("strike")[["ltp", "oi"]]
     common = ce.index.intersection(pe.index)
     if len(common) == 0:
         return {}
 
-    diff = (ce.loc[common, "ltp"] - pe.loc[common, "ltp"]).abs()
-    atm_strike = float(diff.idxmin())
+    # Theoretical ATM via put-call parity (min |CE - PE|)
+    theoretical_atm = float((ce.loc[common, "ltp"] - pe.loc[common, "ltp"]).abs().idxmin())
+    # Spot via put-call parity
+    ce_ltp = float(ce.loc[theoretical_atm, "ltp"]) if theoretical_atm in ce.index else 0
+    pe_ltp = float(pe.loc[theoretical_atm, "ltp"]) if theoretical_atm in pe.index else 0
+    spot = theoretical_atm + ce_ltp - pe_ltp
 
-    # Spot via put-call parity: S ≈ K + C - P
-    ce_atm = float(ce.loc[atm_strike, "ltp"]) if atm_strike in ce.index else 0
-    pe_atm = float(pe.loc[atm_strike, "ltp"]) if atm_strike in pe.index else 0
-    spot = atm_strike + ce_atm - pe_atm
+    # Liquidity-aware strike selection
+    atm_strike, oi_ce, oi_pe, liq_ok = find_liquid_atm(df, theoretical_atm, step, symbol)
 
     # PCR from OI
     total_ce_oi = float(df[df["option_type"] == "CE"]["oi"].sum())
@@ -153,11 +156,14 @@ def load_eod_context(ch, symbol: str, snap_date: date, expiry: date) -> dict:
     return {
         "spot": round(spot, 2),
         "atm_strike": atm_strike,
-        "atm_ce_iv": 0.0,   # IV not in source data for BANKNIFTY/FINNIFTY
+        "atm_ce_iv": 0.0,
         "atm_pe_iv": 0.0,
         "iv_rank": 0.0,
         "iv_percentile": 0.0,
         "pcr": round(pcr, 4),
+        "oi_ce": oi_ce,
+        "oi_pe": oi_pe,
+        "liquidity_ok": liq_ok,
     }
 
 def load_fii_net(ch, as_of: date) -> float:
@@ -200,14 +206,50 @@ def prev_trading_day(ch, symbol: str, expiry: date) -> date | None:
 
 # ── Strike analysis helpers ───────────────────────────────────────────────────
 
-def find_atm(df_t1: pd.DataFrame, spot: float, step: int) -> float:
-    """Round spot to nearest strike step, verify it exists in data."""
-    atm = round(spot / step) * step
+def find_liquid_atm(df: pd.DataFrame, theoretical_atm: float,
+                    step: int, symbol: str) -> tuple[float, float, float, bool]:
+    """
+    Pick the most liquid strike within ±3 steps of theoretical ATM.
+    Liquidity = CE OI + PE OI above per-symbol threshold.
+    Returns (atm_strike, oi_ce, oi_pe, liquidity_ok).
+    Falls back to theoretical ATM if nothing meets the threshold.
+    """
+    min_oi = MIN_OI.get(symbol, 5_000)
+    ce = df[df["option_type"] == "CE"].set_index("strike")
+    pe = df[df["option_type"] == "PE"].set_index("strike")
+    common = ce.index.intersection(pe.index)
+
+    best_strike = theoretical_atm
+    best_total_oi = 0.0
+    liquidity_ok = False
+
+    for offset in range(0, 4):           # check ATM, ±1, ±2, ±3 steps
+        for sign in ([0] if offset == 0 else [1, -1]):
+            k = theoretical_atm + sign * offset * step
+            if k not in common:
+                continue
+            oi_ce = float(ce.loc[k, "oi"]) if "oi" in ce.columns else 0.0
+            oi_pe = float(pe.loc[k, "oi"]) if "oi" in pe.columns else 0.0
+            total  = oi_ce + oi_pe
+            meets  = oi_ce >= min_oi and oi_pe >= min_oi
+            if meets and total > best_total_oi:
+                best_total_oi = total
+                best_strike   = k
+                liquidity_ok  = True
+
+    # Read final OI at chosen strike
+    oi_ce = float(ce.loc[best_strike, "oi"]) if best_strike in ce.index and "oi" in ce.columns else 0.0
+    oi_pe = float(pe.loc[best_strike, "oi"]) if best_strike in pe.index and "oi" in pe.columns else 0.0
+    return best_strike, oi_ce, oi_pe, liquidity_ok
+
+
+def find_atm(df_t1: pd.DataFrame, spot: float, step: int, symbol: str = "NIFTY") -> tuple[float, float, float, bool]:
+    """Round spot to nearest step, then apply liquidity check."""
+    theoretical = round(spot / step) * step
     available = df_t1["strike"].unique()
-    if atm in available:
-        return atm
-    # find closest available strike
-    return min(available, key=lambda k: abs(k - spot))
+    if theoretical not in available:
+        theoretical = min(available, key=lambda k: abs(k - spot))
+    return find_liquid_atm(df_t1, theoretical, step, symbol)
 
 def straddle_at_strike(df: pd.DataFrame, strike: float) -> float:
     """CE + PE ltp at a given strike. 0 if either leg missing."""
@@ -276,9 +318,13 @@ def simulate_expiry(ch, symbol: str, expiry: date, step: int) -> dict | None:
 
     spot_t1      = ctx_t1["spot"]
     spot_expiry  = ctx_t.get("spot", 0) if ctx_t else 0
-    atm_t1       = find_atm(df_t1, spot_t1, step)
+    atm_t1, oi_ce, oi_pe, liq_ok = find_atm(df_t1, spot_t1, step, symbol)
     iv_t1        = ctx_t1.get("atm_ce_iv", 0) or ctx_t1.get("atm_pe_iv", 0)
-    day_of_week  = expiry.strftime("%A")  # Tuesday for NIFTY
+    day_of_week  = expiry.strftime("%A")
+
+    if not liq_ok:
+        log.debug("Low liquidity at ATM for %s expiry=%s (CE OI=%.0f PE OI=%.0f)",
+                  symbol, expiry, oi_ce, oi_pe)
 
     # ── 1DTE scenario ─────────────────────────────────────────────────────────
     entry_1dte   = straddle_at_strike(df_t1, atm_t1)
@@ -354,6 +400,10 @@ def simulate_expiry(ch, symbol: str, expiry: date, step: int) -> dict | None:
         "atm_iv":                 round(iv_t1, 2),
         "pcr":                    round(ctx_t1.get("pcr", 0), 4),
         "fii_net_3d":             round(fii_net, 2),
+        # Liquidity
+        "oi_ce":                  round(oi_ce, 0),
+        "oi_pe":                  round(oi_pe, 0),
+        "liquidity_ok":           int(liq_ok),
     }
 
 # ── Report ────────────────────────────────────────────────────────────────────
@@ -545,6 +595,9 @@ def ensure_table(ch):
             atm_iv               Float64,
             pcr                  Float64,
             fii_net_3d           Float64,
+            oi_ce                Float64 DEFAULT 0,
+            oi_pe                Float64 DEFAULT 0,
+            liquidity_ok         Int8    DEFAULT 0,
             run_date             Date DEFAULT today()
         ) ENGINE = ReplacingMergeTree(run_date)
         ORDER BY (symbol, expiry_date)
