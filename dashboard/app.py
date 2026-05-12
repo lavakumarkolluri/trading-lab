@@ -86,6 +86,7 @@ page = st.sidebar.radio("Navigate", [
     "Breakout Backtest",
     "Data Freshness",
     "Fundamentals",
+    "Edge Analysis",
 ])
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Auto-refresh: 60s | Capital: {fmt_inr(STARTING_CAPITAL)}")
@@ -1798,6 +1799,212 @@ elif page == "Fundamentals":
                      color_continuous_scale=["#7a2a2a", "#7a4a2a", "#7a7a2a", "#4a9a5a", "#1a7a3a"],
                      title="Fundamental Quality Distribution")
         st.plotly_chart(fig, use_container_width=True)
+
+
+elif page == "Edge Analysis":
+    import plotly.express as px
+    import plotly.graph_objects as go
+
+    st.title("Edge Analysis — NIFTY Straddle")
+    st.caption(
+        "Backtested on historical NIFTY weekly expiries. "
+        "1DTE = sell ATM straddle at T-1 EOD; 0DTE = estimated open-price straddle on expiry day."
+    )
+
+    with st.expander("Strategy Explained", expanded=True):
+        st.markdown("""
+**What we trade**: We sell an ATM (at-the-money) straddle on NIFTY every Tuesday expiry.
+A straddle = sell 1 CE (call option) + 1 PE (put option) at the same strike price nearest to spot.
+
+**Why sell?** Options decay to zero on expiry day. If NIFTY stays near our strike, both options expire worthless and we keep the full premium. We profit when the market *doesn't move much*.
+
+**The edge**: Implied Volatility (IV) — what options are priced at — tends to overestimate actual market moves. This difference (Implied - Realized) is the **Volatility Risk Premium (VRP)**. When VRP > 0, option sellers have a structural advantage.
+
+**How we manage risk**:
+- Target: close the trade when we've kept ~₹2000 profit (options lost enough value)
+- Stop: exit if options gain ₹1000 (market moved against us)
+- Trailing stop: once target is hit, trail at 75% of peak profit to lock in gains
+- Entry window: 09:30–14:00 IST; forced exit at 15:20 IST (before close)
+
+**Key insight from backtest**: 71.8% of expiries end profitably for the seller (0DTE).
+High-IV environments (ATM IV > 20) show 80%+ win rates. Tuesday expiries specifically show **75.8% win rate**.
+        """)
+
+    ea_df = query(
+        "SELECT expiry_date, day_of_week, spot_t1, spot_expiry, atm_strike, "
+        "       entry_1dte, exit_1dte, profit_1dte_pts, profit_1dte_pct, win_1dte, "
+        "       estimated_0dte_entry, profit_0dte_pts, profit_0dte_pct, win_0dte, "
+        "       implied_move_pct, realized_move_pct, vrp, "
+        "       best_profit_pts, best_dist_from_atm, atm_profit_pts, "
+        "       iv_rank, atm_iv, pcr "
+        "FROM analysis.edge_analysis FINAL "
+        "WHERE symbol = 'NIFTY' "
+        "ORDER BY expiry_date"
+    )
+
+    if ea_df.empty:
+        st.warning("No edge analysis data. Run: docker compose run --rm edge_analysis")
+    else:
+        # ── Summary KPIs ──────────────────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("Summary Statistics")
+        n = len(ea_df)
+        wr_1dte = ea_df["win_1dte"].mean() * 100
+        wr_0dte = ea_df["win_0dte"].mean() * 100
+        avg_vrp = ea_df["vrp"].mean()
+        avg_profit_0dte = ea_df["profit_0dte_pts"].mean()
+        avg_profit_1dte = ea_df["profit_1dte_pts"].mean()
+        exp_0dte = (
+            ea_df[ea_df["win_0dte"] == 1]["profit_0dte_pts"].mean() * wr_0dte / 100
+            + ea_df[ea_df["win_0dte"] == 0]["profit_0dte_pts"].mean() * (1 - wr_0dte / 100)
+        )
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Expiries analysed", n)
+        c2.metric("0DTE win rate", f"{wr_0dte:.1f}%")
+        c3.metric("1DTE win rate", f"{wr_1dte:.1f}%")
+        c4.metric("Avg VRP", f"{avg_vrp:+.3f}%")
+        c5.metric("0DTE expectancy", f"{exp_0dte:+.0f} pts")
+
+        st.markdown("---")
+
+        # ── Win rates by condition ─────────────────────────────────────────────
+        st.subheader("Win Rate by Market Condition")
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.markdown("**By ATM IV bucket**")
+            bins_iv = [0, 12, 16, 20, 25, 100]
+            labels_iv = ["<12", "12–16", "16–20", "20–25", ">25"]
+            ea_df["iv_bucket"] = pd.cut(ea_df["atm_iv"], bins=bins_iv, labels=labels_iv)
+            iv_grp = ea_df.groupby("iv_bucket", observed=True).agg(
+                N=("win_1dte", "count"),
+                WinPct=("win_1dte", lambda x: x.mean() * 100),
+                AvgProfit=("profit_1dte_pts", "mean"),
+            ).reset_index()
+            iv_grp.columns = ["ATM IV", "N", "Win %", "Avg Profit (pts)"]
+            iv_grp["Win %"] = iv_grp["Win %"].round(1)
+            iv_grp["Avg Profit (pts)"] = iv_grp["Avg Profit (pts)"].round(1)
+            st.dataframe(iv_grp, hide_index=True, use_container_width=True)
+
+        with col_b:
+            st.markdown("**By Day of Week**")
+            dow_grp = ea_df.groupby("day_of_week").agg(
+                N=("win_1dte", "count"),
+                WinPct=("win_1dte", lambda x: x.mean() * 100),
+                AvgProfit=("profit_1dte_pts", "mean"),
+            ).reset_index()
+            dow_grp.columns = ["Day", "N", "Win %", "Avg Profit (pts)"]
+            dow_grp["Win %"] = dow_grp["Win %"].round(1)
+            dow_grp["Avg Profit (pts)"] = dow_grp["Avg Profit (pts)"].round(1)
+            st.dataframe(dow_grp, hide_index=True, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── IV Rank conditional ────────────────────────────────────────────────
+        st.subheader("Win Rate by IV Rank")
+        bins_ivr = [0, 20, 40, 60, 80, 101]
+        labels_ivr = ["0–20", "20–40", "40–60", "60–80", "80+"]
+        ea_df["ivr_bucket"] = pd.cut(ea_df["iv_rank"], bins=bins_ivr, labels=labels_ivr)
+        ivr_grp = ea_df.groupby("ivr_bucket", observed=True).agg(
+            N=("win_1dte", "count"),
+            WinPct=("win_1dte", lambda x: x.mean() * 100),
+            AvgProfit=("profit_1dte_pts", "mean"),
+        ).reset_index()
+
+        fig_ivr = px.bar(
+            ivr_grp, x="ivr_bucket", y="WinPct",
+            text=ivr_grp["N"].apply(lambda n: f"n={n}"),
+            color="WinPct",
+            color_continuous_scale=["#7a2a2a", "#7a7a2a", "#1a7a3a"],
+            range_color=[40, 100],
+            labels={"ivr_bucket": "IV Rank Bucket", "WinPct": "Win Rate (%)"},
+            title="1DTE Win Rate by IV Rank"
+        )
+        fig_ivr.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="50% break-even")
+        st.plotly_chart(fig_ivr, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Per-expiry profit scatter ──────────────────────────────────────────
+        st.subheader("Per-Expiry Profit Distribution (1DTE)")
+        ea_df["expiry_str"] = ea_df["expiry_date"].astype(str)
+        ea_df["color"] = ea_df["win_1dte"].map({1: "Win", 0: "Loss"})
+
+        fig_scatter = px.scatter(
+            ea_df, x="expiry_str", y="profit_1dte_pts",
+            color="color",
+            color_discrete_map={"Win": "#1a7a3a", "Loss": "#7a2a2a"},
+            labels={"expiry_str": "Expiry Date", "profit_1dte_pts": "Profit (pts)"},
+            title="Per-Expiry Straddle Profit (1DTE)",
+            hover_data=["atm_iv", "iv_rank", "pcr"],
+        )
+        fig_scatter.add_hline(y=0, line_dash="dash", line_color="gray")
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Cumulative P&L ────────────────────────────────────────────────────
+        st.subheader("Cumulative P&L (1DTE, equal size every expiry)")
+        ea_df_sorted = ea_df.sort_values("expiry_date")
+        ea_df_sorted["cumulative_pnl"] = ea_df_sorted["profit_1dte_pts"].cumsum()
+
+        fig_cum = go.Figure()
+        fig_cum.add_trace(go.Scatter(
+            x=ea_df_sorted["expiry_str"],
+            y=ea_df_sorted["cumulative_pnl"],
+            mode="lines+markers",
+            name="Cumulative P&L",
+            line=dict(color="#4a9aff", width=2),
+            marker=dict(
+                color=ea_df_sorted["win_1dte"].map({1: "#1a7a3a", 0: "#7a2a2a"}),
+                size=6,
+            ),
+        ))
+        fig_cum.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig_cum.update_layout(title="Cumulative Straddle P&L (pts)", xaxis_title="Expiry", yaxis_title="Points")
+        st.plotly_chart(fig_cum, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Stop/Target calibration ────────────────────────────────────────────
+        st.subheader("Stop / Target Calibration (0DTE, % of collected premium)")
+        targets = [20, 30, 40, 50, 60, 70, 80]
+        stops   = [20, 30, 50, 80, 100]
+
+        target_hits = []
+        for t in targets:
+            hit_pct = (ea_df["profit_0dte_pct"] >= t).mean() * 100
+            target_hits.append({"Threshold": f"Keep {t}%", "Hit Rate (%)": round(hit_pct, 1), "Type": "Target"})
+
+        stop_hits = []
+        for s in stops:
+            breached_pct = (ea_df["profit_0dte_pct"] <= -s).mean() * 100
+            stop_hits.append({"Threshold": f"Lose {s}%", "Hit Rate (%)": round(breached_pct, 1), "Type": "Stop"})
+
+        calib_df = pd.DataFrame(target_hits + stop_hits)
+        col_t, col_s = st.columns(2)
+        with col_t:
+            st.markdown("**Targets — how often do we keep X% of premium?**")
+            st.dataframe(calib_df[calib_df["Type"] == "Target"][["Threshold", "Hit Rate (%)"]], hide_index=True)
+        with col_s:
+            st.markdown("**Stops — how often does loss exceed X% of premium?**")
+            st.dataframe(calib_df[calib_df["Type"] == "Stop"][["Threshold", "Hit Rate (%)"]], hide_index=True)
+
+        st.info(
+            "Recommendation: Set target at 30% of premium (hits 60% of expiries) and stop at 80% of premium "
+            "(only breached 8% of expiries). This gives a ~7:1 win/loss frequency ratio."
+        )
+
+        st.markdown("---")
+        # ── Raw data ──────────────────────────────────────────────────────────
+        with st.expander("Raw per-expiry data"):
+            show_cols = ["expiry_date", "day_of_week", "atm_iv", "iv_rank", "pcr",
+                         "profit_1dte_pts", "profit_1dte_pct", "win_1dte",
+                         "profit_0dte_pts", "profit_0dte_pct", "win_0dte", "vrp"]
+            st.dataframe(ea_df[show_cols].sort_values("expiry_date", ascending=False),
+                         hide_index=True, use_container_width=True)
 
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────

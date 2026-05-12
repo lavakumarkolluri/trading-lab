@@ -76,5 +76,6 @@ COPY events_pipeline.py .
 COPY intraday_monitor.py .
 COPY data_freshness_check.py .
 COPY monthly_breakout_backtest.py .
+COPY edge_analysis.py .
 
 CMD ["python", "main.py"]
