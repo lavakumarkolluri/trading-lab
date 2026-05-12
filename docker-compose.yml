@@ -753,6 +753,21 @@ services:
     entrypoint: ["python", "weekend_theta_backtest.py"]
     command: []
 
+  compute_greeks:
+    build: *pipeline-build
+    container_name: compute_greeks
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "compute_greeks.py"]
+    command: []
+
   data_freshness_check:
     build: *pipeline-build
     container_name: data_freshness_check
