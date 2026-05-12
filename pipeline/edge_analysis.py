@@ -70,7 +70,7 @@ def get_ch():
 def load_expiries(ch, symbol: str) -> list[date]:
     rows = ch.query(
         "SELECT DISTINCT expiry FROM market.options_chain FINAL "
-        "WHERE symbol={sym:String} AND expiry >= '2024-01-01' "
+        "WHERE symbol={sym:String} AND expiry >= '2019-01-01' AND expiry <= today() "
         "ORDER BY expiry",
         parameters={"sym": symbol}
     ).result_rows
@@ -104,18 +104,18 @@ def load_eod_context(ch, symbol: str, snap_date: date, expiry: date) -> dict:
             "WHERE date={d:Date} AND expiry={exp:Date}",
             parameters={"d": snap_date, "exp": expiry}
         )
-        if not result.result_rows:
-            return {}
-        r = result.result_rows[0]
-        return {
-            "spot": float(r[0] or 0),
-            "atm_strike": float(r[1] or 0),
-            "atm_ce_iv": float(r[2] or 0),
-            "atm_pe_iv": float(r[3] or 0),
-            "iv_rank": float(r[4] or 0),
-            "iv_percentile": float(r[5] or 0),
-            "pcr": float(r[6] or 0),
-        }
+        if result.result_rows:
+            r = result.result_rows[0]
+            return {
+                "spot": float(r[0] or 0),
+                "atm_strike": float(r[1] or 0),
+                "atm_ce_iv": float(r[2] or 0),
+                "atm_pe_iv": float(r[3] or 0),
+                "iv_rank": float(r[4] or 0),
+                "iv_percentile": float(r[5] or 0),
+                "pcr": float(r[6] or 0),
+            }
+        # Fall through to put-call parity for historical dates not in options_eod_summary
 
     # ── Derive context from options_chain for BANKNIFTY / FINNIFTY ──────────────
     step = STRIKE_STEPS.get(symbol, 50)
