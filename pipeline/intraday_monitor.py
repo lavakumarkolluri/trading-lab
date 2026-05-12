@@ -26,6 +26,7 @@ Usage:
 
 import json
 import logging
+import math
 import os
 import signal
 import time
@@ -63,6 +64,9 @@ STOP_COOLDOWN_M  = 30         # minutes to wait before re-entry after stop hit
 
 MIN_PREMIUM_NIFTY     = 40.0   # don't enter if straddle too cheap
 MIN_PREMIUM_BANKNIFTY = 80.0
+
+DELTA_HEDGE_THRESHOLD = 0.15   # hedge when |net_delta| exceeds this
+RISK_FREE_RATE        = 0.065  # India 10-yr approx
 
 CH_HOST = os.getenv("CH_HOST", "clickhouse")
 CH_PORT = int(os.getenv("CH_PORT", "8123"))
@@ -120,6 +124,191 @@ def load_lot_sizes(ch) -> dict:
     except Exception as e:
         log.warning(f"Could not load lot sizes from DB: {e} — using defaults")
         return DEFAULT_LOT_SIZES
+
+
+# ── Black-Scholes Greeks ──────────────────────────────────────────────────────
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_delta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    """Black-Scholes delta for a European option."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.5 if is_call else -0.5
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return _norm_cdf(d1) if is_call else _norm_cdf(d1) - 1.0
+
+
+def bs_call_price(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+
+
+def implied_vol(S: float, K: float, T: float, r: float, market_price: float) -> float:
+    """Newton-Raphson IV from call price. Returns 0.15 fallback if non-convergent."""
+    if T <= 0 or market_price <= 0:
+        return 0.15
+    sigma = 0.25  # initial guess
+    for _ in range(50):
+        price = bs_call_price(S, K, T, r, sigma)
+        vega  = S * math.sqrt(T) * math.exp(-0.5 * ((math.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*math.sqrt(T)))**2) / math.sqrt(2 * math.pi)
+        if vega < 1e-8:
+            break
+        diff = price - market_price
+        sigma -= diff / vega
+        sigma = max(0.01, min(sigma, 5.0))
+        if abs(diff) < 0.001:
+            return sigma
+    return sigma
+
+
+def compute_net_delta(spot: float, strike: float, expiry: date,
+                      ce_ltp: float, pe_ltp: float) -> float:
+    """
+    Net delta of a SHORT straddle position.
+    Short call delta = -N(d1); short put delta = 1 - N(d1).
+    Net = short_call_delta + short_put_delta = 1 - 2*N(d1).
+    """
+    today = date.today()
+    T = max((expiry - today).days / 365.0, 1 / 365.0)
+    # Use CE LTP to back-solve IV; fall back to 0.15 if inputs invalid
+    iv = implied_vol(spot, strike, T, RISK_FREE_RATE, ce_ltp) if ce_ltp > 0.5 else 0.15
+    d1_val = (math.log(spot / strike) + (RISK_FREE_RATE + 0.5 * iv ** 2) * T) / (iv * math.sqrt(T))
+    n_d1 = _norm_cdf(d1_val)
+    return 1.0 - 2.0 * n_d1   # net delta of short straddle
+
+
+def get_spot_from_chain(ch, symbol: str, expiry: date) -> float | None:
+    """Derive spot via put-call parity from the latest options chain snapshot."""
+    try:
+        r = ch.query("""
+            SELECT strike, option_type, ltp FROM market.options_chain
+            WHERE symbol={sym:String} AND expiry={exp:Date}
+              AND toDate(timestamp) = today()
+              AND timestamp = (
+                  SELECT max(timestamp) FROM market.options_chain
+                  WHERE symbol={sym:String} AND toDate(timestamp) = today()
+              )
+              AND ltp > 0.5
+        """, parameters={"sym": symbol, "exp": expiry})
+        if not r.result_rows:
+            return None
+        import pandas as pd
+        df = pd.DataFrame(r.result_rows, columns=["strike", "option_type", "ltp"])
+        df["strike"] = df["strike"].astype(float)
+        df["ltp"]    = df["ltp"].astype(float)
+        ce = df[df["option_type"] == "CE"].set_index("strike")["ltp"]
+        pe = df[df["option_type"] == "PE"].set_index("strike")["ltp"]
+        common = ce.index.intersection(pe.index)
+        if common.empty:
+            return None
+        atm = float((ce.loc[common] - pe.loc[common]).abs().idxmin())
+        return atm + float(ce.loc[atm]) - float(pe.loc[atm])
+    except Exception as e:
+        log.warning(f"[{symbol}] spot derivation failed: {e}")
+        return None
+
+
+def get_position_delta(ch, symbol: str, expiry: date,
+                       strike: float) -> tuple[float, float] | None:
+    """
+    Return (net_delta, spot) for a short straddle at the given strike.
+    Tries NSE-provided delta first; falls back to Black-Scholes computation.
+    Net delta for short straddle = -(ce_delta) + -(pe_delta)
+                                 = -ce_delta - pe_delta
+    """
+    try:
+        r = ch.query("""
+            SELECT option_type, delta, ltp FROM market.options_chain
+            WHERE symbol={sym:String} AND expiry={exp:Date}
+              AND strike={k:Float64}
+              AND toDate(timestamp) = today()
+              AND timestamp = (
+                  SELECT max(timestamp) FROM market.options_chain
+                  WHERE symbol={sym:String} AND toDate(timestamp) = today()
+              )
+              AND ltp > 0.5
+        """, parameters={"sym": symbol, "exp": expiry, "k": strike})
+
+        if not r.result_rows:
+            return None
+
+        ce_delta = pe_delta = ce_ltp = pe_ltp = None
+        for opt_type, delta_val, ltp in r.result_rows:
+            if opt_type == "CE":
+                ce_delta, ce_ltp = float(delta_val), float(ltp)
+            elif opt_type == "PE":
+                pe_delta, pe_ltp = float(delta_val), float(ltp)
+
+        spot = get_spot_from_chain(ch, symbol, expiry)
+        if spot is None:
+            return None
+
+        # If NSE provided non-zero deltas, use them directly
+        if ce_delta and pe_delta and (abs(ce_delta) > 0.01 or abs(pe_delta) > 0.01):
+            net_delta = -ce_delta + (-pe_delta)   # short both legs
+            return net_delta, spot
+
+        # Fall back to BS computation
+        if ce_ltp and pe_ltp:
+            net_delta = compute_net_delta(spot, strike, expiry, ce_ltp, pe_ltp)
+            return net_delta, spot
+
+    except Exception as e:
+        log.warning(f"[{symbol}] delta computation failed: {e}")
+    return None
+
+
+# ── Delta hedge recording ─────────────────────────────────────────────────────
+
+def record_hedge(ch, pos: dict, net_delta: float, spot: float, dry_run: bool) -> float:
+    """
+    Record a paper futures hedge to neutralise net_delta.
+    Returns the hedge lot size applied (negative = sold futures).
+    """
+    # Lots to trade: -net_delta brings position back to zero
+    # One futures lot = 1 index lot (same lot_size as options)
+    hedge_lots = -net_delta * pos["lot_size"]
+    direction  = "buy" if hedge_lots > 0 else "sell"
+    cum_lots   = float(pos.get("hedge_lots_cum", 0.0)) + hedge_lots
+    now        = ist_naive()
+
+    log.info(f"[{pos['symbol']}] DELTA HEDGE net_delta={net_delta:+.3f} "
+             f"→ {direction} {abs(hedge_lots):.1f} futures lots  "
+             f"spot={spot:.1f}  cumulative={cum_lots:+.1f}")
+
+    if not dry_run:
+        ch.insert(
+            "trades.delta_hedges",
+            [[pos["trade_id"], pos["symbol"], now,
+              net_delta, hedge_lots, direction, spot, cum_lots]],
+            column_names=["trade_id", "symbol", "hedge_time",
+                          "net_delta", "hedge_lots", "hedge_direction",
+                          "spot_at_hedge", "cumulative_lots"],
+        )
+        # Update open_positions with latest net_delta and cumulative hedge
+        ch.insert(
+            "trades.open_positions",
+            [[pos["trade_id"], pos["symbol"], pos["expiry"], pos["entry_time"],
+              pos["strike"], pos["entry_ce_ltp"], pos["entry_pe_ltp"], pos["entry_premium"],
+              pos["lot_size"], pos["target_pts"], pos["stop_pts"],
+              pos["target_inr"], pos["stoploss_inr"],
+              pos["scorecard_conf"], "open",
+              int(pos["trailing_active"]), float(pos["peak_pnl_inr"]),
+              float(pos["trail_stop_inr"]), now, pos.get("entry_features", "{}"),
+              net_delta, cum_lots]],
+            column_names=["trade_id", "symbol", "expiry", "entry_time", "strike",
+                          "entry_ce_ltp", "entry_pe_ltp", "entry_premium",
+                          "lot_size", "target_pts", "stop_pts", "target_inr", "stoploss_inr",
+                          "scorecard_conf", "status",
+                          "trailing_active", "peak_pnl_inr", "trail_stop_inr", "last_checked",
+                          "entry_features", "net_delta", "hedge_lots_cum"],
+        )
+    return hedge_lots
 
 
 # ── Market data ───────────────────────────────────────────────────────────────
@@ -294,13 +483,13 @@ def record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run=False) -> s
               snap["strike"], snap["ce_ltp"], snap["pe_ltp"], snap["straddle"],
               lot_size, target_pts, stop_pts, TARGET_INR, STOPLOSS_INR,
               scorecard_conf, "open",
-              0, 0.0, 0.0, entry_time, features]],
+              0, 0.0, 0.0, entry_time, features, 0.0, 0.0]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
-                          "entry_features"],
+                          "entry_features","net_delta","hedge_lots_cum"],
         )
     return trade_id
 
@@ -336,13 +525,14 @@ def record_exit(ch, pos, current_straddle, exit_reason, dry_run=False):
               pos["target_inr"], pos["stoploss_inr"],
               pos["scorecard_conf"], "closed",
               int(pos["trailing_active"]), float(pos["peak_pnl_inr"]),
-              float(pos["trail_stop_inr"]), exit_time, pos.get("entry_features", "{}")]],
+              float(pos["trail_stop_inr"]), exit_time, pos.get("entry_features", "{}"),
+              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0))]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
-                          "entry_features"],
+                          "entry_features","net_delta","hedge_lots_cum"],
         )
 
 
@@ -363,13 +553,14 @@ def update_trail(ch, pos, pnl_inr, dry_run=False):
               pos["lot_size"], pos["target_pts"], pos["stop_pts"],
               pos["target_inr"], pos["stoploss_inr"],
               pos["scorecard_conf"], "open",
-              1, peak, trail, now, pos.get("entry_features", "{}")]],
+              1, peak, trail, now, pos.get("entry_features", "{}"),
+              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0))]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
-                          "entry_features"],
+                          "entry_features","net_delta","hedge_lots_cum"],
         )
     return peak, trail
 
@@ -398,6 +589,14 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
                  f"entry={pos['entry_premium']:.1f} now={current:.1f} "
                  f"pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f} "
                  f"trailing={'yes' if pos['trailing_active'] else 'no'}")
+
+        # Delta hedge check — prefer NSE-provided delta, fall back to BS computation
+        delta_info = get_position_delta(ch, symbol, pos["expiry"], float(pos["strike"]))
+        if delta_info:
+            net_delta, spot = delta_info
+            log.info(f"[{symbol}] net_delta={net_delta:+.3f} spot={spot:.1f}")
+            if abs(net_delta) > DELTA_HEDGE_THRESHOLD:
+                record_hedge(ch, pos, net_delta, spot, dry_run)
 
         # EOD exit
         if t >= EOD_EXIT:
