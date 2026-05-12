@@ -79,5 +79,6 @@ COPY monthly_breakout_backtest.py .
 COPY edge_analysis.py .
 COPY weekend_theta_backtest.py .
 COPY price_action.py .
+COPY compute_greeks.py .
 
 CMD ["python", "main.py"]
