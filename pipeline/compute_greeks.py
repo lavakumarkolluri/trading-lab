@@ -138,7 +138,7 @@ def derive_spot(df_day: pd.DataFrame) -> dict:
 
 def process_day(ch, symbol: str, dt: date, dry_run: bool) -> int:
     result = ch.query(
-        "SELECT timestamp, expiry, strike, option_type, ltp, version "
+        "SELECT timestamp, expiry, strike, option_type, ltp, oi, oi_change, volume, version "
         "FROM market.options_chain "
         "WHERE symbol={sym:String} AND toDate(timestamp)={d:Date} AND ltp > 0.1 "
         "ORDER BY timestamp, expiry, strike",
@@ -148,7 +148,8 @@ def process_day(ch, symbol: str, dt: date, dry_run: bool) -> int:
         return 0
 
     df = pd.DataFrame(result.result_rows,
-                      columns=["timestamp", "expiry", "strike", "option_type", "ltp", "version"])
+                      columns=["timestamp", "expiry", "strike", "option_type",
+                               "ltp", "oi", "oi_change", "volume", "version"])
     df["strike"] = df["strike"].astype(float)
     df["ltp"]    = df["ltp"].astype(float)
 
@@ -176,9 +177,9 @@ def process_day(ch, symbol: str, dt: date, dry_run: bool) -> int:
             "iv":          iv,
             "delta":       delta,
             "theta":       theta,
-            "oi":          0,
-            "oi_change":   0,
-            "volume":      0,
+            "oi":          int(row["oi"]),
+            "oi_change":   int(row["oi_change"]),
+            "volume":      int(row["volume"]),
             "version":     int(row["version"]) + 1,
         })
 
@@ -218,9 +219,9 @@ def main():
                  symbol, from_dt, to_dt, args.workers)
 
         dates = [r[0] for r in ch_main.query(
-            "SELECT DISTINCT toDate(timestamp) as dt FROM market.options_chain "
+            "SELECT DISTINCT toDate(timestamp) as dt FROM market.options_chain FINAL "
             "WHERE symbol={sym:String} AND toDate(timestamp) BETWEEN {d_from:Date} AND {d_to:Date} "
-            "  AND delta = 0 ORDER BY dt",
+            "  AND (delta = 0 OR oi = 0) AND ltp > 0.1 ORDER BY dt",
             parameters={"sym": symbol, "d_from": from_dt, "d_to": to_dt}
         ).result_rows]
         log.info("  %d dates to process", len(dates))

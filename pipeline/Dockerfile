@@ -80,5 +80,6 @@ COPY edge_analysis.py .
 COPY weekend_theta_backtest.py .
 COPY price_action.py .
 COPY compute_greeks.py .
+COPY compute_vol_surface.py .
 
 CMD ["python", "main.py"]
