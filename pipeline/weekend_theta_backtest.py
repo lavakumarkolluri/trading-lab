@@ -183,6 +183,26 @@ def straddle_intrinsic(strike: float, spot: float) -> float:
     return abs(spot - strike)
 
 
+def fetch_friday_vix(ch, friday: date) -> float:
+    """Return India VIX for the given Friday from market.nifty_live (0 if unavailable)."""
+    result = ch.query(
+        "SELECT vix FROM market.nifty_live "
+        "WHERE toDate(timestamp)={d:Date} ORDER BY timestamp DESC LIMIT 1",
+        parameters={"d": friday}
+    )
+    return float(result.result_rows[0][0]) if result.result_rows else 0.0
+
+
+def has_high_impact_event(ch, friday: date, expiry: date) -> int:
+    """Return 1 if a HIGH impact event falls between Friday and Tuesday expiry (inclusive)."""
+    result = ch.query(
+        "SELECT count() FROM market.events "
+        "WHERE impact='HIGH' AND event_date >= {d_from:Date} AND event_date <= {d_to:Date}",
+        parameters={"d_from": friday, "d_to": expiry}
+    )
+    return int(result.result_rows[0][0] > 0) if result.result_rows else 0
+
+
 # ── Build (friday, monday, expiry) triplets ───────────────────────────────────
 
 def build_triplets(trading_days: list[date], expiries: list[date]) -> list[tuple]:
@@ -280,6 +300,9 @@ def simulate_weekend(ch, symbol: str, friday: date, monday: date,
         "liquidity_ok":       int(fri_data["liquidity_ok"]),
         # Price action as of Friday
         **{k: v for k, v in compute_price_action(ch, symbol, friday).items()},
+        # Gap risk filters
+        "vix_friday":         fetch_friday_vix(ch, friday),
+        "event_week":         has_high_impact_event(ch, friday, expiry),
     }
 
 
@@ -389,6 +412,51 @@ def print_report(df: pd.DataFrame):
             ap = sub["weekend_decay_pts"].mean()
             print(f"  {label:26s}  {len(sub):>4d}  {wr:>5.1f}%  {ap:>+10.1f}")
 
+    # ── VIX filter impact ─────────────────────────────────────────────────────
+    if df["vix_friday"].sum() > 0:
+        print(f"\n── BY VIX (Friday close) ─────────────────────────────────────")
+        for label, lo, hi in [("<13 Low",  0, 13), ("13–17 Med", 13, 17),
+                               ("17–22 High", 17, 22), (">22 Fear", 22, 999)]:
+            sub = df[(df["vix_friday"] > lo) & (df["vix_friday"] <= hi) & (df["vix_friday"] > 0)]
+            if len(sub) < 3:
+                continue
+            wr = sub["win_mon"].mean() * 100
+            ap = sub["profit_mon_pts"].mean()
+            print(f"  {label:16s}  N={len(sub):3d}  Win={wr:.0f}%  AvgProfit={ap:+.1f}pts")
+
+        skip_high_vix = df[df["vix_friday"].between(0.1, 17)]
+        if len(skip_high_vix) > 3:
+            wr2 = skip_high_vix["win_mon"].mean() * 100
+            ap2 = skip_high_vix["profit_mon_pts"].mean()
+            print(f"  → Filter VIX≤17 only: N={len(skip_high_vix)}  Win={wr2:.1f}%  AvgProfit={ap2:+.1f}pts")
+
+    # ── Event week filter ─────────────────────────────────────────────────────
+    if df["event_week"].sum() > 0:
+        print(f"\n── EVENT WEEK FILTER ─────────────────────────────────────────")
+        non_event = df[df["event_week"] == 0]
+        event_wks = df[df["event_week"] == 1]
+        if len(non_event) > 3:
+            wr_ne = non_event["win_mon"].mean() * 100
+            ap_ne = non_event["profit_mon_pts"].mean()
+            print(f"  No event  N={len(non_event):3d}  Win={wr_ne:.1f}%  AvgProfit={ap_ne:+.1f}pts")
+        if len(event_wks) > 0:
+            wr_ev = event_wks["win_mon"].mean() * 100
+            ap_ev = event_wks["profit_mon_pts"].mean()
+            print(f"  Event wk  N={len(event_wks):3d}  Win={wr_ev:.1f}%  AvgProfit={ap_ev:+.1f}pts")
+
+    # ── Gap stop simulation ───────────────────────────────────────────────────
+    print(f"\n── GAP STOP SIMULATION (skip weeks gap_pct < -1.5%) ─────────")
+    no_big_gap = df[df["gap_pct"] >= -1.5]
+    big_gap_dn = df[df["gap_pct"] < -1.5]
+    if len(no_big_gap) > 3:
+        wr_ng = no_big_gap["win_mon"].mean() * 100
+        ap_ng = no_big_gap["profit_mon_pts"].mean()
+        print(f"  No large gap-dn  N={len(no_big_gap):3d}  Win={wr_ng:.1f}%  AvgProfit={ap_ng:+.1f}pts")
+    if len(big_gap_dn) > 0:
+        wr_bg = big_gap_dn["win_mon"].mean() * 100
+        ap_bg = big_gap_dn["profit_mon_pts"].mean()
+        print(f"  Gap-dn >1.5%     N={len(big_gap_dn):3d}  Win={wr_bg:.1f}%  AvgProfit={ap_bg:+.1f}pts  ← skip these")
+
     # ── Comparison ────────────────────────────────────────────────────────────
     print(f"\n── COMPARISON: Exit A (Mon) vs Exit B (Expiry) ──────────────")
     print(f"  Exit Mon  : {wr_mon:.1f}% win,  {exp_mon:+.1f}pts expectancy")
@@ -439,6 +507,8 @@ def ensure_table(ch):
             week_range_pct    Float64 DEFAULT 0,
             consec_inside_days Int32  DEFAULT 0,
             pa_available      Int8    DEFAULT 0,
+            vix_friday        Float64 DEFAULT 0,
+            event_week        Int8    DEFAULT 0,
             run_date          Date DEFAULT today()
         ) ENGINE = ReplacingMergeTree(run_date)
         ORDER BY (symbol, expiry_date)
