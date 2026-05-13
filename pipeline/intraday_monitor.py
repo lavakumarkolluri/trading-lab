@@ -52,9 +52,9 @@ log = logging.getLogger(__name__)
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
-SYMBOLS = ["NIFTY", "BANKNIFTY"]
+SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
 
-DEFAULT_LOT_SIZES = {"NIFTY": 75, "BANKNIFTY": 35}
+DEFAULT_LOT_SIZES = {"NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 40}
 
 TARGET_INR   = 2000.0
 STOPLOSS_INR = 1000.0
@@ -67,12 +67,11 @@ EOD_EXIT         = dtime(15, 20)
 MONITOR_EXIT     = dtime(15, 25)
 STOP_COOLDOWN_M  = 30         # minutes to wait before re-entry after stop hit
 
-MIN_PREMIUM_NIFTY     = 40.0   # don't enter if straddle too cheap
-MIN_PREMIUM_BANKNIFTY = 80.0
-MIN_CONFIDENCE        = 50.0   # skip entry if scorecard below this
+MIN_PREMIUM       = {"NIFTY": 40.0, "BANKNIFTY": 80.0, "FINNIFTY": 50.0}
+MIN_CONFIDENCE    = 50.0   # skip entry if scorecard below this
 
 # Iron fly wing distances (OTM strikes to buy for defined-risk structure)
-WING_PTS = {"NIFTY": 200.0, "BANKNIFTY": 500.0}
+WING_PTS = {"NIFTY": 200.0, "BANKNIFTY": 500.0, "FINNIFTY": 200.0}
 
 DELTA_HEDGE_THRESHOLD = 0.15   # hedge when |net_delta| exceeds this
 RISK_FREE_RATE        = 0.065  # India 10-yr approx
@@ -701,7 +700,7 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
     """One monitoring cycle for a symbol."""
     t = ist_time()
     lot_size = lot_sizes.get(symbol, DEFAULT_LOT_SIZES.get(symbol, 75))
-    min_premium = MIN_PREMIUM_NIFTY if symbol == "NIFTY" else MIN_PREMIUM_BANKNIFTY
+    min_premium = MIN_PREMIUM.get(symbol, 40.0)
 
     pos = get_open_position(ch, symbol)
 

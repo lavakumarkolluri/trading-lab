@@ -48,7 +48,7 @@ MARKET_CLOSE     = dtime(15, 30)
 EXIT_AFTER       = dtime(15, 35)    # hard exit
 FETCH_INTERVAL_S = 180              # 3 minutes
 
-SYMBOLS = ["NIFTY", "BANKNIFTY"]
+SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
 
 CH_HOST  = os.getenv("CH_HOST", "clickhouse")
 CH_PORT  = int(os.getenv("CH_PORT", "8123"))

@@ -384,6 +384,9 @@ def load_options_chain(ch, symbol: str) -> pd.DataFrame:
 # ── Feature Extraction ────────────────────────────────────────────────────────
 
 def find_atm_strike(ce: pd.Series, pe: pd.Series) -> Optional[float]:
+    # Deduplicate strikes (keep max LTP per strike to handle multi-expiry rows)
+    ce = ce.groupby(level=0).max()
+    pe = pe.groupby(level=0).max()
     common = ce.index.intersection(pe.index)
     common = common[(ce.loc[common] > 0.5) & (pe.loc[common] > 0.5)]
     if len(common) < 2:
