@@ -60,7 +60,7 @@ TARGET_INR   = 2000.0
 STOPLOSS_INR = 1000.0
 TRAIL_PCT    = 0.75        # trail stop = 75% of peak profit
 
-LOOP_INTERVAL_S  = 15 * 60   # 15 minutes
+LOOP_INTERVAL_S  = 5 * 60    # 5 minutes
 ENTRY_START      = dtime(9, 30)
 ENTRY_CUTOFF     = dtime(14, 0)
 EOD_EXIT         = dtime(15, 20)
