@@ -313,18 +313,23 @@ def show_status(ch):
 
 # ── Reprocess ─────────────────────────────────────────────
 
-def reprocess_from_minio(ch, mc: Minio):
+def reprocess_from_minio(ch, mc: Minio, fix_oi: bool = False):
     """
     Re-parse all bhavcopy zips already in MinIO using the current TARGET_SYMBOLS.
     Used to backfill new symbols (e.g. FINNIFTY, MIDCPNIFTY) without re-downloading.
     Insert is idempotent via ReplacingMergeTree.
+
+    fix_oi=True: override version with int(time.time()) so bhavcopy rows win over
+    any prior compute_greeks re-inserts (which used version = eod_ts + 1).
+    Run compute_greeks --workers N afterwards to recompute IVs with real OI.
     """
     objs = sorted(
         mc.list_objects(MINIO_BUCKET, prefix=MINIO_PREFIX, recursive=True),
         key=lambda o: o.object_name
     )
+    mode = "fix-oi (high version)" if fix_oi else "normal"
     log.info(f"Reprocessing {len(objs)} bhavcopy files from MinIO "
-             f"with symbols: {TARGET_SYMBOLS}")
+             f"with symbols: {TARGET_SYMBOLS}  mode={mode}")
 
     lot_size_known = build_lot_size_cache(ch)
     loaded = skipped = 0
@@ -341,6 +346,11 @@ def reprocess_from_minio(ch, mc: Minio):
         resp.close()
 
         rows, lot_sizes = parse_bhavcopy(zip_bytes, trade_date)
+
+        if fix_oi and rows:
+            high_version = int(time.time())
+            for r in rows:
+                r["version"] = high_version
 
         if lot_sizes:
             upsert_lot_sizes(ch, lot_sizes, trade_date, lot_size_known)
@@ -377,6 +387,9 @@ def main():
                         help="Show current DB stats and exit")
     parser.add_argument("--reprocess", action="store_true",
                         help="Re-parse all MinIO bhavcopy zips (backfills new symbols)")
+    parser.add_argument("--fix-oi", dest="fix_oi", action="store_true",
+                        help="Re-parse MinIO zips with version=now() to restore real OI "
+                             "overwritten by compute_greeks; run compute_greeks after")
     args = parser.parse_args()
 
     ch = get_ch_client()
@@ -389,6 +402,11 @@ def main():
     if args.reprocess:
         log.info("=== Reprocess mode — reading from MinIO ===")
         reprocess_from_minio(ch, mc)
+        return
+
+    if args.fix_oi:
+        log.info("=== Fix-OI mode — re-inserting bhavcopy with high version ===")
+        reprocess_from_minio(ch, mc, fix_oi=True)
         return
 
     today = date.today()

@@ -139,7 +139,7 @@ def derive_spot(df_day: pd.DataFrame) -> dict:
 def process_day(ch, symbol: str, dt: date, dry_run: bool) -> int:
     result = ch.query(
         "SELECT timestamp, expiry, strike, option_type, ltp, oi, oi_change, volume, version "
-        "FROM market.options_chain "
+        "FROM market.options_chain FINAL "
         "WHERE symbol={sym:String} AND toDate(timestamp)={d:Date} AND ltp > 0.1 "
         "ORDER BY timestamp, expiry, strike",
         parameters={"sym": symbol, "d": dt}
