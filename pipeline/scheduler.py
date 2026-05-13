@@ -413,24 +413,29 @@ def _run_tests_and_record():
 
     try:
         ch = _ch_client()
+        run_at = datetime.utcnow()
+        row = [branch, sha, msg, author, cts,
+               n_pass, n_fail, n_pass + n_fail,
+               duration, failed_names, status, run_at]
+        col_names = [
+            "branch", "commit_sha", "commit_msg", "commit_author", "commit_ts",
+            "tests_passed", "tests_failed", "tests_total", "duration_s",
+            "failed_tests", "status", "run_at",
+        ]
+        # ci_results: latest per branch (ReplacingMergeTree keyed by branch)
         ch.insert(
             "system_meta.ci_results",
-            [[branch, sha, msg, author, cts,
-              n_pass, n_fail, n_pass + n_fail,
-              duration, failed_names, status,
-              datetime.utcnow(), int(t0.timestamp())]],
-            column_names=[
-                "branch", "commit_sha", "commit_msg", "commit_author", "commit_ts",
-                "tests_passed", "tests_failed", "tests_total", "duration_s",
-                "failed_tests", "status", "run_at", "version",
-            ],
+            [row + [int(t0.timestamp())]],
+            column_names=col_names + ["version"],
         )
+        # deploy_log: append-only history — dashboard reads last 7 for propagation table
+        ch.insert("system_meta.deploy_log", [row], column_names=col_names)
         log.info(
             "TEST-RUN: branch=%s sha=%s %s/%s tests %s (%.1fs)",
             branch, sha, n_pass, n_pass + n_fail, status.upper(), duration,
         )
     except Exception as e:
-        log.error("TEST-RUN: failed to write ci_results: %s", e)
+        log.error("TEST-RUN: failed to write ci_results/deploy_log: %s", e)
 
 
 def job_graduation_gate():

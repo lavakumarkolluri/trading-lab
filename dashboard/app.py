@@ -5,7 +5,7 @@ Trading Lab — Dashboard
 
 import json
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.express as px
@@ -42,7 +42,7 @@ def get_ch():
     )
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def query(sql: str) -> pd.DataFrame:
     try:
         return get_ch().query_df(sql)
@@ -95,6 +95,44 @@ def span_estimate_pts(features_json: str, spot: float, lot_size: int) -> float:
 
 LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120}
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _age_str(dt) -> str:
+    """Human-readable age of a UTC datetime: 'just now', '5m ago', '3h ago', '2d ago'."""
+    if dt is None:
+        return "—"
+    if not isinstance(dt, datetime):
+        try:
+            dt = pd.Timestamp(dt).to_pydatetime()
+        except Exception:
+            return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def _to_ist_str(dt) -> str:
+    """Format a UTC datetime as IST HH:MM string."""
+    if dt is None:
+        return "—"
+    if not isinstance(dt, datetime):
+        try:
+            dt = pd.Timestamp(dt).to_pydatetime()
+        except Exception:
+            return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST).strftime("%H:%M IST")
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("📈 Trading Lab")
 if st.sidebar.button("🔄 Refresh"):
@@ -113,14 +151,41 @@ page = st.sidebar.radio("", [
 # PAGE 1 — SYSTEM HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 if page == "System Health":
-    st.title("🟢 System Health")
-    st.caption("All building blocks at a glance. Green = healthy, Yellow = warning, Red = action needed.")
 
-    today = date.today()
+    # Auto-refresh every 60 min (browser-level reload)
+    st.markdown('<meta http-equiv="refresh" content="3600">', unsafe_allow_html=True)
 
-    # ── Git Branch & CI Status ────────────────────────────────────────────────
+    # Track when the current session first loaded this page
+    if "health_loaded_at" not in st.session_state:
+        st.session_state.health_loaded_at = datetime.now(timezone.utc)
+    loaded_at_utc = st.session_state.health_loaded_at
+    loaded_age    = _age_str(loaded_at_utc)
+
+    now_ist = datetime.now(IST)
+    today   = now_ist.date()
+
+    # ── Page header bar ───────────────────────────────────────────────────────
+    hdr_left, hdr_right = st.columns([7, 3])
+    with hdr_left:
+        st.title("🟢 System Health")
+        st.caption(
+            f"{now_ist.strftime('%A, %d %B %Y · %H:%M IST')}  ·  "
+            f"Page loaded {loaded_age}  ·  data cache refreshes every 60 min"
+        )
+    with hdr_right:
+        st.markdown("")  # vertical padding
+        if st.button("🔄 Refresh now", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state.health_loaded_at = datetime.now(timezone.utc)
+            st.rerun()
+
+    st.divider()
+
+    # ── Current branch (latest CI result) ─────────────────────────────────────
+    st.subheader("Branch Status")
+
     ci_df = query("""
-        SELECT branch, commit_sha, commit_msg, commit_author, commit_ts,
+        SELECT branch, commit_sha, commit_msg, commit_author,
                tests_passed, tests_failed, tests_total, duration_s,
                failed_tests, status, run_at
         FROM system_meta.ci_results FINAL
@@ -128,32 +193,73 @@ if page == "System Health":
         LIMIT 1
     """)
 
-    st.subheader("Branch & CI Status")
     if ci_df.empty:
         st.info("No CI results yet — scheduler records tests after each auto-deploy.")
     else:
-        ci = ci_df.iloc[0]
-        all_pass = int(ci["tests_failed"]) == 0 and int(ci["tests_passed"]) > 0
-        ci_icon  = "🟢" if all_pass else "🔴"
-        n_pass   = int(ci["tests_passed"])
-        n_fail   = int(ci["tests_failed"])
-        n_total  = int(ci["tests_total"])
-        run_age  = (today - pd.Timestamp(ci["run_at"]).date()).days
+        ci      = ci_df.iloc[0]
+        n_pass  = int(ci["tests_passed"])
+        n_fail  = int(ci["tests_failed"])
+        n_total = int(ci["tests_total"])
+        all_ok  = n_fail == 0 and n_pass > 0
+        ci_icon = "🟢" if all_ok else "🔴"
+        run_at_dt = pd.Timestamp(ci["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Branch", str(ci["branch"]))
-        c2.metric("Commit", str(ci["commit_sha"])[:10],
-                  delta=str(ci["commit_msg"])[:40])
-        c3.metric(f"{ci_icon} Tests",
-                  f"{n_pass}/{n_total} passed",
-                  delta=f"{n_fail} failed" if n_fail else "All pass",
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Branch",  str(ci["branch"]))
+        c2.metric("Commit",  str(ci["commit_sha"])[:10])
+        c3.metric("Message", str(ci["commit_msg"])[:35] + ("…" if len(str(ci["commit_msg"])) > 35 else ""))
+        c4.metric(f"{ci_icon} Tests", f"{n_pass}/{n_total}",
+                  delta=f"{n_fail} failed" if n_fail else "all pass",
                   delta_color="inverse" if n_fail else "normal")
-        c4.metric("Last Run", f"{run_age}d ago",
+        c5.metric("Last Run", _age_str(run_at_dt),
                   delta=f"{float(ci['duration_s']):.0f}s")
 
         if n_fail > 0:
-            with st.expander(f"🔴 {n_fail} failing tests"):
+            with st.expander(f"🔴 {n_fail} failing tests — expand for names"):
                 st.code(str(ci["failed_tests"]))
+
+    st.divider()
+
+    # ── Last 7 deployments (stage → prod propagation history) ─────────────────
+    st.subheader("Last 7 Deployments  (stage → prod)")
+    st.caption(
+        "Every auto-deploy that detects a code change runs the test suite and records here. "
+        "Stage auto-merges to prod when all tests pass."
+    )
+
+    deploy_df = query("""
+        SELECT branch, commit_sha, commit_msg, commit_author,
+               tests_passed, tests_failed, tests_total, duration_s, status, run_at
+        FROM system_meta.deploy_log
+        ORDER BY run_at DESC
+        LIMIT 7
+    """)
+
+    if deploy_df.empty:
+        st.info(
+            "No deployment history yet — records appear here after the scheduler "
+            "runs its next auto-deploy cycle.",
+            icon="ℹ️",
+        )
+    else:
+        deploy_rows = []
+        for _, r in deploy_df.iterrows():
+            n_p = int(r["tests_passed"])
+            n_f = int(r["tests_failed"])
+            n_t = int(r["tests_total"])
+            ok  = n_f == 0 and n_p > 0
+            run_ts = pd.Timestamp(r["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
+            deploy_rows.append({
+                "Date / Time (IST)": run_ts.astimezone(IST).strftime("%d %b %Y  %H:%M"),
+                "Branch":            str(r["branch"]),
+                "Commit":            str(r["commit_sha"])[:10],
+                "Message":           str(r["commit_msg"])[:60],
+                "Author":            str(r["commit_author"])[:20],
+                "Tests":             f"{n_p}/{n_t}",
+                "Status":            "🟢 pass" if ok else "🔴 FAIL",
+                "Dur (s)":           f"{float(r['duration_s']):.0f}",
+            })
+        st.dataframe(pd.DataFrame(deploy_rows), use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -170,11 +276,7 @@ if page == "System Health":
     """)
 
     # Only services that actually write to pipeline_runs (others tracked via data freshness)
-    KEY_JOBS = [
-        "strategy_backtester",
-        "confidence_scorer",
-    ]
-
+    KEY_JOBS = ["strategy_backtester", "confidence_scorer"]
     STATUS_ICON = {"success": "🟢", "failed": "🔴", "running": "🟡", "skipped": "⬜"}
 
     if runs_df.empty:
@@ -187,29 +289,23 @@ if page == "System Health":
         for svc in KEY_JOBS:
             svc_rows = runs_df[runs_df["service"] == svc]
             if svc_rows.empty:
-                last_run = "—"
-                last_status = "⚫"
-                recent_err = ""
+                last_run, last_status, recent_err = "—", "⚫", ""
             else:
-                latest = svc_rows.sort_values("run_date", ascending=False).iloc[0]
-                last_run = str(latest["run_date"])
+                latest     = svc_rows.sort_values("run_date", ascending=False).iloc[0]
+                last_run   = str(latest["run_date"])
                 last_status = STATUS_ICON.get(str(latest["status"]), "❓")
-                recent_err = str(latest["error_msg"] or "")[:80]
+                recent_err  = str(latest["error_msg"] or "")[:80]
 
             row = {"Job": svc, "Last Run": last_run, "Status": last_status}
             for d in dates[:5]:
                 cell = svc_rows[svc_rows["run_date"] == d]
-                if cell.empty:
-                    row[str(d)] = "⚫"
-                else:
-                    rec = cell.sort_values("run_date").iloc[-1]
-                    row[str(d)] = STATUS_ICON.get(str(rec["status"]), "❓")
+                row[str(d)] = ("⚫" if cell.empty else
+                               STATUS_ICON.get(str(cell.sort_values("run_date").iloc[-1]["status"]), "❓"))
             if recent_err:
                 row["Last Error"] = recent_err
             grid_rows.append(row)
 
-        grid_df = pd.DataFrame(grid_rows)
-        st.dataframe(grid_df, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(grid_rows), use_container_width=True, hide_index=True)
         st.caption("🟢 success  🔴 failed  🟡 running  ⬜ skipped  ⚫ no record")
 
         fails = runs_df[runs_df["status"] == "failed"].sort_values("run_date", ascending=False).head(5)
@@ -217,126 +313,189 @@ if page == "System Health":
             with st.expander(f"🔴 {len(fails)} recent failures"):
                 st.dataframe(
                     fails[["service", "run_date", "error_msg", "duration_s"]],
-                    use_container_width=True, hide_index=True
+                    use_container_width=True, hide_index=True,
                 )
-
-    # ── Pipeline proxy freshness (services that don't write pipeline_runs) ────
-    st.markdown("**Derived job status (from data tables)**")
-    proxy_rows = []
-
-    def _proxy_row(label, sql, ok_days=1, warn_days=3):
-        df = query(sql)
-        if df.empty or df.iloc[0, 0] is None:
-            return {"Job": label, "Last Data": "—", "Status": "⚫"}
-        ld = df.iloc[0, 0]
-        if hasattr(ld, "date"):
-            ld = ld.date()
-        elif isinstance(ld, str):
-            try:
-                ld = date.fromisoformat(str(ld)[:10])
-            except Exception:
-                return {"Job": label, "Last Data": str(ld), "Status": "❓"}
-        age = (today - ld).days
-        icon = traffic_light(age <= ok_days, age <= warn_days)
-        return {"Job": label, "Last Data": str(ld), "Status": f"{icon} ({age}d ago)"}
-
-    proxy_rows.append(_proxy_row(
-        "option_chain_intraday",
-        "SELECT max(toDate(timestamp)) FROM market.options_chain FINAL",
-        ok_days=1, warn_days=4,
-    ))
-    proxy_rows.append(_proxy_row(
-        "compute_oi_features",
-        "SELECT max(date) FROM market.options_eod_summary FINAL",
-        ok_days=1, warn_days=4,
-    ))
-    proxy_rows.append(_proxy_row(
-        "vix_pipeline",
-        "SELECT max(toDate(timestamp)) FROM market.nifty_live FINAL",
-        ok_days=1, warn_days=3,
-    ))
-    proxy_rows.append(_proxy_row(
-        "participant_oi_pipeline",
-        "SELECT max(date) FROM market.participant_oi FINAL",
-        ok_days=1, warn_days=3,
-    ))
-    proxy_rows.append(_proxy_row(
-        "intraday_monitor",
-        "SELECT max(toDate(entry_time)) FROM trades.open_positions FINAL",
-        ok_days=4, warn_days=7,
-    ))
-    st.dataframe(pd.DataFrame(proxy_rows), use_container_width=True, hide_index=True)
-    st.caption("Status derived from latest data in each table — not a direct job log.")
 
     st.divider()
 
     # ── Data Freshness ────────────────────────────────────────────────────────
     st.subheader("Data Freshness")
+    st.caption("Latest record in each table. Age is relative to now (IST). 🟢 < 1d · 🟡 < 4d · 🔴 older.")
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("**Options Chain (last snapshot)**")
-        chain_df = query("""
-            SELECT symbol, max(toDate(timestamp)) as last_date
-            FROM market.options_chain FINAL
-            GROUP BY symbol ORDER BY symbol
-        """)
-        if not chain_df.empty:
-            for _, r in chain_df.iterrows():
-                sym = r["symbol"]
-                ld = r["last_date"]
-                if hasattr(ld, "date"):
-                    ld = ld.date()
-                age = (today - ld).days if ld else 99
-                icon = traffic_light(age <= 1, age <= 4)
-                st.write(f"{icon} **{sym}** — {ld} ({age}d ago)")
+    def _freshness_row(label, table, date_sql, ts_sql=None, ok_days=1, warn_days=4):
+        """
+        Build one freshness row. date_sql must return a single scalar date/datetime.
+        ts_sql is optional — returns the most recent timestamp for the 'At (IST)' column.
+        """
+        df = query(date_sql)
+        if df.empty or df.iloc[0, 0] is None:
+            return {"Source": label, "Table": table, "Latest Date": "—",
+                    "At (IST)": "—", "Age": "—", "Status": "⚫ no data"}
+        raw = df.iloc[0, 0]
+        if isinstance(raw, datetime):
+            dt_utc = raw.replace(tzinfo=timezone.utc) if raw.tzinfo is None else raw
+            ld     = dt_utc.astimezone(IST).date()
         else:
-            st.warning("options_chain: no data")
+            dt_utc = None
+            try:
+                ld = raw.date() if hasattr(raw, "date") else date.fromisoformat(str(raw)[:10])
+            except Exception:
+                return {"Source": label, "Table": table, "Latest Date": str(raw),
+                        "At (IST)": "—", "Age": "—", "Status": "❓"}
 
-        st.markdown("**India VIX**")
-        vix_df = query("SELECT max(toDate(timestamp)) as last_date FROM market.nifty_live FINAL")
-        if not vix_df.empty:
-            ld = vix_df.iloc[0]["last_date"]
-            if hasattr(ld, "date"):
-                ld = ld.date()
-            age = (today - ld).days if ld else 99
-            icon = traffic_light(age <= 1, age <= 3)
-            st.write(f"{icon} **VIX** — {ld} ({age}d ago)")
-        else:
-            st.warning("nifty_live: no data")
+        # timestamp column
+        at_ist = "—"
+        if ts_sql:
+            ts_df = query(ts_sql)
+            if not ts_df.empty and ts_df.iloc[0, 0] is not None:
+                at_ist = _to_ist_str(ts_df.iloc[0, 0])
+        elif dt_utc:
+            at_ist = _to_ist_str(dt_utc)
 
-    with col2:
-        st.markdown("**OHLCV (by market)**")
-        ohlcv_df = query("""
-            SELECT market, max(date) as last_date
-            FROM market.ohlcv_daily FINAL
-            WHERE market IN ('nse_index', 'indian', 'bse')
-            GROUP BY market ORDER BY market
-        """)
-        if not ohlcv_df.empty:
-            for _, r in ohlcv_df.iterrows():
-                ld = r["last_date"]
-                if hasattr(ld, "date"):
-                    ld = ld.date()
-                age = (today - ld).days if ld else 99
-                icon = traffic_light(age <= 1, age <= 3)
-                st.write(f"{icon} **{r['market']}** — {ld} ({age}d ago)")
+        age_days = (today - ld).days
+        age_secs = age_days * 86400
+        # Re-compute precise age if we have a UTC datetime
+        if dt_utc:
+            age_secs = int((datetime.now(timezone.utc) - dt_utc).total_seconds())
+            age_days = age_secs // 86400
 
-        st.markdown("**Participant OI**")
-        poi_df = query("SELECT max(date) as last_date FROM market.participant_oi FINAL")
-        if not poi_df.empty:
-            ld = poi_df.iloc[0]["last_date"]
-            if hasattr(ld, "date"):
-                ld = ld.date()
-            age = (today - ld).days if ld else 99
-            icon = traffic_light(age <= 1, age <= 3)
-            st.write(f"{icon} **Participant OI** — {ld} ({age}d ago)")
+        age_label = _age_str(dt_utc) if dt_utc else (f"{age_days}d ago" if age_days else "today")
+        icon  = traffic_light(age_days <= ok_days, age_days <= warn_days)
+        return {
+            "Source":      label,
+            "Table":       table,
+            "Latest Date": str(ld),
+            "At (IST)":    at_ist,
+            "Age":         age_label,
+            "Status":      icon,
+        }
+
+    freshness_rows = []
+
+    # Options chain — one row per symbol
+    chain_sym_df = query("""
+        SELECT symbol,
+               max(timestamp)       AS last_ts,
+               max(toDate(timestamp)) AS last_date
+        FROM market.options_chain FINAL
+        GROUP BY symbol ORDER BY symbol
+    """)
+    if chain_sym_df.empty:
+        for sym in SYMBOLS:
+            freshness_rows.append({
+                "Source": f"Options Chain · {sym}", "Table": "market.options_chain",
+                "Latest Date": "—", "At (IST)": "—", "Age": "—", "Status": "⚫ no data",
+            })
+    else:
+        for _, r in chain_sym_df.iterrows():
+            ts_raw = r["last_ts"]
+            dt_utc = None
+            if ts_raw is not None:
+                dt_utc = pd.Timestamp(ts_raw).to_pydatetime()
+                if dt_utc.tzinfo is None:
+                    dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+            ld_raw = r["last_date"]
+            ld = ld_raw.date() if hasattr(ld_raw, "date") else ld_raw
+            age_days = (today - ld).days if ld else 99
+            freshness_rows.append({
+                "Source":      f"Options Chain · {r['symbol']}",
+                "Table":       "market.options_chain",
+                "Latest Date": str(ld),
+                "At (IST)":    _to_ist_str(dt_utc),
+                "Age":         _age_str(dt_utc),
+                "Status":      traffic_light(age_days <= 1, age_days <= 4),
+            })
+
+    # India VIX / Nifty spot
+    freshness_rows.append(_freshness_row(
+        "India VIX / Nifty Spot", "market.nifty_live",
+        "SELECT max(timestamp) FROM market.nifty_live FINAL",
+        ok_days=1, warn_days=3,
+    ))
+
+    # OI features (EOD summary) — per symbol
+    eod_sym_df = query("""
+        SELECT symbol, max(date) AS last_date
+        FROM market.options_eod_summary FINAL
+        GROUP BY symbol ORDER BY symbol
+    """)
+    if eod_sym_df.empty:
+        freshness_rows.append({
+            "Source": "OI Features (EOD)", "Table": "market.options_eod_summary",
+            "Latest Date": "—", "At (IST)": "—", "Age": "—", "Status": "⚫ no data",
+        })
+    else:
+        for _, r in eod_sym_df.iterrows():
+            ld_raw = r["last_date"]
+            ld = ld_raw.date() if hasattr(ld_raw, "date") else (
+                date.fromisoformat(str(ld_raw)[:10]) if ld_raw else None)
+            age_days = (today - ld).days if ld else 99
+            freshness_rows.append({
+                "Source":      f"OI Features (EOD) · {r['symbol']}",
+                "Table":       "market.options_eod_summary",
+                "Latest Date": str(ld) if ld else "—",
+                "At (IST)":    "—",
+                "Age":         f"{age_days}d ago" if ld else "—",
+                "Status":      traffic_light(age_days <= 1, age_days <= 4),
+            })
+
+    # OHLCV by market
+    ohlcv_df = query("""
+        SELECT market, max(date) AS last_date
+        FROM market.ohlcv_daily FINAL
+        WHERE market IN ('nse_index', 'indian', 'bse')
+        GROUP BY market ORDER BY market
+    """)
+    for _, r in (ohlcv_df.iterrows() if not ohlcv_df.empty else iter([])):
+        ld_raw = r["last_date"]
+        ld = ld_raw.date() if hasattr(ld_raw, "date") else (
+            date.fromisoformat(str(ld_raw)[:10]) if ld_raw else None)
+        age_days = (today - ld).days if ld else 99
+        freshness_rows.append({
+            "Source":      f"OHLCV · {r['market']}",
+            "Table":       "market.ohlcv_daily",
+            "Latest Date": str(ld) if ld else "—",
+            "At (IST)":    "—",
+            "Age":         f"{age_days}d ago" if ld else "—",
+            "Status":      traffic_light(age_days <= 1, age_days <= 3),
+        })
+
+    # Participant OI
+    freshness_rows.append(_freshness_row(
+        "Participant OI", "market.participant_oi",
+        "SELECT max(date) FROM market.participant_oi FINAL",
+        ok_days=1, warn_days=3,
+    ))
+
+    # Confidence scores
+    freshness_rows.append(_freshness_row(
+        "Confidence Scores", "analysis.confidence_scores",
+        "SELECT max(score_date) FROM analysis.confidence_scores FINAL",
+        ok_days=1, warn_days=2,
+    ))
+
+    # Open positions
+    freshness_rows.append(_freshness_row(
+        "Open Positions", "trades.open_positions",
+        "SELECT max(toDate(entry_time)) FROM trades.open_positions FINAL",
+        ts_sql="SELECT max(entry_time) FROM trades.open_positions FINAL",
+        ok_days=4, warn_days=7,
+    ))
+
+    # Trade outcomes
+    freshness_rows.append(_freshness_row(
+        "Trade Outcomes", "trades.trade_outcomes",
+        "SELECT max(toDate(exit_time)) FROM trades.trade_outcomes FINAL",
+        ts_sql="SELECT max(exit_time) FROM trades.trade_outcomes FINAL",
+        ok_days=4, warn_days=14,
+    ))
+
+    st.dataframe(pd.DataFrame(freshness_rows), use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # ── Confidence Score Freshness ────────────────────────────────────────────
-    st.subheader("Confidence Scores (freshness & value)")
+    # ── Confidence Scores ─────────────────────────────────────────────────────
+    st.subheader("Confidence Scores")
     scores_df = query("""
         SELECT symbol, score_date, confidence
         FROM analysis.confidence_scores FINAL
@@ -359,15 +518,15 @@ if page == "System Health":
                     st.write("🔴 Never scored")
                 else:
                     r = row.iloc[0]
-                    conf = float(r["confidence"])
-                    age = (today - r["score_date"]).days
-                    go = conf >= MIN_CONFIDENCE
-                    icon = traffic_light(age == 0, age <= 1)
-                    status_icon = "✅" if go else "❌"
+                    conf     = float(r["confidence"])
+                    age_days = (today - r["score_date"]).days
+                    go       = conf >= MIN_CONFIDENCE
+                    icon     = traffic_light(age_days == 0, age_days <= 1)
                     st.metric(
                         label=f"{icon} {sym}",
                         value=f"{conf:.0f}/100",
-                        delta=f"{status_icon} {'GO' if go else 'NO-GO'} · {age}d ago",
+                        delta=f"{'✅ GO' if go else '❌ NO-GO'} · {age_days}d ago",
+                        delta_color="normal" if go else "inverse",
                     )
 
 
