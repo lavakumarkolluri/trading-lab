@@ -375,8 +375,8 @@ if page == "System Health":
     # Options chain — one row per symbol
     chain_sym_df = query("""
         SELECT symbol,
-               max(timestamp)       AS last_ts,
-               max(toDate(timestamp)) AS last_date
+               nullIf(max(timestamp), toDateTime(0))       AS last_ts,
+               nullIf(max(toDate(timestamp)), toDate(0))   AS last_date
         FROM market.options_chain FINAL
         GROUP BY symbol ORDER BY symbol
     """)
@@ -409,7 +409,7 @@ if page == "System Health":
     # India VIX / Nifty spot
     freshness_rows.append(_freshness_row(
         "India VIX / Nifty Spot", "market.nifty_live",
-        "SELECT max(timestamp) FROM market.nifty_live FINAL",
+        "SELECT nullIf(max(timestamp), toDateTime(0)) FROM market.nifty_live FINAL",
         ok_days=1, warn_days=3,
     ))
 
@@ -455,19 +455,17 @@ if page == "System Health":
         ok_days=1, warn_days=2,
     ))
 
-    # Open positions
+    # Open positions — nullIf guards against epoch (1970) returned from empty table
     freshness_rows.append(_freshness_row(
         "Open Positions", "trades.open_positions",
-        "SELECT max(toDate(entry_time)) FROM trades.open_positions FINAL",
-        ts_sql="SELECT max(entry_time) FROM trades.open_positions FINAL",
+        "SELECT nullIf(max(entry_time), toDateTime(0)) FROM trades.open_positions FINAL",
         ok_days=4, warn_days=7,
     ))
 
     # Trade outcomes
     freshness_rows.append(_freshness_row(
         "Trade Outcomes", "trades.trade_outcomes",
-        "SELECT max(toDate(exit_time)) FROM trades.trade_outcomes FINAL",
-        ts_sql="SELECT max(exit_time) FROM trades.trade_outcomes FINAL",
+        "SELECT nullIf(max(exit_time), toDateTime(0)) FROM trades.trade_outcomes FINAL",
         ok_days=4, warn_days=14,
     ))
 
