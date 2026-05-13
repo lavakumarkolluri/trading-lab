@@ -357,6 +357,12 @@ def job_strategy_selector_fill_outcomes():
     _run("strategy_selector", "--fill-outcomes")
 
 
+def job_graduation_gate():
+    """Daily strategy graduation check — updates analysis.strategy_graduation."""
+    log.info("=== Graduation gate check triggered ===")
+    _run("graduation_gate")
+
+
 def job_events_pipeline():
     """Weekly refresh of FOMC/RBI/budget event calendar."""
     log.info("=== Events pipeline weekly refresh triggered ===")
@@ -561,6 +567,7 @@ def main():
     log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
     log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV+VIX")
     log.info("  Confidence scorer   : Mon–Fri 13:00 UTC (18:30 IST) --score-only (daily refresh)")
+    log.info("  Graduation gate     : Mon–Fri 13:05 UTC (18:35 IST) strategy stage check")
     log.info("  Weekly  refresh     : Sun     00:30 UTC (06:00 IST)")
     log.info("  Gap     analyzer    : Sun     01:00 UTC (06:30 IST)")
     log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
@@ -602,6 +609,11 @@ def main():
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("13:00").do(job_confidence_scorer_daily)
 
+    # Graduation gate: after daily scorer at 13:05 UTC (18:35 IST)
+    # Updates analysis.strategy_graduation so dashboard shows current stage
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("13:05").do(job_graduation_gate)
+
     schedule.every().sunday.at("00:00").do(job_events_pipeline)
     schedule.every().sunday.at("00:30").do(job_weekly)
     schedule.every().sunday.at("01:00").do(job_gap_analyzer)
@@ -611,6 +623,7 @@ def main():
     schedule.every().sunday.at("05:00").do(job_lot_size_pipeline)
     schedule.every().sunday.at("05:30").do(job_strategy_backtester)
     schedule.every().sunday.at("07:00").do(job_confidence_scorer)   # 90 min after backtester
+    schedule.every().sunday.at("07:30").do(job_graduation_gate)     # after weekly retrain
     schedule.every().sunday.at("08:00").do(job_strategy_selector_backtest)
     schedule.every().sunday.at("09:00").do(job_cleanup)  # 09:00 UTC = 14:30 IST
 

@@ -159,7 +159,7 @@ def test_required_pages_present():
     """Key pages must exist in the nav — catches accidental deletion."""
     source = _dashboard_source()
     nav    = _sidebar_pages(source)
-    for page in ("Overview", "Today's Signals", "Data Freshness", "Breakout Backtest"):
+    for page in ("System Health", "Model", "Trade Log", "Market Data"):
         assert page in nav, f"Required page '{page}' missing from sidebar nav"
 
 

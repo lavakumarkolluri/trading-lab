@@ -256,3 +256,27 @@ def test_migration_068_exists():
         os.path.dirname(__file__), "..", "clickhouse", "migrations", "068_*.sql"
     ))
     assert files, "Migration 068 (iron fly wings) not found"
+
+
+# ── Graduation stage gate ─────────────────────────────────────────────────────
+
+def test_get_graduation_stage_returns_stage_from_db():
+    """get_graduation_stage returns the stage stored in analysis.strategy_graduation."""
+    ch = MagicMock()
+    ch.query.return_value.result_rows = [(2,)]
+    stage = monitor.get_graduation_stage(ch, "iron_fly_0dte")
+    assert stage == 2
+
+def test_get_graduation_stage_defaults_to_1_on_empty():
+    """When no row exists for strategy, stage defaults to 1 (BACKTEST — no trading)."""
+    ch = MagicMock()
+    ch.query.return_value.result_rows = []
+    stage = monitor.get_graduation_stage(ch, "iron_fly_0dte")
+    assert stage == 1
+
+def test_get_graduation_stage_defaults_to_1_on_error():
+    """DB error → default to Stage 1 (safe: no trading)."""
+    ch = MagicMock()
+    ch.query.side_effect = Exception("connection refused")
+    stage = monitor.get_graduation_stage(ch, "iron_fly_0dte")
+    assert stage == 1

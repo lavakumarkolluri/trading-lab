@@ -454,6 +454,21 @@ def get_current_position_value(ch, symbol: str, expiry: date,
     return straddle - wce_ltp - wpe_ltp
 
 
+def get_graduation_stage(ch, strategy_id: str = "iron_fly_0dte") -> int:
+    """Return current graduation stage (1-4) from analysis.strategy_graduation.
+    Returns 1 (backtest only — no trading) if the table is missing or the
+    strategy has no row yet.  Stage 2+ allows paper/live trading."""
+    try:
+        r = ch.query(
+            "SELECT stage FROM analysis.strategy_graduation FINAL "
+            "WHERE strategy_id = {sid:String} LIMIT 1",
+            parameters={"sid": strategy_id},
+        )
+        return int(r.result_rows[0][0]) if r.result_rows else 1
+    except Exception:
+        return 1
+
+
 def get_scorecard_confidence(ch, symbol: str) -> float:
     """Get latest confidence score for symbol, must be within last 7 days."""
     try:
@@ -846,6 +861,18 @@ def main():
     ch = get_ch()
     lot_sizes = load_lot_sizes(ch)
     log.info(f"Lot sizes      : {lot_sizes}")
+
+    graduation_stage = get_graduation_stage(ch, "iron_fly_0dte")
+    log.info(f"Graduation stage: {graduation_stage}")
+    if graduation_stage == 1:
+        log.warning(
+            "iron_fly_0dte is Stage 1 (BACKTEST only) — "
+            "backtest gates not passed, refusing to trade. "
+            "Run graduation_gate.py to recheck after more backtest data."
+        )
+        raise SystemExit(0)
+    if graduation_stage >= 3 and not args.live:
+        log.info("Stage 3/4 detected — consider running with --live for real orders")
 
     while ist_time() <= MONITOR_EXIT and not _SHUTDOWN:
         t = ist_time()

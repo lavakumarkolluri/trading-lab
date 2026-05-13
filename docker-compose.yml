@@ -656,6 +656,21 @@ services:
     entrypoint: ["python", "confidence_scorer.py"]
     command: []
 
+  graduation_gate:
+    build: *pipeline-build
+    container_name: graduation_gate
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "graduation_gate.py"]
+    command: []
+
   strategy_selector:
     build: *pipeline-build
     container_name: strategy_selector
