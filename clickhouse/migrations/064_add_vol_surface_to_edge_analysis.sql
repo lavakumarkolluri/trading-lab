@@ -1,0 +1,5 @@
+ALTER TABLE analysis.edge_analysis
+    ADD COLUMN IF NOT EXISTS term_slope  Float64 DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS skew_2pct   Float64 DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS skew_3pct   Float64 DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS atm_iv_30d  Float64 DEFAULT 0;
