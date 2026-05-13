@@ -1223,7 +1223,8 @@ elif page == "Paper Trades":
                entry_ce_ltp, entry_pe_ltp, entry_premium,
                lot_size, lots, target_inr, stoploss_inr,
                trailing_active, peak_pnl_inr, trail_stop_inr,
-               scorecard_conf
+               scorecard_conf,
+               wing_ce_strike, wing_pe_strike, wing_ce_ltp, wing_pe_ltp, net_premium
         FROM trades.open_positions FINAL
         WHERE status = 'open'
         ORDER BY entry_time DESC
@@ -1231,58 +1232,73 @@ elif page == "Paper Trades":
     if open_df.empty:
         st.info("No open positions right now.")
     else:
+        rows = []
         for _, r in open_df.iterrows():
             sym    = r["symbol"]
             strike = float(r["strike"])
-            expiry = str(r["expiry"])[:10]  # strip time part
+            expiry = str(r["expiry"])[:10]
+            wce    = float(r.get("wing_ce_strike", 0) or 0)
+            wpe    = float(r.get("wing_pe_strike", 0) or 0)
+            is_iron_fly = wce > 0
 
-            # Live mark-to-market from intraday chain (best-effort, values are internal/trusted)
+            # Fetch current straddle LTP at ATM strike
             mark_df = query(f"""
                 SELECT sumIf(ltp, option_type='CE') + sumIf(ltp, option_type='PE') AS curr
                 FROM market.options_chain
-                WHERE symbol   = '{sym}'
-                  AND strike   = {strike}
-                  AND expiry   = '{expiry}'
-                  AND toDate(timestamp) = today()
-                  AND timestamp = (
-                      SELECT max(timestamp) FROM market.options_chain
-                      WHERE symbol = '{sym}' AND toDate(timestamp) = today()
-                  )
-                GROUP BY symbol
-                HAVING curr > 0
+                WHERE symbol='{sym}' AND strike={strike} AND expiry='{expiry}'
+                  AND toDate(timestamp)=today()
+                  AND timestamp=(SELECT max(timestamp) FROM market.options_chain
+                                 WHERE symbol='{sym}' AND toDate(timestamp)=today())
+                GROUP BY symbol HAVING curr > 0
             """)
+            curr_straddle = float(mark_df["curr"].iloc[0]) if not mark_df.empty else None
 
-            curr_straddle  = float(mark_df["curr"].iloc[0]) if not mark_df.empty else None
-            entry_premium  = float(r["entry_premium"])
-            lot_size       = int(r["lot_size"])
-            lots           = int(r.get("lots", 1))
-            margin_req     = entry_premium * lot_size * lots  # approx: premium × qty
-            if curr_straddle is not None:
-                unreal_pts = entry_premium - curr_straddle
-                unreal_inr = unreal_pts * lot_size * lots
-            else:
-                unreal_pts = unreal_inr = None
+            # For iron fly, also fetch current wing LTPs to compute net position value
+            curr_net = curr_straddle
+            if is_iron_fly and curr_straddle is not None:
+                wing_df = query(f"""
+                    SELECT
+                        sumIf(ltp, option_type='CE' AND strike={wce}) AS wce_ltp,
+                        sumIf(ltp, option_type='PE' AND strike={wpe}) AS wpe_ltp
+                    FROM market.options_chain
+                    WHERE symbol='{sym}' AND expiry='{expiry}'
+                      AND toDate(timestamp)=today()
+                      AND timestamp=(SELECT max(timestamp) FROM market.options_chain
+                                     WHERE symbol='{sym}' AND toDate(timestamp)=today())
+                """)
+                if not wing_df.empty:
+                    curr_net = curr_straddle - float(wing_df["wce_ltp"].iloc[0]) - float(wing_df["wpe_ltp"].iloc[0])
 
-            pnl_color = "green" if (unreal_inr or 0) >= 0 else "red"
-            trail_tag  = " 🔒" if r["trailing_active"] else ""
-            pnl_str    = (f"<span style='color:{pnl_color}'>{fmt_inr(unreal_inr)} "
-                          f"({unreal_pts:+.1f}pts)</span>"
-                          if unreal_inr is not None else "—")
+            entry_value = float(r["net_premium"]) if is_iron_fly and float(r.get("net_premium", 0) or 0) > 0 else float(r["entry_premium"])
+            lot_size    = int(r["lot_size"])
+            lots        = int(r.get("lots", 1))
+            unreal_pts  = (entry_value - curr_net) if curr_net is not None else None
+            unreal_inr  = (unreal_pts * lot_size * lots) if curr_net is not None else None
+            margin_req  = entry_value * lot_size * lots
 
-            with st.container(border=True):
-                st.markdown(
-                    f"<small>"
-                    f"<b>{sym}</b> | Strike <b>{strike:.0f}</b> | Expiry {expiry} | "
-                    f"Entry {str(r['entry_time'])[:10]} {str(r['entry_time'])[11:16]} IST | "
-                    f"CE {r['entry_ce_ltp']:.1f} + PE {r['entry_pe_ltp']:.1f} = <b>{entry_premium:.1f}pts</b> | "
-                    f"Lots {lots} | Margin ~{fmt_inr(margin_req)} | "
-                    f"Conf {r['scorecard_conf']:.0f}/100 | "
-                    f"Target {fmt_inr(float(r['target_inr']))} | Stop {fmt_inr(float(r['stoploss_inr']))} | "
-                    f"P&L {pnl_str}{trail_tag} | Peak {fmt_inr(float(r['peak_pnl_inr']))} | "
-                    f"Floor {fmt_inr(float(r['trail_stop_inr']))}"
-                    f"</small>",
-                    unsafe_allow_html=True,
-                )
+            hedge_type = f"Iron Fly ±{int(wce - strike)}" if is_iron_fly else "Naked"
+            rows.append({
+                "Symbol":      sym,
+                "Strike":      int(strike),
+                "Expiry":      expiry,
+                "Entry Date":  str(r["entry_time"])[:10],
+                "Entry Time":  str(r["entry_time"])[11:16],
+                "Entry CE":    f"{r['entry_ce_ltp']:.1f}",
+                "Entry PE":    f"{r['entry_pe_ltp']:.1f}",
+                "Net Premium": f"{entry_value:.1f}",
+                "Structure":   hedge_type,
+                "Lots":        lots,
+                "Margin~":     fmt_inr(margin_req),
+                "Conf":        f"{r['scorecard_conf']:.0f}",
+                "Target":      fmt_inr(float(r["target_inr"])),
+                "Stop":        fmt_inr(float(r["stoploss_inr"])),
+                "Unreal P&L":  (f"{'+' if unreal_inr>=0 else ''}₹{unreal_inr:.0f} ({unreal_pts:+.1f}pts)"
+                                 if unreal_inr is not None else "—"),
+                "Trailing":    "🔒 Yes" if r["trailing_active"] else "No",
+                "Peak P&L":    fmt_inr(float(r["peak_pnl_inr"])),
+                "Trail Floor": fmt_inr(float(r["trail_stop_inr"])),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     # ── Today's completed trades ───────────────────────────────────────────────
     st.subheader("Today's Completed Trades")

@@ -139,16 +139,28 @@ def test_record_entry_includes_entry_features():
 
 # ── record_exit column schema ─────────────────────────────────────────────────
 
-def _make_pos():
-    return {
+def _make_pos(lots=1, with_wings=False):
+    pos = {
         "trade_id": "test-id", "symbol": "NIFTY", "expiry": "2026-05-07",
         "entry_time": datetime.now(UTC).replace(tzinfo=None), "strike": 24000.0,
         "entry_ce_ltp": 100.0, "entry_pe_ltp": 100.0, "entry_premium": 200.0,
         "lot_size": 75, "target_pts": 26.67, "stop_pts": 13.33,
-        "target_inr": 2000.0, "stoploss_inr": 1000.0, "scorecard_conf": 70.0,
+        "target_inr": 2000.0 * lots, "stoploss_inr": 1000.0 * lots,
+        "scorecard_conf": 70.0,
         "trailing_active": 0, "peak_pnl_inr": 0.0, "trail_stop_inr": 0.0,
         "entry_features": '{"test": 1}',
+        "lots": lots,
+        # iron fly columns (0 = naked straddle by default)
+        "wing_ce_strike": 0.0, "wing_pe_strike": 0.0,
+        "wing_ce_ltp": 0.0, "wing_pe_ltp": 0.0, "net_premium": 0.0,
     }
+    if with_wings:
+        pos.update({
+            "wing_ce_strike": 24200.0, "wing_pe_strike": 23800.0,
+            "wing_ce_ltp": 20.0, "wing_pe_ltp": 20.0,
+            "net_premium": 160.0,   # straddle(200) - wings(40)
+        })
+    return pos
 
 
 def test_record_exit_open_positions_includes_entry_features():
@@ -175,3 +187,72 @@ def test_record_exit_trade_outcomes_preserves_entry_features():
     assert "entry_features" in col_names
     idx = col_names.index("entry_features")
     assert values_row[idx] == '{"scorecard_conf": 70}'
+
+
+# ── Iron fly column schema ─────────────────────────────────────────────────────
+
+def test_record_entry_includes_wing_columns():
+    """record_entry must write wing columns to open_positions."""
+    ch = MagicMock()
+    # get_wing_ltps is called inside record_entry; mock it to return known values
+    with patch.object(monitor, "get_wing_ltps", return_value=(20.0, 18.0)):
+        snap = {
+            "expiry": "2026-05-07", "strike": 24000.0,
+            "ce_ltp": 100.0, "pe_ltp": 100.0, "straddle": 200.0,
+            "ce_iv": 15.0, "pe_iv": 15.0,
+        }
+        monitor.record_entry(ch, "NIFTY", snap, lot_size=75,
+                             scorecard_conf=70.0, dry_run=False)
+    col_names  = ch.insert.call_args[1]["column_names"]
+    values_row = ch.insert.call_args[0][1][0]
+    for col in ("wing_ce_strike", "wing_pe_strike", "wing_ce_ltp", "wing_pe_ltp", "net_premium"):
+        assert col in col_names, f"missing column: {col}"
+    np_idx = col_names.index("net_premium")
+    assert values_row[np_idx] == pytest.approx(162.0)   # 200 - 20 - 18
+
+
+def test_record_exit_iron_fly_pnl_uses_net_premium():
+    """Iron fly P&L is entry net_premium minus current net position value."""
+    ch = MagicMock()
+    pos = _make_pos(with_wings=True)   # net_premium=160
+    # Current: straddle=170, wings=30 → net=140; P&L = 160-140 = +20pts × 75 × 1 = ₹1500
+    monitor.record_exit(ch, pos, current_straddle=140.0, exit_reason="target", dry_run=False)
+    first_call = ch.insert.call_args_list[0]
+    col_names  = first_call[1]["column_names"]
+    values_row = first_call[0][1][0]
+    pnl_pts_idx = col_names.index("pnl_pts")
+    pnl_inr_idx = col_names.index("pnl_inr")
+    assert values_row[pnl_pts_idx] == pytest.approx(20.0)
+    assert values_row[pnl_inr_idx] == pytest.approx(1500.0)
+
+
+def test_record_exit_naked_pnl_uses_entry_premium():
+    """Naked straddle P&L uses entry_premium (legacy, no wings)."""
+    ch = MagicMock()
+    pos = _make_pos()   # wing_ce_strike=0 → naked
+    monitor.record_exit(ch, pos, current_straddle=160.0, exit_reason="eod", dry_run=False)
+    first_call = ch.insert.call_args_list[0]
+    col_names  = first_call[1]["column_names"]
+    values_row = first_call[0][1][0]
+    pnl_pts_idx = col_names.index("pnl_pts")
+    assert values_row[pnl_pts_idx] == pytest.approx(40.0)   # 200 - 160
+
+
+def test_record_exit_wing_columns_in_trade_outcomes():
+    """record_exit must store wing columns in trade_outcomes."""
+    ch = MagicMock()
+    pos = _make_pos(with_wings=True)
+    monitor.record_exit(ch, pos, current_straddle=140.0, exit_reason="eod", dry_run=False)
+    first_call = ch.insert.call_args_list[0]
+    col_names  = first_call[1]["column_names"]
+    for col in ("wing_ce_strike", "wing_pe_strike", "net_premium"):
+        assert col in col_names, f"missing in trade_outcomes: {col}"
+
+
+def test_migration_068_exists():
+    """Migration 068 adding iron fly wing columns must exist."""
+    import glob
+    files = glob.glob(os.path.join(
+        os.path.dirname(__file__), "..", "clickhouse", "migrations", "068_*.sql"
+    ))
+    assert files, "Migration 068 (iron fly wings) not found"
