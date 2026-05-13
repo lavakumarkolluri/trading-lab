@@ -1314,9 +1314,16 @@ elif page == "Paper Trades":
             "symbol", "strike", "entry_time", "exit_time", "exit_reason",
             "entry_premium", "exit_premium", "pnl_pts", "pnl_inr", "scorecard_conf"
         ]].copy()
-        display["entry_time"] = pd.to_datetime(display["entry_time"]).dt.strftime("%H:%M")
-        display["exit_time"]  = pd.to_datetime(display["exit_time"]).dt.strftime("%H:%M")
-        display["pnl_inr"]    = display["pnl_inr"].apply(lambda v: f"₹{v:.0f}")
+        display["entry_time"] = pd.to_datetime(display["entry_time"]).dt.strftime("%Y-%m-%d %H:%M")
+        display["exit_time"]  = pd.to_datetime(display["exit_time"]).dt.strftime("%Y-%m-%d %H:%M")
+        display["status"]     = display["pnl_inr"].apply(lambda v: "✅ Win" if v > 0 else "❌ Loss")
+        display["pnl_inr"]    = display["pnl_inr"].apply(lambda v: f"+₹{v:.0f}" if v >= 0 else f"-₹{abs(v):.0f}")
+        display["pnl_pts"]    = display["pnl_pts"].apply(lambda v: f"{v:+.1f}")
+        display = display.rename(columns={
+            "entry_time": "Entry", "exit_time": "Exit", "exit_reason": "Reason",
+            "entry_premium": "Entry₹", "exit_premium": "Exit₹",
+            "pnl_pts": "P&L pts", "pnl_inr": "P&L ₹", "scorecard_conf": "Conf",
+        })
         st.dataframe(display, use_container_width=True, hide_index=True)
 
     # ── Historical outcomes ────────────────────────────────────────────────────
