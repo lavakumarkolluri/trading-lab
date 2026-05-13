@@ -54,7 +54,7 @@ IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
 
-DEFAULT_LOT_SIZES = {"NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 40}
+DEFAULT_LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60}
 
 TARGET_INR   = 2000.0
 STOPLOSS_INR = 1000.0
@@ -124,8 +124,10 @@ def ist_naive() -> datetime:
 def load_lot_sizes(ch) -> dict:
     try:
         r = ch.query("""
-            SELECT symbol, lot_size FROM market.fo_lot_sizes FINAL
-            WHERE symbol IN ('NIFTY', 'BANKNIFTY')
+            SELECT symbol, argMax(lot_size, effective_from) AS lot_size
+            FROM market.fo_lot_sizes FINAL
+            WHERE symbol IN ('NIFTY', 'BANKNIFTY', 'FINNIFTY')
+            GROUP BY symbol
         """)
         sizes = {row[0]: int(row[1]) for row in r.result_rows}
         return {**DEFAULT_LOT_SIZES, **sizes}
