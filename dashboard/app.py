@@ -1216,8 +1216,27 @@ elif page == "Paper Trades":
     st.title("Paper Trades — Intraday Straddle Monitor")
     st.caption("Auto paper trading: NIFTY + BANKNIFTY straddle, ₹2000 target (trailing), ₹1000 stop")
 
+    # Transaction cost model (Zerodha NSE options, same as option_backtest.py)
+    _BROKERAGE    = 20.0    # ₹20 flat per order leg
+    _STT_PCT      = 0.0005  # 0.05% on sell-side premium
+    _EXCHANGE_PCT = 0.0005  # 0.05% on total turnover
+    _GST          = 0.18    # 18% GST on brokerage
+
+    def est_txn_cost(entry_premium: float, wing_cost: float,
+                     lot_size: int, lots: int, is_iron_fly: bool) -> float:
+        """Estimated round-trip cost: entry + exit, all legs."""
+        n_orders = (8 if is_iron_fly else 4)   # iron fly: 4 legs × 2 sides; naked: 2 × 2
+        brok     = n_orders * _BROKERAGE * (1 + _GST)
+        # STT on sell side (ATM straddle) at entry and exit
+        stt      = entry_premium * _STT_PCT * lot_size * lots * 2
+        # Exchange charges on all turnover (both legs, both sides)
+        total_prem = (entry_premium + wing_cost) * lot_size * lots
+        exch     = total_prem * _EXCHANGE_PCT * 2
+        return round(brok + stt + exch)
+
     # ── Open positions ────────────────────────────────────────────────────────
     st.subheader("Open Positions")
+    st.caption("Net Premium = straddle collected − wing hedge paid. P&L is marked against this net entry value.")
     open_df = query("""
         SELECT symbol, expiry, entry_time, strike,
                entry_ce_ltp, entry_pe_ltp, entry_premium,
@@ -1275,28 +1294,34 @@ elif page == "Paper Trades":
             unreal_pts  = (entry_value - curr_net) if curr_net is not None else None
             unreal_inr  = (unreal_pts * lot_size * lots) if curr_net is not None else None
             margin_req  = entry_value * lot_size * lots
+            wing_cost   = float(r.get("wing_ce_ltp", 0) or 0) + float(r.get("wing_pe_ltp", 0) or 0)
+            txn_cost    = est_txn_cost(float(r["entry_premium"]), wing_cost, lot_size, lots, is_iron_fly)
+            net_inr     = (unreal_inr - txn_cost) if unreal_inr is not None else None
 
-            hedge_type = f"Iron Fly ±{int(wce - strike)}" if is_iron_fly else "Naked"
             rows.append({
-                "Symbol":      sym,
-                "Strike":      int(strike),
-                "Expiry":      expiry,
-                "Entry Date":  str(r["entry_time"])[:10],
-                "Entry Time":  str(r["entry_time"])[11:16],
-                "Entry CE":    f"{r['entry_ce_ltp']:.1f}",
-                "Entry PE":    f"{r['entry_pe_ltp']:.1f}",
-                "Net Premium": f"{entry_value:.1f}",
-                "Structure":   hedge_type,
-                "Lots":        lots,
-                "Margin~":     fmt_inr(margin_req),
-                "Conf":        f"{r['scorecard_conf']:.0f}",
-                "Target":      fmt_inr(float(r["target_inr"])),
-                "Stop":        fmt_inr(float(r["stoploss_inr"])),
-                "Unreal P&L":  (f"{'+' if unreal_inr>=0 else ''}₹{unreal_inr:.0f} ({unreal_pts:+.1f}pts)"
-                                 if unreal_inr is not None else "—"),
-                "Trailing":    "🔒 Yes" if r["trailing_active"] else "No",
-                "Peak P&L":    fmt_inr(float(r["peak_pnl_inr"])),
-                "Trail Floor": fmt_inr(float(r["trail_stop_inr"])),
+                "Symbol":        sym,
+                "Sold CE+PE @":  f"{int(strike)}",
+                "Bought CE @":   f"{int(wce)}" if is_iron_fly else "—",
+                "Bought PE @":   f"{int(wpe)}" if is_iron_fly else "—",
+                "Expiry":        expiry,
+                "Entry Date":    (pd.to_datetime(r["entry_time"]) + pd.Timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d"),
+                "Entry Time":    (pd.to_datetime(r["entry_time"]) + pd.Timedelta(hours=5, minutes=30)).strftime("%I:%M %p"),
+                "Entry CE":      f"{r['entry_ce_ltp']:.1f}",
+                "Entry PE":      f"{r['entry_pe_ltp']:.1f}",
+                "Net Prem (sold−hedge)": f"{entry_value:.1f}",
+                "Lots":          lots,
+                "Margin~":       fmt_inr(margin_req),
+                "Conf":          f"{r['scorecard_conf']:.0f}",
+                "Target":        fmt_inr(float(r["target_inr"])),
+                "Stop":          fmt_inr(float(r["stoploss_inr"])),
+                "Gross P&L":     (f"{'+' if unreal_inr>=0 else ''}₹{unreal_inr:.0f} ({unreal_pts:+.1f}pts)"
+                                  if unreal_inr is not None else "—"),
+                "Est. TxCost":   f"-₹{txn_cost:.0f}",
+                "Net P&L":       (f"{'+' if net_inr>=0 else ''}₹{net_inr:.0f}"
+                                  if net_inr is not None else "—"),
+                "Trailing":      "🔒 Yes" if r["trailing_active"] else "No",
+                "Peak P&L":      fmt_inr(float(r["peak_pnl_inr"])),
+                "Trail Floor":   fmt_inr(float(r["trail_stop_inr"])),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
@@ -1306,7 +1331,8 @@ elif page == "Paper Trades":
         SELECT symbol, strike, expiry,
                entry_time, exit_time, exit_reason,
                entry_premium, exit_premium,
-               pnl_pts, pnl_inr, lot_size, scorecard_conf
+               pnl_pts, pnl_inr, lot_size, lots, scorecard_conf,
+               wing_ce_strike, wing_pe_strike, wing_ce_ltp, wing_pe_ltp, net_premium
         FROM trades.trade_outcomes FINAL
         WHERE toDate(entry_time) = today()
         ORDER BY exit_time DESC
@@ -1314,33 +1340,61 @@ elif page == "Paper Trades":
     if today_df.empty:
         st.info("No completed trades today.")
     else:
-        total_inr = float(today_df["pnl_inr"].sum())
-        wins  = int((today_df["pnl_inr"] > 0).sum())
+        # Compute transaction costs per row
+        def _row_txn_cost(row):
+            is_fly = float(row.get("wing_ce_strike", 0) or 0) > 0
+            wc = float(row.get("wing_ce_ltp", 0) or 0) + float(row.get("wing_pe_ltp", 0) or 0)
+            return est_txn_cost(float(row["entry_premium"]), wc,
+                                int(row["lot_size"]), int(row.get("lots", 1)), is_fly)
+
+        today_df["txn_cost"] = today_df.apply(_row_txn_cost, axis=1)
+        today_df["net_pnl"]  = today_df["pnl_inr"] - today_df["txn_cost"]
+
+        total_gross = float(today_df["pnl_inr"].sum())
+        total_cost  = float(today_df["txn_cost"].sum())
+        total_net   = float(today_df["net_pnl"].sum())
+        wins  = int((today_df["net_pnl"] > 0).sum())
         stops = int((today_df["exit_reason"] == "stop").sum())
         trails = int((today_df["exit_reason"] == "trail").sum())
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Today P&L",  fmt_inr(total_inr), delta_color=color(total_inr))
-        c2.metric("Trades",     len(today_df))
-        c3.metric("Wins",       wins)
-        c4.metric("Stops",      stops)
-        c5.metric("Trail Exits", trails)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Gross P&L",   fmt_inr(total_gross), delta_color=color(total_gross))
+        c2.metric("Est. TxCost", f"-₹{total_cost:.0f}")
+        c3.metric("Net P&L",     fmt_inr(total_net),   delta_color=color(total_net))
+        c4.metric("Trades",      len(today_df))
+        c5.metric("Wins (net)",  wins)
+        c6.metric("Stops",       stops)
 
-        display = today_df[[
-            "symbol", "strike", "entry_time", "exit_time", "exit_reason",
-            "entry_premium", "exit_premium", "pnl_pts", "pnl_inr", "scorecard_conf"
-        ]].copy()
-        display["entry_time"] = pd.to_datetime(display["entry_time"]).dt.strftime("%Y-%m-%d %H:%M")
-        display["exit_time"]  = pd.to_datetime(display["exit_time"]).dt.strftime("%Y-%m-%d %H:%M")
-        display["status"]     = display["pnl_inr"].apply(lambda v: "✅ Win" if v > 0 else "❌ Loss")
-        display["pnl_inr"]    = display["pnl_inr"].apply(lambda v: f"+₹{v:.0f}" if v >= 0 else f"-₹{abs(v):.0f}")
-        display["pnl_pts"]    = display["pnl_pts"].apply(lambda v: f"{v:+.1f}")
-        display = display.rename(columns={
-            "entry_time": "Entry", "exit_time": "Exit", "exit_reason": "Reason",
-            "entry_premium": "Entry₹", "exit_premium": "Exit₹",
-            "pnl_pts": "P&L pts", "pnl_inr": "P&L ₹", "scorecard_conf": "Conf",
-        })
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        _ist = pd.Timedelta(hours=5, minutes=30)
+        rows = []
+        for _, r in today_df.iterrows():
+            is_fly = float(r.get("wing_ce_strike", 0) or 0) > 0
+            wce = int(r.get("wing_ce_strike", 0) or 0)
+            wpe = int(r.get("wing_pe_strike", 0) or 0)
+            wc  = float(r.get("wing_ce_ltp", 0) or 0) + float(r.get("wing_pe_ltp", 0) or 0)
+            gross = float(r["pnl_inr"])
+            cost  = float(r["txn_cost"])
+            net   = gross - cost
+            rows.append({
+                "Symbol":       r["symbol"],
+                "Sold CE+PE @": int(r["strike"]),
+                "Bought CE @":  wce if is_fly else "—",
+                "Bought PE @":  wpe if is_fly else "—",
+                "Entry":        (pd.to_datetime(r["entry_time"]) + _ist).strftime("%Y-%m-%d %I:%M %p"),
+                "Exit":         (pd.to_datetime(r["exit_time"])  + _ist).strftime("%Y-%m-%d %I:%M %p"),
+                "Reason":       r["exit_reason"],
+                "Status":       "✅ Win" if net > 0 else "❌ Loss",
+                "Straddle Sold": f"{float(r['entry_premium']):.1f}",
+                "Hedge Cost":   f"-{wc:.1f}" if is_fly else "—",
+                "Net Entry":    f"{float(r.get('net_premium', 0) or r['entry_premium']):.1f}",
+                "Exit Val":     f"{float(r['exit_premium']):.1f}",
+                "P&L pts":      f"{float(r['pnl_pts']):+.1f}",
+                "Gross P&L":    f"{'+' if gross>=0 else ''}₹{gross:.0f}",
+                "Est. TxCost":  f"-₹{cost:.0f}",
+                "Net P&L":      f"{'+' if net>=0 else ''}₹{net:.0f}",
+                "Conf":         f"{float(r['scorecard_conf']):.0f}",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     # ── Historical outcomes ────────────────────────────────────────────────────
     st.subheader("Historical Outcomes")

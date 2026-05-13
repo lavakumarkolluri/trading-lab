@@ -400,10 +400,10 @@ def extract_chain_features(chain, snap_date, expiry) -> Optional[dict]:
     if snap.empty:
         return None
 
-    ce = snap[snap.option_type == "CE"].set_index("strike")["ltp"]
-    pe = snap[snap.option_type == "PE"].set_index("strike")["ltp"]
-    ce_oi = snap[snap.option_type == "CE"].set_index("strike")["oi"]
-    pe_oi = snap[snap.option_type == "PE"].set_index("strike")["oi"]
+    ce    = snap[snap.option_type == "CE"].set_index("strike")["ltp"].groupby(level=0).last()
+    pe    = snap[snap.option_type == "PE"].set_index("strike")["ltp"].groupby(level=0).last()
+    ce_oi = snap[snap.option_type == "CE"].set_index("strike")["oi"].groupby(level=0).last()
+    pe_oi = snap[snap.option_type == "PE"].set_index("strike")["oi"].groupby(level=0).last()
 
     atm = find_atm_strike(ce, pe)
     if atm is None:
@@ -880,12 +880,24 @@ def score_today(ch, mc, symbol: str) -> None:
         log.warning(f"[{symbol}] could not extract chain features for {next_expiry}")
         return
 
+    # Fall back to nearest available EOD date for IV/POI/VIX features when
+    # today's intraday snap has no corresponding EOD summary yet
+    def _nearest_eod(index, snap):
+        if snap in index:
+            return snap
+        past = [d for d in index if d <= snap]
+        return past[-1] if past else snap
+
+    eod_snap = _nearest_eod(eod.index, latest_snap)
+    poi_snap = _nearest_eod(poi.index, latest_snap)
+    vix_snap = _nearest_eod(vix.index, latest_snap)
+
     row = {}
     row.update(chain_feats)
-    row.update(extract_eod_features(eod, latest_snap))
-    row.update(extract_poi_features(poi, latest_snap))
+    row.update(extract_eod_features(eod, eod_snap))
+    row.update(extract_poi_features(poi, poi_snap))
     row.update(temporal_features(next_expiry))
-    row["vix"] = float(vix.loc[latest_snap, "vix"]) if latest_snap in vix.index else 0.0
+    row["vix"] = float(vix.loc[vix_snap, "vix"]) if vix_snap in vix.index else 0.0
     if not tech.empty:
         row.update(_tech_row(tech, latest_snap, eod))
     row.update(extract_event_features(event_dates, latest_snap, next_expiry))
