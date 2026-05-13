@@ -1463,7 +1463,7 @@ elif page == "Market Data":
     # ── Fundamentals (compact) ────────────────────────────────────────────────
     with st.expander("📦 Fundamentals & MF NAV"):
         mf_df = query("""
-            SELECT date, scheme_name, nav
+            SELECT date, scheme_code, nav
             FROM market.mf_nav FINAL
             ORDER BY date DESC LIMIT 10
         """)
@@ -1473,7 +1473,8 @@ elif page == "Market Data":
             st.info("No MF NAV data.")
 
         fund_df = query("""
-            SELECT symbol, period, revenue, net_income, eps, roe
+            SELECT symbol, period, revenue, net_income, eps,
+                   free_cashflow, ebitda
             FROM market.fundamental_quarterly FINAL
             ORDER BY period DESC LIMIT 20
         """)
