@@ -118,6 +118,45 @@ if page == "System Health":
 
     today = date.today()
 
+    # ── Git Branch & CI Status ────────────────────────────────────────────────
+    ci_df = query("""
+        SELECT branch, commit_sha, commit_msg, commit_author, commit_ts,
+               tests_passed, tests_failed, tests_total, duration_s,
+               failed_tests, status, run_at
+        FROM system_meta.ci_results FINAL
+        ORDER BY run_at DESC
+        LIMIT 1
+    """)
+
+    st.subheader("Branch & CI Status")
+    if ci_df.empty:
+        st.info("No CI results yet — scheduler records tests after each auto-deploy.")
+    else:
+        ci = ci_df.iloc[0]
+        all_pass = int(ci["tests_failed"]) == 0 and int(ci["tests_passed"]) > 0
+        ci_icon  = "🟢" if all_pass else "🔴"
+        n_pass   = int(ci["tests_passed"])
+        n_fail   = int(ci["tests_failed"])
+        n_total  = int(ci["tests_total"])
+        run_age  = (today - pd.Timestamp(ci["run_at"]).date()).days
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Branch", str(ci["branch"]))
+        c2.metric("Commit", str(ci["commit_sha"])[:10],
+                  delta=str(ci["commit_msg"])[:40])
+        c3.metric(f"{ci_icon} Tests",
+                  f"{n_pass}/{n_total} passed",
+                  delta=f"{n_fail} failed" if n_fail else "All pass",
+                  delta_color="inverse" if n_fail else "normal")
+        c4.metric("Last Run", f"{run_age}d ago",
+                  delta=f"{float(ci['duration_s']):.0f}s")
+
+        if n_fail > 0:
+            with st.expander(f"🔴 {n_fail} failing tests"):
+                st.code(str(ci["failed_tests"]))
+
+    st.divider()
+
     # ── Pipeline Jobs ─────────────────────────────────────────────────────────
     st.subheader("Pipeline Jobs — Last 7 Days")
 
@@ -130,26 +169,19 @@ if page == "System Health":
         ORDER BY run_date DESC, service
     """)
 
+    # Only services that actually write to pipeline_runs (others tracked via data freshness)
     KEY_JOBS = [
-        "option_chain_intraday",
-        "compute_oi_features",
         "strategy_backtester",
         "confidence_scorer",
-        "intraday_monitor",
-        "participant_oi_pipeline",
-        "vix_pipeline",
-        "data_freshness_check",
     ]
 
+    STATUS_ICON = {"success": "🟢", "failed": "🔴", "running": "🟡", "skipped": "⬜"}
+
     if runs_df.empty:
-        st.warning("No pipeline run records found in system_meta.pipeline_runs.")
+        st.info("No pipeline run records yet — jobs populate this after first run.")
     else:
         runs_df["run_date"] = pd.to_datetime(runs_df["run_date"]).dt.date
         dates = sorted(runs_df["run_date"].unique(), reverse=True)[:7]
-
-        STATUS_ICON = {
-            "success": "🟢", "failed": "🔴", "running": "🟡", "skipped": "⬜",
-        }
 
         grid_rows = []
         for svc in KEY_JOBS:
@@ -180,7 +212,6 @@ if page == "System Health":
         st.dataframe(grid_df, use_container_width=True, hide_index=True)
         st.caption("🟢 success  🔴 failed  🟡 running  ⬜ skipped  ⚫ no record")
 
-        # Show recent failures
         fails = runs_df[runs_df["status"] == "failed"].sort_values("run_date", ascending=False).head(5)
         if not fails.empty:
             with st.expander(f"🔴 {len(fails)} recent failures"):
@@ -188,6 +219,54 @@ if page == "System Health":
                     fails[["service", "run_date", "error_msg", "duration_s"]],
                     use_container_width=True, hide_index=True
                 )
+
+    # ── Pipeline proxy freshness (services that don't write pipeline_runs) ────
+    st.markdown("**Derived job status (from data tables)**")
+    proxy_rows = []
+
+    def _proxy_row(label, sql, ok_days=1, warn_days=3):
+        df = query(sql)
+        if df.empty or df.iloc[0, 0] is None:
+            return {"Job": label, "Last Data": "—", "Status": "⚫"}
+        ld = df.iloc[0, 0]
+        if hasattr(ld, "date"):
+            ld = ld.date()
+        elif isinstance(ld, str):
+            try:
+                ld = date.fromisoformat(str(ld)[:10])
+            except Exception:
+                return {"Job": label, "Last Data": str(ld), "Status": "❓"}
+        age = (today - ld).days
+        icon = traffic_light(age <= ok_days, age <= warn_days)
+        return {"Job": label, "Last Data": str(ld), "Status": f"{icon} ({age}d ago)"}
+
+    proxy_rows.append(_proxy_row(
+        "option_chain_intraday",
+        "SELECT max(toDate(timestamp)) FROM market.options_chain FINAL",
+        ok_days=1, warn_days=4,
+    ))
+    proxy_rows.append(_proxy_row(
+        "compute_oi_features",
+        "SELECT max(date) FROM market.options_eod_summary FINAL",
+        ok_days=1, warn_days=4,
+    ))
+    proxy_rows.append(_proxy_row(
+        "vix_pipeline",
+        "SELECT max(toDate(timestamp)) FROM market.nifty_live FINAL",
+        ok_days=1, warn_days=3,
+    ))
+    proxy_rows.append(_proxy_row(
+        "participant_oi_pipeline",
+        "SELECT max(date) FROM market.participant_oi FINAL",
+        ok_days=1, warn_days=3,
+    ))
+    proxy_rows.append(_proxy_row(
+        "intraday_monitor",
+        "SELECT max(toDate(entry_time)) FROM trades.open_positions FINAL",
+        ok_days=4, warn_days=7,
+    ))
+    st.dataframe(pd.DataFrame(proxy_rows), use_container_width=True, hide_index=True)
+    st.caption("Status derived from latest data in each table — not a direct job log.")
 
     st.divider()
 

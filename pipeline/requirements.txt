@@ -29,3 +29,6 @@ kiteconnect==5.0.1
 
 # jugaad-data — NSE option chain (handles Akamai bot auth internally)
 jugaad-data==0.33.1
+
+# CI — test runner invoked by scheduler after auto-deploy
+pytest==8.3.5

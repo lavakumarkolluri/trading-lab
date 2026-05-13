@@ -44,28 +44,28 @@ def test_bt_gates_all_pass():
     assert gates["years"] == 1
 
 def test_bt_gates_fail_trades():
-    gates = m.check_bt_gates(bt_oos_trades=49, bt_win_rate=0.60,
+    gates = m.check_bt_gates(bt_oos_trades=m.BT_MIN_TRADES - 1, bt_win_rate=0.60,
                               bt_sharpe=0.80, bt_years=3.0)
     assert gates["trades"] == 0
 
 def test_bt_gates_fail_win_rate():
-    gates = m.check_bt_gates(bt_oos_trades=60, bt_win_rate=0.54,
+    gates = m.check_bt_gates(bt_oos_trades=60, bt_win_rate=m.BT_MIN_WIN_RATE - 0.01,
                               bt_sharpe=0.80, bt_years=3.0)
     assert gates["win_rate"] == 0
 
 def test_bt_gates_fail_sharpe():
     gates = m.check_bt_gates(bt_oos_trades=60, bt_win_rate=0.60,
-                              bt_sharpe=0.05, bt_years=3.0)
+                              bt_sharpe=m.BT_MIN_SHARPE / 2, bt_years=3.0)
     assert gates["sharpe"] == 0
 
 def test_bt_gates_fail_years():
     gates = m.check_bt_gates(bt_oos_trades=60, bt_win_rate=0.60,
-                              bt_sharpe=0.80, bt_years=1.5)
+                              bt_sharpe=0.80, bt_years=m.BT_MIN_YEARS - 0.5)
     assert gates["years"] == 0
 
 def test_bt_gates_exactly_on_threshold_pass():
-    gates = m.check_bt_gates(bt_oos_trades=50, bt_win_rate=0.55,
-                              bt_sharpe=0.50, bt_years=2.0)
+    gates = m.check_bt_gates(bt_oos_trades=m.BT_MIN_TRADES, bt_win_rate=m.BT_MIN_WIN_RATE,
+                              bt_sharpe=m.BT_MIN_SHARPE, bt_years=m.BT_MIN_YEARS)
     assert all(v == 1 for v in gates.values())
 
 
@@ -79,14 +79,14 @@ def test_paper_gates_all_pass():
     assert gates["pnl"] == 1
 
 def test_paper_gates_fail_trades():
-    gates = m.check_paper_gates(paper_trades=29, paper_win_rate=0.60,
+    gates = m.check_paper_gates(paper_trades=m.PAPER_MIN_TRADES - 1, paper_win_rate=0.60,
                                  paper_net_pnl=5000.0, paper_vs_bt_delta=-0.05)
     assert gates["trades"] == 0
 
 def test_paper_gates_fail_drift():
-    """Drift of -0.11 (more negative than -0.10 threshold) → fail."""
+    """Drift more negative than PAPER_MAX_DRIFT → fail."""
     gates = m.check_paper_gates(paper_trades=40, paper_win_rate=0.49,
-                                 paper_net_pnl=5000.0, paper_vs_bt_delta=-0.11)
+                                 paper_net_pnl=5000.0, paper_vs_bt_delta=m.PAPER_MAX_DRIFT - 0.01)
     assert gates["win_rate"] == 0
 
 def test_paper_gates_fail_pnl():
@@ -111,7 +111,7 @@ def test_micro_gates_all_pass():
     assert gates["pnl"] == 1
 
 def test_micro_gates_fail_trades():
-    gates = m.check_micro_gates(micro_trades=19, micro_win_rate=0.60,
+    gates = m.check_micro_gates(micro_trades=m.MICRO_MIN_TRADES - 1, micro_win_rate=0.60,
                                  micro_net_pnl=3000.0)
     assert gates["trades"] == 0
 

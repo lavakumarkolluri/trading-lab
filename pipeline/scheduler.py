@@ -198,6 +198,16 @@ def job_auto_deploy():
             log.info("AUTO-DEPLOY: docker-compose.yml changed — applying with up -d...")
             _compose(["up", "-d", "--remove-orphans"])
 
+        # ── Run tests on any code change ─────────────────────────────────────
+        code_changed = any(
+            f.startswith("pipeline/") or f.startswith("tests/")
+            or f.startswith("dashboard/") or f.startswith("clickhouse/")
+            for f in changed
+        )
+        if code_changed:
+            log.info("AUTO-DEPLOY: code changed — running test suite...")
+            _run_tests_and_record()
+
         # ── Rebuild pipeline image and self-restart ───────────────────────────
         pipeline_changed = any(f.startswith("pipeline/") for f in changed)
         if pipeline_changed:
@@ -355,6 +365,72 @@ def job_strategy_selector_backtest():
 def job_strategy_selector_fill_outcomes():
     log.info("=== Strategy selector outcome fill-back triggered ===")
     _run("strategy_selector", "--fill-outcomes")
+
+
+def _run_tests_and_record():
+    """
+    Run offline test suite and write results to system_meta.ci_results.
+    Called after every successful auto-deploy that changes code.
+    Tests run against the mounted source tree at /trading-lab/tests/.
+    """
+    if not _TRACKING_OK:
+        log.warning("TEST-RUN: tracking unavailable, skipping CI record")
+        return
+    import re as _re
+    test_dir = "/trading-lab/tests"
+    t0 = datetime.utcnow()
+    try:
+        result = subprocess.run(
+            ["python", "-m", "pytest", test_dir, "--tb=line", "-q", "--no-header"],
+            capture_output=True, text=True, timeout=180,
+        )
+        output = result.stdout + result.stderr
+        # Parse "X passed, Y failed" from pytest summary line
+        m_pass = _re.search(r"(\d+) passed", output)
+        m_fail = _re.search(r"(\d+) failed", output)
+        n_pass = int(m_pass.group(1)) if m_pass else 0
+        n_fail = int(m_fail.group(1)) if m_fail else 0
+        # Collect failed test names from output
+        failed_lines = [l for l in output.splitlines() if "FAILED" in l]
+        failed_names = "\n".join(failed_lines[:30])
+        status = "pass" if n_fail == 0 and n_pass > 0 else "fail"
+        if result.returncode not in (0, 1):
+            status = "error"
+    except Exception as e:
+        n_pass, n_fail, failed_names, status = 0, 0, str(e)[:200], "error"
+    duration = (datetime.utcnow() - t0).total_seconds()
+
+    # Collect git info from the mounted repo
+    try:
+        branch = _git(["rev-parse", "--abbrev-ref", "HEAD"],
+                      ).stdout.strip() or "unknown"
+        sha    = _git(["rev-parse", "HEAD"]).stdout.strip()[:12] or "unknown"
+        msg    = _git(["log", "-1", "--format=%s"]).stdout.strip()[:120] or ""
+        author = _git(["log", "-1", "--format=%an"]).stdout.strip()[:60] or ""
+        cts    = _git(["log", "-1", "--format=%ci"]).stdout.strip()[:19] or "1970-01-01 00:00:00"
+    except Exception:
+        branch, sha, msg, author, cts = "unknown", "unknown", "", "", "1970-01-01 00:00:00"
+
+    try:
+        ch = _ch_client()
+        ch.insert(
+            "system_meta.ci_results",
+            [[branch, sha, msg, author, cts,
+              n_pass, n_fail, n_pass + n_fail,
+              duration, failed_names, status,
+              datetime.utcnow(), int(t0.timestamp())]],
+            column_names=[
+                "branch", "commit_sha", "commit_msg", "commit_author", "commit_ts",
+                "tests_passed", "tests_failed", "tests_total", "duration_s",
+                "failed_tests", "status", "run_at", "version",
+            ],
+        )
+        log.info(
+            "TEST-RUN: branch=%s sha=%s %s/%s tests %s (%.1fs)",
+            branch, sha, n_pass, n_pass + n_fail, status.upper(), duration,
+        )
+    except Exception as e:
+        log.error("TEST-RUN: failed to write ci_results: %s", e)
 
 
 def job_graduation_gate():
