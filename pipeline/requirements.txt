@@ -26,3 +26,6 @@ beautifulsoup4==4.12.3
 
 # Zerodha Kite Connect — live order placement
 kiteconnect==5.0.1
+
+# jugaad-data — NSE option chain (handles Akamai bot auth internally)
+jugaad-data==0.33.1

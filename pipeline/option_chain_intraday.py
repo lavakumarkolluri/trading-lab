@@ -32,7 +32,7 @@ from datetime import datetime, time as dtime, date
 
 import pandas as pd
 import clickhouse_connect
-from curl_cffi import requests as cffi_requests
+from jugaad_data.nse import NSELive
 from minio import Minio
 
 logging.basicConfig(
@@ -47,7 +47,6 @@ MARKET_OPEN      = dtime(9, 15)
 MARKET_CLOSE     = dtime(15, 30)
 EXIT_AFTER       = dtime(15, 35)    # hard exit
 FETCH_INTERVAL_S = 180              # 3 minutes
-SESSION_REFRESH_S = 25 * 60         # refresh NSE session every 25 min
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 
@@ -61,8 +60,6 @@ MINIO_USER   = os.getenv("MINIO_USER", "admin")
 MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 
-NSE_HOME   = "https://www.nseindia.com"
-NSE_OC_URL = "https://www.nseindia.com/api/option-chain-indices"
 HTTP_TIMEOUT = 20
 
 _TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -112,38 +109,20 @@ def get_minio_client() -> Minio:
 
 # ── NSE session ──────────────────────────────────────────
 
-def build_nse_session() -> cffi_requests.Session:
-    session = cffi_requests.Session(impersonate="chrome110")
-    log.info("Building NSE session (homepage warm-up)...")
-    resp = session.get(
-        f"{NSE_HOME}/option-chain",
-        timeout=HTTP_TIMEOUT,
-        headers={
-            "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 Chrome/110.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
-    resp.raise_for_status()
-    log.info(f"NSE session ready (cookies: {len(session.cookies)})")
-    time.sleep(2.0)
-    return session
+def build_nse_session() -> NSELive:
+    """Return a jugaad-data NSELive client (handles NSE auth internally)."""
+    log.info("Building NSE session via jugaad-data...")
+    client = NSELive()
+    log.info("NSE session ready (jugaad-data)")
+    return client
 
 
-def fetch_chain(session: cffi_requests.Session, symbol: str) -> dict | None:
+def fetch_chain(client: NSELive, symbol: str) -> dict | None:
     try:
-        resp = session.get(
-            NSE_OC_URL,
-            params={"symbol": symbol},
-            timeout=HTTP_TIMEOUT,
-            headers={
-                "Referer":          "https://www.nseindia.com/option-chain",
-                "X-Requested-With": "XMLHttpRequest",
-                "Accept":           "application/json",
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()
+        data = client.equities_option_chain(symbol)
+        if not data or "records" not in data:
+            raise ValueError(f"Empty/invalid response: {str(data)[:60]}")
+        return data
     except Exception as e:
         log.warning(f"Fetch failed for {symbol}: {e}")
         return None
@@ -168,14 +147,22 @@ def parse_all_strikes(data: dict, symbol: str, now: datetime) -> list[dict]:
 
     for item in all_data:
         strike = float(item.get("strikePrice", 0))
-        expiry_str = item.get("expiryDate", "")
-        try:
-            expiry = datetime.strptime(expiry_str, "%d-%b-%Y").date()
-        except ValueError:
-            continue
-
         ce = item.get("CE", {})
         pe = item.get("PE", {})
+        # jugaad-data puts expiryDate inside CE/PE; original NSE puts it at item level
+        expiry_str = (item.get("expiryDate")
+                      or (ce or {}).get("expiryDate")
+                      or (pe or {}).get("expiryDate")
+                      or "")
+        expiry = None
+        for fmt in ("%d-%b-%Y", "%d-%m-%Y"):
+            try:
+                expiry = datetime.strptime(expiry_str, fmt).date()
+                break
+            except ValueError:
+                continue
+        if expiry is None:
+            continue
 
         for opt_type, side in (("CE", ce), ("PE", pe)):
             if not side:
@@ -281,10 +268,10 @@ def main():
         log.info("ClickHouse + MinIO connected")
 
     session = build_nse_session()
-    last_session_refresh = time.monotonic()
     fetch_count = 0
     session_fail_streak = 0
     _MAX_SESSION_FAILS = 3
+    consecutive_empty = 0     # force refresh when all symbols return None repeatedly
 
     while ist_time() <= EXIT_AFTER and not _SHUTDOWN:
         now_ist = ist_now()
@@ -299,39 +286,35 @@ def main():
             log.info(f"Market closed ({t}) — exiting")
             break
 
-        # Refresh session every 25 min
-        if time.monotonic() - last_session_refresh > SESSION_REFRESH_S:
-            log.info("Refreshing NSE session...")
-            try:
-                session = build_nse_session()
-                last_session_refresh = time.monotonic()
-                session_fail_streak = 0
-            except Exception as e:
-                session_fail_streak += 1
-                log.warning(
-                    f"Session refresh failed ({session_fail_streak}/{_MAX_SESSION_FAILS}): "
-                    f"{e} — continuing with old session"
-                )
-                if session_fail_streak >= _MAX_SESSION_FAILS:
-                    _send_telegram(
-                        f"⚠️ option_chain_intraday: NSE session refresh failed "
-                        f"{session_fail_streak} times in a row. Fetching with stale cookies."
-                    )
-                    session_fail_streak = 0  # reset after alert to avoid spam
-
         fetch_count += 1
         log.info(f"--- Snapshot {fetch_count} at {now_ist.strftime('%H:%M:%S')} IST ---")
 
         all_rows = []
+        fetched = 0
         for symbol in SYMBOLS:
             data = fetch_chain(session, symbol)
             if data is None:
                 continue
+            fetched += 1
             rows = parse_all_strikes(data, symbol, now_ist.replace(tzinfo=None))
             all_rows.extend(rows)
             if not args.dry_run:
                 save_to_minio(mc, data, symbol, now_ist)
             time.sleep(2.5)  # brief pause between symbols
+
+        # Force session refresh if all symbols failed (likely Akamai block)
+        if fetched == 0:
+            consecutive_empty += 1
+            log.warning("All fetches returned empty (%d consecutive) — forcing session refresh",
+                        consecutive_empty)
+            try:
+                session = build_nse_session()
+                last_session_refresh = time.monotonic()
+                consecutive_empty = 0
+            except Exception as e:
+                log.warning("Forced session refresh failed: %s", e)
+        else:
+            consecutive_empty = 0
 
         if not args.dry_run and all_rows:
             insert_rows(ch, all_rows)
