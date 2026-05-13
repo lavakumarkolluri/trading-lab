@@ -57,6 +57,12 @@ VIX_MIN = 11.0          # skip if VIX too low (no premium worth collecting)
 VIX_MAX = 28.0          # skip if VIX too high (tail-risk events)
 IV_SKEW_THRESH = 2.0    # % — iv_skew = avg(PE_IV_OTM) − avg(CE_IV_OTM); +ve = fear/put premium
 
+# Vol surface signal thresholds
+VOL_SKEW_BULL_PUT_THRESH = 0.02   # skew_2pct > 2% → puts expensive → bias toward bull_put
+TERM_BACKW_BONUS_MIN     = -0.04  # term_slope > -4% (not panic) → eligible for bonus pts
+TERM_BACKW_BONUS_MAX     = -0.01  # term_slope < -1% → backwardation confirmed
+TERM_BACKW_BONUS_PTS     = 3.0    # bonus added to trade_score in moderate backwardation
+
 # Phase 2 trade_score weights (sum = 100)
 SCORE_W_CONFIDENCE = 40   # confidence model quality
 SCORE_W_VIX        = 20   # VIX regime: sweet spot 14-22 = full, 11-13/23-28 = half
@@ -89,6 +95,29 @@ def get_vix(ch, snap_date: date) -> float | None:
         parameters={"d": snap_date},
     ).result_rows
     return float(rows[0][0]) if rows and rows[0][0] else None
+
+
+def get_vol_surface_signals(ch, symbol: str, snap_date: date) -> dict:
+    """Fetch term_slope and skew from vol_term_structure for snap_date.
+    Returns zeros if no surface data available (e.g. pre-2019 or not yet computed).
+    """
+    _default = {"term_slope": 0.0, "skew_2pct": 0.0, "skew_3pct": 0.0}
+    if snap_date is None:
+        return _default
+    rows = ch.query(
+        "SELECT term_slope, skew_2pct, skew_3pct "
+        "FROM market.vol_term_structure FINAL "
+        "WHERE symbol={sym:String} AND date={d:Date}",
+        parameters={"sym": symbol, "d": snap_date},
+    ).result_rows
+    if not rows:
+        return _default
+    r = rows[0]
+    return {
+        "term_slope": float(r[0] or 0),
+        "skew_2pct":  float(r[1] or 0),
+        "skew_3pct":  float(r[2] or 0),
+    }
 
 
 def get_eod_signals(ch, expiry: date, snap_date: date) -> dict:
@@ -183,12 +212,14 @@ def get_confidence(ch, score_date: date, symbol: str):
     return conf, pcr_bias, iv_skew, expiry
 
 
-def pick_strategy(confidence: float, pcr_bias: float, iv_skew: float) -> str:
+def pick_strategy(confidence: float, pcr_bias: float, iv_skew: float,
+                  skew_from_surface: float = 0.0) -> str:
     """Choose spread type from confidence + market bias.
 
     Both PCR and iv_skew must agree for a directional trade:
       pcr > PCR_BULLISH AND iv_skew > IV_SKEW_THRESH  → bull_put  (fear premium, puts expensive)
       pcr < PCR_BEARISH AND iv_skew < -IV_SKEW_THRESH → bear_call (upside fear, calls expensive)
+      skew_from_surface > VOL_SKEW_BULL_PUT_THRESH     → bias bull_put (puts structurally expensive)
       any conflict or neutral                          → iron_condor
     """
     pcr_bull  = pcr_bias > PCR_BULLISH
@@ -200,12 +231,16 @@ def pick_strategy(confidence: float, pcr_bias: float, iv_skew: float) -> str:
         return "bull_put"
     if pcr_bear and not skew_bull:
         return "bear_call"
+    # Vol surface tiebreaker: structurally elevated put skew favours bull_put
+    if skew_from_surface > VOL_SKEW_BULL_PUT_THRESH and not skew_bear:
+        return "bull_put"
     return "iron_condor"
 
 
 def compute_trade_score(
     confidence: float, vix: float | None,
     iv_rank: float, pcr_bias: float, iv_skew: float,
+    term_slope: float = 0.0,
 ) -> tuple[float, dict]:
     """Composite trade quality score 0-100. Returns (score, breakdown).
 
@@ -215,6 +250,9 @@ def compute_trade_score(
       iv_rank     20pts — proportional (more premium → higher score)
       alignment   20pts — PCR + iv_skew both agree on direction (full),
                           only PCR signal (half), conflict or neutral (0)
+    Adjustment:
+      term_slope  +3pts bonus if moderate backwardation (-4% to -1%): IV is elevated
+                  but not panic — good environment to sell premium
     """
     # Confidence component
     conf_pct  = min(confidence, 100.0) / 100.0
@@ -245,13 +283,19 @@ def compute_trade_score(
     else:
         s_align = 0.0                        # neutral or conflict
 
-    score = s_conf + s_vix + s_ivrank + s_align
+    # Term slope bonus: moderate backwardation → IV elevated but not panic
+    s_term = 0.0
+    if TERM_BACKW_BONUS_MIN <= term_slope <= TERM_BACKW_BONUS_MAX:
+        s_term = TERM_BACKW_BONUS_PTS
+
+    score = s_conf + s_vix + s_ivrank + s_align + s_term
     breakdown = {
         "score": round(score, 1),
         "s_confidence": round(s_conf, 1),
         "s_vix": round(s_vix, 1),
         "s_iv_rank": round(s_ivrank, 1),
         "s_alignment": round(s_align, 1),
+        "s_term_slope": round(s_term, 1),
     }
     return score, breakdown
 
@@ -354,6 +398,7 @@ def build_recommendation(
     confidence: float, pcr_bias: float, iv_skew: float,
     params: dict, lots: int, lot_size: int,
     signals: dict | None = None,
+    term_slope: float = 0.0, skew_2pct: float = 0.0,
 ):
     """Assemble full recommendation dict with leg prices.
 
@@ -414,6 +459,7 @@ def build_recommendation(
         net_credit=net_credit, max_loss=max_loss,
         lots=lots, capital_at_risk=capital_at_risk,
         confidence=confidence, pcr_bias=pcr_bias, iv_skew=iv_skew,
+        term_slope=term_slope, skew_2pct=skew_2pct,
         pnl_pts=0.0, pnl_amount=0.0, outcome="pending",
     )
 
@@ -432,6 +478,7 @@ def insert_recommendation(ch, rec: dict):
             rec["net_credit"], rec["max_loss"],
             rec["lots"], rec["capital_at_risk"],
             rec["confidence"], rec["pcr_bias"], rec["iv_skew"],
+            rec["term_slope"], rec["skew_2pct"],
             rec["pnl_pts"], rec["pnl_amount"], rec["outcome"],
         ]],
         column_names=[
@@ -445,6 +492,7 @@ def insert_recommendation(ch, rec: dict):
             "net_credit", "max_loss",
             "lots", "capital_at_risk",
             "confidence", "pcr_bias", "iv_skew",
+            "term_slope", "skew_2pct",
             "pnl_pts", "pnl_amount", "outcome",
         ],
     )
@@ -488,17 +536,23 @@ def run_recommend(ch):
     vix = get_vix(ch, snap_date) if snap_date else None
     signals = get_eod_signals(ch, expiry, snap_date) if snap_date else {}
     iv_rank = signals.get("iv_rank", 50.0)
+    vol_signals = get_vol_surface_signals(ch, symbol, snap_date)
+    term_slope = vol_signals["term_slope"]
+    skew_2pct  = vol_signals["skew_2pct"]
 
     # Phase 2: composite trade_score gate
-    trade_score, score_breakdown = compute_trade_score(confidence, vix, iv_rank, pcr_bias, iv_skew)
+    trade_score, score_breakdown = compute_trade_score(
+        confidence, vix, iv_rank, pcr_bias, iv_skew, term_slope=term_slope
+    )
     log.info(
-        "Trade score: %.1f/100 (conf=%.1f vix=%.1f ivrank=%.1f align=%.1f) | "
-        "VIX=%s iv_rank=%.1f pcr=%.2f iv_skew=%.2f",
+        "Trade score: %.1f/100 (conf=%.1f vix=%.1f ivrank=%.1f align=%.1f term=%.1f) | "
+        "VIX=%s iv_rank=%.1f pcr=%.2f iv_skew=%.2f term_slope=%.3f skew_2pct=%.3f",
         trade_score,
         score_breakdown["s_confidence"], score_breakdown["s_vix"],
         score_breakdown["s_iv_rank"], score_breakdown["s_alignment"],
+        score_breakdown["s_term_slope"],
         f"{vix:.1f}" if vix is not None else "n/a",
-        iv_rank, pcr_bias, iv_skew,
+        iv_rank, pcr_bias, iv_skew, term_slope, skew_2pct,
     )
     if trade_score < TRADE_SCORE_THRESHOLD:
         log.info("Trade score %.1f < threshold %.1f — no trade for %s",
@@ -511,8 +565,9 @@ def run_recommend(ch):
                  vix, VIX_MIN, VIX_MAX, symbol)
         return
 
-    strategy = pick_strategy(confidence, pcr_bias, iv_skew)
-    log.info("Signal: pcr=%.2f iv_skew=%.2f → strategy=%s", pcr_bias, iv_skew, strategy)
+    strategy = pick_strategy(confidence, pcr_bias, iv_skew, skew_from_surface=skew_2pct)
+    log.info("Signal: pcr=%.2f iv_skew=%.2f skew_2pct=%.3f → strategy=%s",
+             pcr_bias, iv_skew, skew_2pct, strategy)
     params   = get_optimal_params(ch, symbol, strategy)
     if params is None:
         log.warning("No optimal params for %s/%s — skipping", symbol, strategy)
@@ -548,6 +603,7 @@ def run_recommend(ch):
         confidence, pcr_bias, iv_skew,
         params, lots, lot_size,
         signals=signals,
+        term_slope=term_slope, skew_2pct=skew_2pct,
     )
 
     if rec is None:
@@ -634,6 +690,20 @@ def run_backtest(ch):
         eod_rows = []
     eod_by_key = {(r[0], r[1]): (float(r[2]), float(r[3]), float(r[4])) for r in eod_rows}
 
+    # Pre-fetch vol surface term structure for all symbols × dates
+    try:
+        vts_rows = ch.query(
+            "SELECT symbol, date, term_slope, skew_2pct "
+            "FROM market.vol_term_structure FINAL "
+            "WHERE date >= {d1:Date} AND date <= {d2:Date}",
+            parameters={"d1": d_min, "d2": d_max},
+        ).result_rows
+    except Exception as e:
+        log.warning("vol_term_structure query failed: %s — using defaults", e)
+        vts_rows = []
+    vts_by_key = {(r[0], r[1]): (float(r[2] or 0), float(r[3] or 0)) for r in vts_rows}
+    log.info("Loaded %d vol surface rows for backtest", len(vts_by_key))
+
     capital = INITIAL_CAPITAL
     sim_rows = []
     win_pnls: list[float] = []   # track winning trade amounts for drawdown cap
@@ -651,6 +721,7 @@ def run_backtest(ch):
         # Resolve signals for this row
         vix = vix_by_date.get(entry_date)
         iv_rank, pcr_bias, iv_skew = eod_by_key.get((expiry, entry_date), (50.0, 1.0, 0.0))
+        term_slope, skew_2pct = vts_by_key.get((symbol, entry_date), (0.0, 0.0))
 
         # Hard VIX gate
         if vix is not None and (vix < VIX_MIN or vix > VIX_MAX):
@@ -661,7 +732,9 @@ def run_backtest(ch):
             ])
             continue
 
-        trade_score, _ = compute_trade_score(confidence_pct, vix, iv_rank, pcr_bias, iv_skew)
+        trade_score, _ = compute_trade_score(
+            confidence_pct, vix, iv_rank, pcr_bias, iv_skew, term_slope=term_slope
+        )
 
         skipped = 0
         pnl_pts = 0.0
