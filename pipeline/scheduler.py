@@ -337,6 +337,11 @@ def job_confidence_scorer():
     _run("confidence_scorer", "--compare")
 
 
+def job_confidence_scorer_daily():
+    log.info("=== Confidence scorer daily score-only triggered ===")
+    _run("confidence_scorer", "--score-only")
+
+
 def job_strategy_selector_recommend():
     log.info("=== Strategy selector daily recommendation triggered ===")
     _run("strategy_selector", "--recommend")
@@ -555,6 +560,7 @@ def main():
     log.info("  Intraday monitor    : Mon–Fri 03:50 UTC (09:20 IST) paper straddle")
     log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
     log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV+VIX")
+    log.info("  Confidence scorer   : Mon–Fri 13:00 UTC (18:30 IST) --score-only (daily refresh)")
     log.info("  Weekly  refresh     : Sun     00:30 UTC (06:00 IST)")
     log.info("  Gap     analyzer    : Sun     01:00 UTC (06:30 IST)")
     log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
@@ -590,6 +596,11 @@ def main():
     # Option chain EOD: bhavcopy + PCR/max pain + IV at 18:00 IST (12:30 UTC)
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("12:30").do(job_option_chain_eod)
+
+    # Daily confidence scoring (score-only): after EOD pipeline at 13:00 UTC (18:30 IST)
+    # Uses existing model; ensures intraday_monitor has fresh scores each morning
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("13:00").do(job_confidence_scorer_daily)
 
     schedule.every().sunday.at("00:00").do(job_events_pipeline)
     schedule.every().sunday.at("00:30").do(job_weekly)
