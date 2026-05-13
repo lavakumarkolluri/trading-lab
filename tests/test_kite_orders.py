@@ -159,6 +159,78 @@ def test_place_straddle_exit_places_two_buy_orders():
         assert c[1]["transaction_type"] == "BUY"
 
 
+# ── get_available_capital / compute_lots ──────────────────────────────────────
+
+def test_get_available_capital_returns_net():
+    from kite_orders import KiteOrderManager
+    kite = MagicMock()
+    kite.margins.return_value = {"net": 500000.0, "used": 100000.0}
+    mgr = KiteOrderManager(kite)
+    assert mgr.get_available_capital() == pytest.approx(500000.0)
+    kite.margins.assert_called_once_with("equity")
+
+
+def test_get_available_capital_returns_zero_when_kite_none():
+    from kite_orders import KiteOrderManager
+    mgr = KiteOrderManager(None)
+    assert mgr.get_available_capital() == 0.0
+
+
+def test_get_available_capital_returns_zero_on_api_error():
+    from kite_orders import KiteOrderManager
+    kite = MagicMock()
+    kite.margins.side_effect = Exception("network error")
+    mgr = KiteOrderManager(kite)
+    assert mgr.get_available_capital() == 0.0
+
+
+def test_compute_lots_sizes_by_capital():
+    from kite_orders import KiteOrderManager
+    kite = MagicMock()
+    kite.instruments.return_value = _make_instruments()
+    # 500k capital, 80% utilisation = 400k; margin_1lot = 150k → 2 lots
+    kite.margins.return_value = {"net": 500000.0}
+    kite.order_margins.return_value = [{"total": 80000}, {"total": 70000}]  # 150k per lot
+    mgr = KiteOrderManager(kite)
+    mgr.load_instruments()
+    lots = mgr.compute_lots("NIFTY", date(2026, 5, 15), 22000.0, 75)
+    assert lots == 2   # floor(500000 * 0.8 / 150000) = floor(2.666) = 2
+
+
+def test_compute_lots_clamps_to_max():
+    from kite_orders import KiteOrderManager, MAX_LOTS
+    kite = MagicMock()
+    kite.instruments.return_value = _make_instruments()
+    kite.margins.return_value = {"net": 50_000_000.0}   # huge capital
+    kite.order_margins.return_value = [{"total": 80000}, {"total": 70000}]
+    mgr = KiteOrderManager(kite)
+    mgr.load_instruments()
+    lots = mgr.compute_lots("NIFTY", date(2026, 5, 15), 22000.0, 75)
+    assert lots == MAX_LOTS
+
+
+def test_compute_lots_returns_one_when_capital_zero():
+    from kite_orders import KiteOrderManager
+    kite = MagicMock()
+    kite.instruments.return_value = _make_instruments()
+    kite.margins.return_value = {"net": 0.0}
+    kite.order_margins.return_value = [{"total": 80000}, {"total": 70000}]
+    mgr = KiteOrderManager(kite)
+    mgr.load_instruments()
+    assert mgr.compute_lots("NIFTY", date(2026, 5, 15), 22000.0, 75) == 1
+
+
+def test_compute_lots_returns_one_when_margin_check_fails():
+    from kite_orders import KiteOrderManager
+    kite = MagicMock()
+    kite.instruments.return_value = _make_instruments()
+    kite.margins.return_value = {"net": 500000.0}
+    kite.order_margins.side_effect = Exception("api error")
+    mgr = KiteOrderManager(kite)
+    mgr.load_instruments()
+    assert mgr.compute_lots("NIFTY", date(2026, 5, 15), 22000.0, 75) == 1
+
+
 # ── build_kite_client ─────────────────────────────────────────────────────────
 
 def test_build_kite_client_returns_none_when_env_missing():
@@ -185,7 +257,7 @@ def _make_snap():
 def test_record_entry_columns_match_values_with_kite_ids():
     ch = MagicMock()
     mgr = MagicMock()
-    mgr.check_margin.return_value = 100000.0
+    mgr.compute_lots.return_value = 2
     mgr.place_straddle_entry.return_value = ("ce_001", "pe_001")
     monitor.record_entry(ch, "NIFTY", _make_snap(), lot_size=75,
                          scorecard_conf=70.0, dry_run=False, kite_mgr=mgr)
@@ -197,6 +269,13 @@ def test_record_entry_columns_match_values_with_kite_ids():
     )
     assert "kite_ce_order_id" in cols
     assert "kite_pe_order_id" in cols
+    assert "lots" in cols
+    # 2 lots → target_inr = 2 × 2000
+    idx = cols.index("target_inr")
+    assert values[idx] == pytest.approx(4000.0)
+    # place_straddle_entry called with lots=2
+    mgr.place_straddle_entry.assert_called_once()
+    assert mgr.place_straddle_entry.call_args[1]["lots"] == 2
 
 
 def test_record_entry_paper_mode_no_kite_calls():
@@ -208,18 +287,22 @@ def test_record_entry_paper_mode_no_kite_calls():
     assert "kite_ce_order_id" in cols
     idx = cols.index("kite_ce_order_id")
     assert vals[idx] == ""   # empty in paper mode
+    # paper mode always uses 1 lot; target_inr = TARGET_INR × 1
+    assert vals[cols.index("lots")] == 1
+    assert vals[cols.index("target_inr")] == pytest.approx(2000.0)
 
 
-def _make_pos():
+def _make_pos(lots=1):
     return {
         "trade_id": "test-id", "symbol": "NIFTY",
         "expiry": date(2026, 5, 15), "strike": 22000.0,
         "entry_time": "2026-05-13 09:30:00",
         "entry_ce_ltp": 150.0, "entry_pe_ltp": 140.0, "entry_premium": 290.0,
         "lot_size": 75, "target_pts": 26.67, "stop_pts": 13.33,
-        "target_inr": 2000.0, "stoploss_inr": 1000.0, "scorecard_conf": 70.0,
+        "target_inr": 2000.0 * lots, "stoploss_inr": 1000.0 * lots,
+        "scorecard_conf": 70.0,
         "trailing_active": 0, "peak_pnl_inr": 0.0, "trail_stop_inr": 0.0,
-        "entry_features": "{}",
+        "entry_features": "{}", "lots": lots,
     }
 
 
@@ -236,9 +319,28 @@ def test_record_exit_columns_match_values_with_kite_ids():
     assert len(values) == len(cols)
     assert "kite_ce_order_id" in cols
     assert "kite_pe_order_id" in cols
+    assert "lots" in cols
 
 
-# ── Migration 066 ──────────────────────────────────────────────────────────────
+def test_record_exit_scales_pnl_by_lots():
+    ch = MagicMock()
+    mgr = MagicMock()
+    mgr.place_straddle_exit.return_value = ("", "")
+    pos = _make_pos(lots=3)
+    monitor.record_exit(ch, pos, current_straddle=250.0,
+                        exit_reason="stop", dry_run=False, kite_mgr=mgr)
+    first = ch.insert.call_args_list[0]
+    values = first[0][1][0]
+    cols   = first[1]["column_names"]
+    pnl_inr = values[cols.index("pnl_inr")]
+    # pnl_pts = 290 - 250 = 40; lot_size=75; lots=3 → 40 × 75 × 3 = 9000
+    assert pnl_inr == pytest.approx(9000.0)
+    # exit called with lots=3
+    mgr.place_straddle_exit.assert_called_once()
+    assert mgr.place_straddle_exit.call_args[1]["lots"] == 3
+
+
+# ── Migration 066 / 067 ────────────────────────────────────────────────────────
 
 def test_migration_066_exists_and_covers_both_tables():
     path = os.path.join(os.path.dirname(__file__), "..",
@@ -249,3 +351,13 @@ def test_migration_066_exists_and_covers_both_tables():
     assert "trade_outcomes"   in sql
     assert "kite_ce_order_id" in sql
     assert "kite_pe_order_id" in sql
+
+
+def test_migration_067_exists_and_adds_lots():
+    path = os.path.join(os.path.dirname(__file__), "..",
+                        "clickhouse", "migrations", "067_add_lots_to_trades.sql")
+    assert os.path.exists(path)
+    sql = open(path).read()
+    assert "open_positions" in sql
+    assert "trade_outcomes" in sql
+    assert "lots" in sql

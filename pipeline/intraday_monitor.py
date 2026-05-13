@@ -305,13 +305,13 @@ def record_hedge(ch, pos: dict, net_delta: float, spot: float, dry_run: bool) ->
               pos["scorecard_conf"], "open",
               int(pos["trailing_active"]), float(pos["peak_pnl_inr"]),
               float(pos["trail_stop_inr"]), now, pos.get("entry_features", "{}"),
-              net_delta, cum_lots]],
+              net_delta, cum_lots, int(pos.get("lots", 1))]],
             column_names=["trade_id", "symbol", "expiry", "entry_time", "strike",
                           "entry_ce_ltp", "entry_pe_ltp", "entry_premium",
                           "lot_size", "target_pts", "stop_pts", "target_inr", "stoploss_inr",
                           "scorecard_conf", "status",
                           "trailing_active", "peak_pnl_inr", "trail_stop_inr", "last_checked",
-                          "entry_features", "net_delta", "hedge_lots_cum"],
+                          "entry_features", "net_delta", "hedge_lots_cum", "lots"],
         )
     return hedge_lots
 
@@ -425,7 +425,7 @@ def get_open_position(ch, symbol: str) -> dict | None:
                    entry_ce_ltp, entry_pe_ltp, entry_premium,
                    lot_size, target_pts, stop_pts, target_inr, stoploss_inr,
                    scorecard_conf, trailing_active, peak_pnl_inr, trail_stop_inr,
-                   entry_features
+                   entry_features, lots
             FROM trades.open_positions FINAL
             WHERE symbol = {sym:String} AND status = 'open'
             ORDER BY entry_time DESC
@@ -438,7 +438,7 @@ def get_open_position(ch, symbol: str) -> dict | None:
                 "entry_ce_ltp","entry_pe_ltp","entry_premium",
                 "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                 "scorecard_conf","trailing_active","peak_pnl_inr","trail_stop_inr",
-                "entry_features"]
+                "entry_features","lots"]
         return dict(zip(cols, r.result_rows[0]))
     except Exception as e:
         log.warning(f"[{symbol}] get_open_position failed: {e}")
@@ -482,51 +482,55 @@ def record_entry(ch, symbol, snap, lot_size, scorecard_conf,
              f"premium={snap['straddle']:.1f} target={target_pts:.1f}pts "
              f"stop={stop_pts:.1f}pts conf={scorecard_conf:.0f}")
 
-    # Live order placement
+    # Live order placement — size lots from available capital
     ce_order_id = pe_order_id = ""
+    lots = 1
     if kite_mgr is not None and not dry_run:
-        margin = kite_mgr.check_margin(symbol, snap["expiry"], snap["strike"], lot_size, lots=1)
-        log.info(f"[{symbol}] Margin required: ₹{margin:.0f}")
+        lots = kite_mgr.compute_lots(symbol, snap["expiry"], snap["strike"], lot_size)
         ce_order_id, pe_order_id = kite_mgr.place_straddle_entry(
-            symbol, snap["expiry"], snap["strike"], lot_size, lots=1
+            symbol, snap["expiry"], snap["strike"], lot_size, lots=lots
         )
+
+    target_inr   = TARGET_INR   * lots
+    stoploss_inr = STOPLOSS_INR * lots
 
     if not dry_run:
         ch.insert(
             "trades.open_positions",
             [[trade_id, symbol, snap["expiry"], entry_time,
               snap["strike"], snap["ce_ltp"], snap["pe_ltp"], snap["straddle"],
-              lot_size, target_pts, stop_pts, TARGET_INR, STOPLOSS_INR,
+              lot_size, target_pts, stop_pts, target_inr, stoploss_inr,
               scorecard_conf, "open",
               0, 0.0, 0.0, entry_time, features, 0.0, 0.0,
-              ce_order_id, pe_order_id]],
+              ce_order_id, pe_order_id, lots]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
                           "entry_features","net_delta","hedge_lots_cum",
-                          "kite_ce_order_id","kite_pe_order_id"],
+                          "kite_ce_order_id","kite_pe_order_id","lots"],
         )
     return trade_id
 
 
 def record_exit(ch, pos, current_straddle, exit_reason,
                 dry_run=False, kite_mgr: KiteOrderManager | None = None):
+    lots    = int(pos.get("lots", 1))
     pnl_pts = pos["entry_premium"] - current_straddle
-    pnl_inr = pnl_pts * pos["lot_size"]
+    pnl_inr = pnl_pts * pos["lot_size"] * lots
     exit_time = ist_naive()
 
     log.info(f"[{pos['symbol']}] EXIT {exit_reason.upper()} trade_id={str(pos['trade_id'])[:8]} "
              f"entry={pos['entry_premium']:.1f} exit={current_straddle:.1f} "
-             f"pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f}")
+             f"pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f} ({lots} lots)")
 
     # Live exit orders
     exit_ce_order_id = exit_pe_order_id = ""
     if kite_mgr is not None and not dry_run:
         exit_ce_order_id, exit_pe_order_id = kite_mgr.place_straddle_exit(
             pos["symbol"], pos["expiry"], float(pos["strike"]),
-            pos["lot_size"], lots=1
+            pos["lot_size"], lots=lots
         )
 
     if not dry_run:
@@ -537,12 +541,12 @@ def record_exit(ch, pos, current_straddle, exit_reason,
               pos["strike"], pos["entry_premium"], current_straddle,
               pnl_pts, pnl_inr, pos["lot_size"], exit_reason,
               pos["scorecard_conf"], pos.get("entry_features", "{}"),
-              exit_ce_order_id, exit_pe_order_id]],
+              exit_ce_order_id, exit_pe_order_id, lots]],
             column_names=["trade_id","symbol","expiry","entry_time","exit_time",
                           "strike","entry_premium","exit_premium",
                           "pnl_pts","pnl_inr","lot_size","exit_reason",
                           "scorecard_conf","entry_features",
-                          "kite_ce_order_id","kite_pe_order_id"],
+                          "kite_ce_order_id","kite_pe_order_id","lots"],
         )
         # Close position by inserting updated row with status=closed
         ch.insert(
@@ -554,13 +558,14 @@ def record_exit(ch, pos, current_straddle, exit_reason,
               pos["scorecard_conf"], "closed",
               int(pos["trailing_active"]), float(pos["peak_pnl_inr"]),
               float(pos["trail_stop_inr"]), exit_time, pos.get("entry_features", "{}"),
-              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0))]],
+              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0)),
+              lots]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
-                          "entry_features","net_delta","hedge_lots_cum"],
+                          "entry_features","net_delta","hedge_lots_cum","lots"],
         )
 
 
@@ -582,13 +587,14 @@ def update_trail(ch, pos, pnl_inr, dry_run=False):
               pos["target_inr"], pos["stoploss_inr"],
               pos["scorecard_conf"], "open",
               1, peak, trail, now, pos.get("entry_features", "{}"),
-              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0))]],
+              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0)),
+              int(pos.get("lots", 1))]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
-                          "entry_features","net_delta","hedge_lots_cum"],
+                          "entry_features","net_delta","hedge_lots_cum","lots"],
         )
     return peak, trail
 
@@ -611,12 +617,13 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
             log.warning(f"[{symbol}] could not fetch current straddle — skipping tick")
             return
 
+        lots    = int(pos.get("lots", 1))
         pnl_pts = pos["entry_premium"] - current
-        pnl_inr = pnl_pts * pos["lot_size"]
+        pnl_inr = pnl_pts * pos["lot_size"] * lots
 
         log.info(f"[{symbol}] IN-TRADE strike={pos['strike']:.0f} "
                  f"entry={pos['entry_premium']:.1f} now={current:.1f} "
-                 f"pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f} "
+                 f"pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f} ({lots} lots) "
                  f"trailing={'yes' if pos['trailing_active'] else 'no'}")
 
         # Delta hedge check — prefer NSE-provided delta, fall back to BS computation
@@ -632,8 +639,8 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
             record_exit(ch, pos, current, "eod", dry_run, kite_mgr)
             return
 
-        # Hard stop loss
-        if pnl_inr <= -STOPLOSS_INR:
+        # Hard stop loss — use position's stored stoploss_inr (scaled by lots at entry)
+        if pnl_inr <= -float(pos["stoploss_inr"]):
             record_exit(ch, pos, current, "stop", dry_run, kite_mgr)
             return
 
@@ -645,7 +652,7 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
             return
 
         # Target hit — activate trailing instead of exiting
-        if pnl_inr >= TARGET_INR:
+        if pnl_inr >= float(pos["target_inr"]):
             log.info(f"[{symbol}] TARGET ₹{TARGET_INR:.0f} hit — activating trailing stop")
             update_trail(ch, pos, pnl_inr, dry_run)
             return

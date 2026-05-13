@@ -24,6 +24,9 @@ log = logging.getLogger(__name__)
 
 TARGET_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY"}
 
+MARGIN_UTILIZATION_CAP = 0.80  # fraction of available capital to commit
+MAX_LOTS = 5                    # hard cap — never exceed regardless of capital
+
 
 def build_kite_client():
     """
@@ -224,6 +227,37 @@ class KiteOrderManager:
             log.error("place PE BUY failed: %s", e)
 
         return str(ce_order_id), str(pe_order_id)
+
+    def get_available_capital(self) -> float:
+        """Return available equity margin (net) in ₹, or 0 on failure."""
+        if self._kite is None:
+            return 0.0
+        try:
+            margins = self._kite.margins("equity")
+            net = float(margins.get("net", 0))
+            log.info("Available capital: ₹%.0f", net)
+            return net
+        except Exception as e:
+            log.warning("get_available_capital failed: %s", e)
+            return 0.0
+
+    def compute_lots(self, symbol: str, expiry, strike: float, lot_size: int) -> int:
+        """
+        Size position using available capital.
+        lots = floor(available_capital × MARGIN_UTILIZATION_CAP / margin_per_lot)
+        Clamped to [1, MAX_LOTS].
+        """
+        available = self.get_available_capital()
+        if available <= 0:
+            return 1
+        margin_1lot = self.check_margin(symbol, expiry, strike, lot_size, lots=1)
+        if margin_1lot <= 0:
+            return 1
+        lots = int((available * MARGIN_UTILIZATION_CAP) // margin_1lot)
+        lots = max(1, min(lots, MAX_LOTS))
+        log.info("compute_lots %s: capital=₹%.0f margin_1lot=₹%.0f → %d lots",
+                 symbol, available, margin_1lot, lots)
+        return lots
 
     def get_order_status(self, order_id: str) -> str:
         """Return order status string (COMPLETE, REJECTED, OPEN, etc.) or 'UNKNOWN'."""
