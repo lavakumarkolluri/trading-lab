@@ -102,36 +102,46 @@ def _age_str(dt) -> str:
     """Human-readable age of a UTC datetime: 'just now', '5m ago', '3h ago', '2d ago'."""
     if dt is None:
         return "—"
-    if not isinstance(dt, datetime):
-        try:
-            dt = pd.Timestamp(dt).to_pydatetime()
-        except Exception:
+    try:
+        if pd.isna(dt):
             return "—"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    delta = datetime.now(timezone.utc) - dt
-    secs = int(delta.total_seconds())
-    if secs < 60:
-        return "just now"
-    if secs < 3600:
-        return f"{secs // 60}m ago"
-    if secs < 86400:
-        return f"{secs // 3600}h ago"
-    return f"{secs // 86400}d ago"
+    except Exception:
+        pass
+    try:
+        if not isinstance(dt, datetime):
+            dt = pd.Timestamp(dt).to_pydatetime()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt
+        secs = int(delta.total_seconds())
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        return f"{secs // 86400}d ago"
+    except Exception:
+        return "—"
 
 
 def _to_ist_str(dt) -> str:
     """Format a UTC datetime as IST HH:MM string."""
     if dt is None:
         return "—"
-    if not isinstance(dt, datetime):
-        try:
-            dt = pd.Timestamp(dt).to_pydatetime()
-        except Exception:
+    try:
+        if pd.isna(dt):
             return "—"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(IST).strftime("%H:%M IST")
+    except Exception:
+        pass
+    try:
+        if not isinstance(dt, datetime):
+            dt = pd.Timestamp(dt).to_pydatetime()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IST).strftime("%H:%M IST")
+    except Exception:
+        return "—"
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("📈 Trading Lab")
@@ -327,13 +337,20 @@ if page == "System Health":
         Build one freshness row. date_sql must return a single scalar date/datetime.
         ts_sql is optional — returns the most recent timestamp for the 'At (IST)' column.
         """
-        df = query(date_sql)
-        if df.empty or df.iloc[0, 0] is None:
-            return {"Source": label, "Table": table, "Latest Date": "—",
+        _no_data = {"Source": label, "Table": table, "Latest Date": "—",
                     "At (IST)": "—", "Age": "—", "Status": "⚫ no data"}
+        df = query(date_sql)
+        if df.empty:
+            return _no_data
         raw = df.iloc[0, 0]
-        if isinstance(raw, datetime):
-            dt_utc = raw.replace(tzinfo=timezone.utc) if raw.tzinfo is None else raw
+        # ClickHouse NULL → pandas NaT or None; both mean no data
+        if raw is None or (hasattr(raw, '_value') and raw is pd.NaT) or pd.isna(raw):
+            return _no_data
+        if isinstance(raw, (datetime, pd.Timestamp)):
+            ts = pd.Timestamp(raw)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            dt_utc = ts.to_pydatetime()
             ld     = dt_utc.astimezone(IST).date()
         else:
             dt_utc = None
@@ -347,8 +364,10 @@ if page == "System Health":
         at_ist = "—"
         if ts_sql:
             ts_df = query(ts_sql)
-            if not ts_df.empty and ts_df.iloc[0, 0] is not None:
-                at_ist = _to_ist_str(ts_df.iloc[0, 0])
+            if not ts_df.empty:
+                ts_raw = ts_df.iloc[0, 0]
+                if ts_raw is not None and not pd.isna(ts_raw):
+                    at_ist = _to_ist_str(ts_raw)
         elif dt_utc:
             at_ist = _to_ist_str(dt_utc)
 
@@ -390,13 +409,17 @@ if page == "System Health":
         for _, r in chain_sym_df.iterrows():
             ts_raw = r["last_ts"]
             dt_utc = None
-            if ts_raw is not None:
-                dt_utc = pd.Timestamp(ts_raw).to_pydatetime()
-                if dt_utc.tzinfo is None:
-                    dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+            if ts_raw is not None and not pd.isna(ts_raw):
+                ts = pd.Timestamp(ts_raw)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                dt_utc = ts.to_pydatetime()
             ld_raw = r["last_date"]
-            ld = ld_raw.date() if hasattr(ld_raw, "date") else ld_raw
-            age_days = (today - ld).days if ld else 99
+            if ld_raw is None or (not isinstance(ld_raw, date) and pd.isna(ld_raw)):
+                ld, age_days = None, 99
+            else:
+                ld = ld_raw.date() if hasattr(ld_raw, "date") else ld_raw
+                age_days = (today - ld).days if ld else 99
             freshness_rows.append({
                 "Source":      f"Options Chain · {r['symbol']}",
                 "Table":       "market.options_chain",
