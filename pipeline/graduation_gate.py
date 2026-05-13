@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 BT_MIN_TRADES   = 50
 BT_MIN_WIN_RATE = 0.55
-BT_MIN_SHARPE   = 0.50
+BT_MIN_SHARPE   = 0.10   # raw per-trade info ratio; weekly freq → ~0.72 annualised
 BT_MIN_YEARS    = 2.0
 
 PAPER_MIN_TRADES = 30
@@ -47,8 +47,8 @@ MICRO_MAX_DRIFT  = -0.15   # micro_win_rate - paper_win_rate must be > this
 STRATEGY_REGISTRY = {
     "iron_fly_0dte": {
         "name": "Iron Fly 0DTE",
-        "bt_table": "analysis.spread_backtest",
-        "bt_where": "strategy = 'iron_condor'",
+        "bt_table": "analysis.confidence_backtest",  # model walk-forward OOS results
+        "bt_where": "1=1",
         "bt_win_col": "target",
         "bt_pnl_col": "pnl_pts",
         "bt_date_col": "entry_date",

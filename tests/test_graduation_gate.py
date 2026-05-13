@@ -19,9 +19,9 @@ import graduation_gate as m
 # ── Gate threshold constants ──────────────────────────────────────────────────
 
 def test_bt_gate_thresholds_present():
-    assert m.BT_MIN_TRADES  == 50
+    assert m.BT_MIN_TRADES   == 50
     assert m.BT_MIN_WIN_RATE == 0.55
-    assert m.BT_MIN_SHARPE   == 0.50
+    assert m.BT_MIN_SHARPE   == 0.10   # raw per-trade; weekly freq → ~0.72 annualised
     assert m.BT_MIN_YEARS    == 2.0
 
 def test_paper_gate_thresholds_present():
@@ -55,7 +55,7 @@ def test_bt_gates_fail_win_rate():
 
 def test_bt_gates_fail_sharpe():
     gates = m.check_bt_gates(bt_oos_trades=60, bt_win_rate=0.60,
-                              bt_sharpe=0.40, bt_years=3.0)
+                              bt_sharpe=0.05, bt_years=3.0)
     assert gates["sharpe"] == 0
 
 def test_bt_gates_fail_years():

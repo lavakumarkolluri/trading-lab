@@ -83,5 +83,6 @@ COPY compute_greeks.py .
 COPY compute_vol_surface.py .
 COPY kite_orders.py .
 COPY kite_auth.py .
+COPY graduation_gate.py .
 
 CMD ["python", "main.py"]
