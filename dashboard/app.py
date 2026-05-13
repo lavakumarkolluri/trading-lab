@@ -522,13 +522,13 @@ if page == "System Health":
                     r = row.iloc[0]
                     conf     = float(r["confidence"])
                     age_days = (today - r["score_date"]).days
-                    go       = conf >= MIN_CONFIDENCE
+                    signal_ok = conf >= MIN_CONFIDENCE
                     icon     = traffic_light(age_days == 0, age_days <= 1)
                     st.metric(
                         label=f"{icon} {sym}",
                         value=f"{conf:.0f}/100",
-                        delta=f"{'✅ GO' if go else '❌ NO-GO'} · {age_days}d ago",
-                        delta_color="normal" if go else "inverse",
+                        delta=f"{'✅ GO' if signal_ok else '❌ NO-GO'} · {age_days}d ago",
+                        delta_color="normal" if signal_ok else "inverse",
                     )
 
 
@@ -590,8 +590,8 @@ elif page == "Model":
             feats_json = row["features_json"] if row["features_json"] else ""
             miss = missing_features(feats_json)
 
-            go = conf >= MIN_CONFIDENCE
-            card_color = "🟢" if go else "🔴"
+            signal_ok  = conf >= MIN_CONFIDENCE
+            card_color = "🟢" if signal_ok else "🔴"
 
             # Graduation model: prominent headline, detail below
             st.markdown(f"### {card_color} {sym}")
@@ -601,8 +601,8 @@ elif page == "Model":
             st.metric(
                 label="Confidence",
                 value=f"{conf:.0f}/100",
-                delta=f"{'✅ GO' if go else '❌ NO-GO'} — {conf_level}",
-                delta_color="normal" if go else "inverse",
+                delta=f"{'✅ GO' if signal_ok else '❌ NO-GO'} — {conf_level}",
+                delta_color="normal" if signal_ok else "inverse",
             )
 
             # Expected P&L
