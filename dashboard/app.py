@@ -564,11 +564,13 @@ elif page == "Model":
     vix_val = float(vix_df["vix"].iloc[0]) if not vix_df.empty else None
     spot_val = float(vix_df["nifty_spot"].iloc[0]) if not vix_df.empty else None
 
+    # options_eod_summary is NIFTY-only (CRIT-003) — inject 'NIFTY' so downstream
+    # symbol-filter still works; other symbols return empty sym_eod correctly.
     eod_df = query("""
-        SELECT symbol, date, iv_rank, pcr
+        SELECT 'NIFTY' AS symbol, date, iv_rank, pcr
         FROM market.options_eod_summary FINAL
         WHERE date >= today() - 5
-        ORDER BY symbol, date DESC
+        ORDER BY date DESC
     """)
 
     cols = st.columns(4)
@@ -1436,13 +1438,13 @@ elif page == "Market Data":
     st.divider()
 
     # ── OI Walls ──────────────────────────────────────────────────────────────
-    st.subheader("OI Walls — Current Expiry")
-    sym_sel_oi = st.selectbox("Symbol", SYMBOLS, key="mkt_sym")
-    wall_df = query(f"""
+    # options_eod_summary is NIFTY-only (CRIT-003) — no symbol column
+    st.subheader("OI Walls — Current Expiry (NIFTY)")
+    st.caption("⚠️ CRIT-003: options_eod_summary is NIFTY-only. BANKNIFTY/FINNIFTY/MIDCPNIFTY data not available here.")
+    wall_df = query("""
         SELECT date, expiry, iv_rank, max_pain_strike,
                ce_wall_strike, pe_wall_strike, pcr, iv_skew
         FROM market.options_eod_summary FINAL
-        WHERE symbol = '{sym_sel_oi}'
         ORDER BY date DESC LIMIT 1
     """)
     if not wall_df.empty:
@@ -1454,7 +1456,7 @@ elif page == "Market Data":
         c4.metric("PE Wall", f"{int(wr['pe_wall_strike']):,}" if wr.get('pe_wall_strike') else "—")
         st.caption(f"As of {wr['date']} · Expiry {str(wr['expiry'])[:10]} · PCR {float(wr['pcr']):.2f}")
     else:
-        st.info(f"No OI wall data for {sym_sel_oi}. Run compute_oi_features.")
+        st.info("No OI wall data. Run compute_oi_features.")
 
     st.divider()
 
