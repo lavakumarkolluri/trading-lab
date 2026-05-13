@@ -69,6 +69,7 @@ STOP_COOLDOWN_M  = 30         # minutes to wait before re-entry after stop hit
 
 MIN_PREMIUM_NIFTY     = 40.0   # don't enter if straddle too cheap
 MIN_PREMIUM_BANKNIFTY = 80.0
+MIN_CONFIDENCE        = 50.0   # skip entry if scorecard below this
 
 DELTA_HEDGE_THRESHOLD = 0.15   # hedge when |net_delta| exceeds this
 RISK_FREE_RATE        = 0.065  # India 10-yr approx
@@ -705,6 +706,9 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
         return
 
     scorecard_conf = get_scorecard_confidence(ch, symbol)
+    if scorecard_conf < MIN_CONFIDENCE:
+        log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} < {MIN_CONFIDENCE:.0f} — skip (low confidence)")
+        return
     log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} — ENTERING")
     record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run, kite_mgr)
 

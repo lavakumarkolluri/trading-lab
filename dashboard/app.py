@@ -1221,7 +1221,7 @@ elif page == "Paper Trades":
     open_df = query("""
         SELECT symbol, expiry, entry_time, strike,
                entry_ce_ltp, entry_pe_ltp, entry_premium,
-               lot_size, target_inr, stoploss_inr,
+               lot_size, lots, target_inr, stoploss_inr,
                trailing_active, peak_pnl_inr, trail_stop_inr,
                scorecard_conf
         FROM trades.open_positions FINAL
@@ -1255,31 +1255,34 @@ elif page == "Paper Trades":
             curr_straddle  = float(mark_df["curr"].iloc[0]) if not mark_df.empty else None
             entry_premium  = float(r["entry_premium"])
             lot_size       = int(r["lot_size"])
+            lots           = int(r.get("lots", 1))
+            margin_req     = entry_premium * lot_size * lots  # approx: premium × qty
             if curr_straddle is not None:
                 unreal_pts = entry_premium - curr_straddle
-                unreal_inr = unreal_pts * lot_size
+                unreal_inr = unreal_pts * lot_size * lots
             else:
                 unreal_pts = unreal_inr = None
 
-            with st.container(border=True):
-                c1, c2, c3, c4, c5, c6 = st.columns(6)
-                c1.metric("Symbol",   sym)
-                c2.metric("Strike",   f"{strike:.0f}")
-                c3.metric("Premium",  f"{entry_premium:.1f} pts")
-                c4.metric("Conf",     f"{r['scorecard_conf']:.0f}/100")
-                c5.metric("Trailing", "Yes" if r["trailing_active"] else "No")
-                if unreal_inr is not None:
-                    c6.metric("Unrealized P&L", fmt_inr(unreal_inr),
-                              delta=f"{unreal_pts:+.1f} pts")
-                else:
-                    c6.metric("Unrealized P&L", "—")
+            pnl_color = "green" if (unreal_inr or 0) >= 0 else "red"
+            trail_tag  = " 🔒" if r["trailing_active"] else ""
+            pnl_str    = (f"<span style='color:{pnl_color}'>{fmt_inr(unreal_inr)} "
+                          f"({unreal_pts:+.1f}pts)</span>"
+                          if unreal_inr is not None else "—")
 
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Expiry",       str(expiry))
-                c2.metric("Entry CE",     f"{r['entry_ce_ltp']:.1f}")
-                c3.metric("Entry PE",     f"{r['entry_pe_ltp']:.1f}")
-                c4.metric("Peak P&L",     fmt_inr(float(r["peak_pnl_inr"])))
-                c5.metric("Trail Floor",  fmt_inr(float(r["trail_stop_inr"])))
+            with st.container(border=True):
+                st.markdown(
+                    f"<small>"
+                    f"<b>{sym}</b> | Strike <b>{strike:.0f}</b> | Expiry {expiry} | "
+                    f"Entry {str(r['entry_time'])[:10]} {str(r['entry_time'])[11:16]} IST | "
+                    f"CE {r['entry_ce_ltp']:.1f} + PE {r['entry_pe_ltp']:.1f} = <b>{entry_premium:.1f}pts</b> | "
+                    f"Lots {lots} | Margin ~{fmt_inr(margin_req)} | "
+                    f"Conf {r['scorecard_conf']:.0f}/100 | "
+                    f"Target {fmt_inr(float(r['target_inr']))} | Stop {fmt_inr(float(r['stoploss_inr']))} | "
+                    f"P&L {pnl_str}{trail_tag} | Peak {fmt_inr(float(r['peak_pnl_inr']))} | "
+                    f"Floor {fmt_inr(float(r['trail_stop_inr']))}"
+                    f"</small>",
+                    unsafe_allow_html=True,
+                )
 
     # ── Today's completed trades ───────────────────────────────────────────────
     st.subheader("Today's Completed Trades")
