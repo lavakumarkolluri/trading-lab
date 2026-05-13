@@ -1460,18 +1460,244 @@ elif page == "Market Data":
 
     st.divider()
 
-    # ── Fundamentals (compact) ────────────────────────────────────────────────
-    with st.expander("📦 Fundamentals & MF NAV"):
-        mf_df = query("""
-            SELECT date, scheme_code, nav
-            FROM market.mf_nav FINAL
-            ORDER BY date DESC LIMIT 10
-        """)
-        if not mf_df.empty:
-            st.dataframe(mf_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No MF NAV data.")
+    # ── MF NAV Explorer ───────────────────────────────────────────────────────
+    st.subheader("Mutual Fund NAV Explorer")
 
+    # Load full scheme list once (cached 1 hr)
+    schemes_df = query("""
+        SELECT scheme_code, scheme_name, fund_house, scheme_type, scheme_category
+        FROM market.mf_schemes
+        WHERE is_active = 1
+        ORDER BY scheme_name
+    """)
+
+    if schemes_df.empty:
+        st.info("No MF scheme metadata. Ensure mf_schemes table is populated.")
+    else:
+        schemes_df["scheme_code"] = schemes_df["scheme_code"].astype(int)
+
+        # ── Derive plan-type tags from name ──────────────────────────────────
+        sn = schemes_df["scheme_name"].str.upper()
+        schemes_df["_is_growth"]  = sn.str.contains("GROWTH",  na=False)
+        schemes_df["_is_idcw"]    = sn.str.contains(r"IDCW|DIVIDEND", na=False, regex=True)
+        schemes_df["_is_direct"]  = sn.str.contains("DIRECT",  na=False)
+        schemes_df["_is_regular"] = ~schemes_df["_is_direct"]  # anything not Direct = Regular
+
+        # ── Filter row 1: Type / Category ────────────────────────────────────
+        fcol1, fcol2 = st.columns([2, 4])
+        with fcol1:
+            scheme_type_sel = st.selectbox(
+                "Scheme Type",
+                ["All"] + sorted(schemes_df["scheme_type"].dropna().unique().tolist()),
+                index=["All", "Equity", "Debt", "Index/ETF", "Hybrid",
+                       "FoF", "Commodity", "Other"].index("Equity")
+                       if "Equity" in schemes_df["scheme_type"].values else 0,
+                key="mf_type",
+            )
+        type_mask = (
+            schemes_df["scheme_type"] == scheme_type_sel
+            if scheme_type_sel != "All"
+            else pd.Series(True, index=schemes_df.index)
+        )
+        avail_cats = (
+            ["All"] + sorted(schemes_df.loc[type_mask, "scheme_category"]
+                             .dropna().unique().tolist())
+        )
+        with fcol2:
+            cat_sel = st.multiselect(
+                "Category",
+                options=avail_cats[1:],          # exclude "All" — empty = all
+                default=[],
+                placeholder="All categories (leave empty for all)",
+                key="mf_cat",
+            )
+
+        # ── Filter row 2: Plan / Direct ───────────────────────────────────────
+        fcol3, fcol4 = st.columns(2)
+        with fcol3:
+            plan_sel = st.radio(
+                "Plan Type",
+                ["Growth", "IDCW / Dividend", "Both"],
+                horizontal=True,
+                key="mf_plan",
+            )
+        with fcol4:
+            dist_sel = st.radio(
+                "Distribution Channel",
+                ["Direct", "Regular", "Both"],
+                horizontal=True,
+                key="mf_dist",
+            )
+
+        # ── Apply filters ─────────────────────────────────────────────────────
+        mask = type_mask.copy()
+        if cat_sel:
+            mask &= schemes_df["scheme_category"].isin(cat_sel)
+        if plan_sel == "Growth":
+            mask &= schemes_df["_is_growth"]
+        elif plan_sel == "IDCW / Dividend":
+            mask &= schemes_df["_is_idcw"]
+        if dist_sel == "Direct":
+            mask &= schemes_df["_is_direct"]
+        elif dist_sel == "Regular":
+            mask &= schemes_df["_is_regular"]
+
+        filtered = schemes_df[mask].copy()
+        st.caption(f"{len(filtered):,} funds match filters")
+
+        if filtered.empty:
+            st.warning("No funds match the selected filters.")
+        else:
+            # ── Fund picker ───────────────────────────────────────────────────
+            fund_options = dict(zip(
+                filtered["scheme_name"],
+                filtered["scheme_code"],
+            ))
+            selected_names = st.multiselect(
+                "Select funds to chart (max 15)",
+                options=list(fund_options.keys()),
+                default=[],
+                max_selections=15,
+                placeholder="Pick one or more funds…",
+                key="mf_funds",
+            )
+            selected_codes = [fund_options[n] for n in selected_names]
+
+            # ── Date range ────────────────────────────────────────────────────
+            dc1, dc2, dc3 = st.columns([2, 2, 2])
+            with dc1:
+                from_date = st.date_input(
+                    "From date",
+                    value=date(2015, 1, 1),
+                    min_value=date(2006, 4, 1),
+                    max_value=date.today(),
+                    key="mf_from",
+                )
+            with dc2:
+                index_to_100 = st.checkbox(
+                    "Index all to 100 (compare growth)",
+                    value=True,
+                    key="mf_idx",
+                )
+            with dc3:
+                show_perf = st.checkbox(
+                    "Show performance table",
+                    value=True,
+                    key="mf_perf",
+                )
+
+            if not selected_codes:
+                st.info("Select at least one fund above to see the NAV chart.")
+            else:
+                codes_sql = ", ".join(str(c) for c in selected_codes)
+                # Join mf_nav with mf_schemes for the name
+                nav_df = query(f"""
+                    SELECT n.date, n.scheme_code, n.nav, s.scheme_name
+                    FROM market.mf_nav n FINAL
+                    JOIN (
+                        SELECT scheme_code, scheme_name
+                        FROM market.mf_schemes
+                        WHERE scheme_code IN ({codes_sql})
+                    ) s ON n.scheme_code = s.scheme_code
+                    WHERE n.scheme_code IN ({codes_sql})
+                      AND n.date >= '{from_date}'
+                    ORDER BY n.date
+                """)
+
+                if nav_df.empty:
+                    st.warning("No NAV data found for selected funds from the chosen date.")
+                else:
+                    nav_df["date"] = pd.to_datetime(nav_df["date"])
+
+                    # Shorten display names: strip "- Direct Plan - Growth" suffixes
+                    def _short(name):
+                        for cut in [" - Direct Plan", " Direct Plan",
+                                    " - Regular Plan", " Regular Plan",
+                                    " - Growth", "-Growth", " Growth",
+                                    " - IDCW", "-IDCW", " IDCW",
+                                    " Option", " Fund"]:
+                            name = name.replace(cut, "")
+                        return name.strip(" -")
+
+                    nav_df["label"] = nav_df["scheme_name"].apply(_short)
+
+                    # ── Chart ─────────────────────────────────────────────────
+                    if index_to_100:
+                        # Divide each fund's NAV by its first value × 100
+                        first_navs = (nav_df.sort_values("date")
+                                      .groupby("scheme_code")["nav"].first())
+                        nav_df = nav_df.join(
+                            first_navs.rename("first_nav"), on="scheme_code"
+                        )
+                        nav_df["plot_val"] = nav_df["nav"] / nav_df["first_nav"] * 100
+                        y_label = "Indexed NAV (base=100)"
+                    else:
+                        nav_df["plot_val"] = nav_df["nav"]
+                        y_label = "NAV (₹)"
+
+                    fig_mf = px.line(
+                        nav_df, x="date", y="plot_val",
+                        color="label",
+                        labels={"date": "", "plot_val": y_label, "label": "Fund"},
+                        height=480,
+                    )
+                    fig_mf.update_traces(line_width=1.8)
+                    fig_mf.update_layout(
+                        legend=dict(orientation="h", yanchor="top",
+                                    y=-0.15, xanchor="left", x=0),
+                        hovermode="x unified",
+                        margin=dict(b=120),
+                    )
+                    if index_to_100:
+                        fig_mf.add_hline(y=100, line_dash="dot",
+                                         line_color="gray", opacity=0.5)
+                    st.plotly_chart(fig_mf, use_container_width=True)
+
+                    # ── Performance table ──────────────────────────────────────
+                    if show_perf:
+                        perf_df = query(f"""
+                            SELECT e.scheme_code, s.scheme_name,
+                                   round(e.return_1m,  1) AS ret_1m,
+                                   round(e.return_3m,  1) AS ret_3m,
+                                   round(e.return_6m,  1) AS ret_6m,
+                                   round(e.return_1y,  1) AS ret_1y,
+                                   round(e.return_3y,  1) AS ret_3y,
+                                   round(e.return_5y,  1) AS ret_5y,
+                                   round(e.cagr_3y,    1) AS cagr_3y,
+                                   round(e.cagr_5y,    1) AS cagr_5y,
+                                   round(e.sharpe_1y,  2) AS sharpe_1y,
+                                   round(e.max_drawdown_pct, 1) AS max_dd_pct,
+                                   round(e.volatility_1y, 1) AS vol_1y
+                            FROM market.mf_nav_enriched e FINAL
+                            JOIN (
+                                SELECT scheme_code, scheme_name
+                                FROM market.mf_schemes
+                                WHERE scheme_code IN ({codes_sql})
+                            ) s ON e.scheme_code = s.scheme_code
+                            WHERE e.scheme_code IN ({codes_sql})
+                            ORDER BY e.date DESC
+                            LIMIT 1 BY e.scheme_code
+                        """)
+
+                        if not perf_df.empty:
+                            perf_df["scheme_name"] = perf_df["scheme_name"].apply(_short)
+                            perf_df = perf_df.rename(columns={
+                                "scheme_name": "Fund",
+                                "ret_1m": "1M%", "ret_3m": "3M%",
+                                "ret_6m": "6M%", "ret_1y": "1Y%",
+                                "ret_3y": "3Y%", "ret_5y": "5Y%",
+                                "cagr_3y": "CAGR 3Y", "cagr_5y": "CAGR 5Y",
+                                "sharpe_1y": "Sharpe", "max_dd_pct": "MaxDD%",
+                                "vol_1y": "Vol%",
+                            }).drop(columns=["scheme_code"])
+                            st.dataframe(
+                                perf_df, use_container_width=True, hide_index=True
+                            )
+
+    st.divider()
+
+    # ── Fundamentals (compact) ────────────────────────────────────────────────
+    with st.expander("📦 Fundamentals"):
         fund_df = query("""
             SELECT symbol, period, revenue, net_income, eps,
                    free_cashflow, ebitda
@@ -1480,3 +1706,5 @@ elif page == "Market Data":
         """)
         if not fund_df.empty:
             st.dataframe(fund_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No fundamentals data.")
