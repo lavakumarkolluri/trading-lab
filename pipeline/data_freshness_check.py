@@ -93,8 +93,8 @@ def _check_ohlcv(ch) -> list[dict]:
 
 def _check_mf_nav(ch) -> list[dict]:
     """Check MF NAV max date."""
-    row = ch.query("SELECT max(date) FROM market.mf_nav FINAL").result_rows[0]
-    last_date = row[0]
+    rows = ch.query("SELECT max(date) FROM market.mf_nav FINAL").result_rows
+    last_date = rows[0][0] if rows else None
     threshold = date.today() - timedelta(days=5)  # weekend+holiday tolerance
     if last_date and last_date < threshold:
         return [{
@@ -108,8 +108,8 @@ def _check_mf_nav(ch) -> list[dict]:
 
 def _check_vix(ch) -> list[dict]:
     """Check VIX / nifty_live max date."""
-    row = ch.query("SELECT max(toDate(timestamp)) FROM market.nifty_live FINAL").result_rows[0]
-    last_date = row[0]
+    rows = ch.query("SELECT max(toDate(timestamp)) FROM market.nifty_live FINAL").result_rows
+    last_date = rows[0][0] if rows else None
     threshold = date.today() - timedelta(days=4)
     if last_date and last_date < threshold:
         return [{

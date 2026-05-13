@@ -58,7 +58,7 @@ MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 MINIO_PREFIX = "bhavcopy/fo/"
 
-LOOKBACK_DAYS = 730    # default 2 years
+DEFAULT_FROM_DATE = date(2019, 1, 1)   # full history from Jan 2019
 REQUEST_DELAY = 1.5    # seconds between downloads
 HTTP_TIMEOUT  = 30
 
@@ -379,7 +379,7 @@ def main():
     )
     parser.add_argument("--from", dest="from_date", type=str, default=None,
                         metavar="YYYY-MM-DD",
-                        help=f"Start date (default: today minus {LOOKBACK_DAYS} days)")
+                        help=f"Start date (default: {DEFAULT_FROM_DATE})")
     parser.add_argument("--to", dest="to_date", type=str, default=None,
                         metavar="YYYY-MM-DD",
                         help="End date (default: yesterday)")
@@ -414,7 +414,7 @@ def main():
     # If NSE hasn't published yet, download_bhavcopy returns None → "no file" skip, which is safe.
     to_date   = date.fromisoformat(args.to_date) if args.to_date else today
     from_date = (date.fromisoformat(args.from_date) if args.from_date
-                 else today - timedelta(days=LOOKBACK_DAYS))
+                 else DEFAULT_FROM_DATE)
 
     log.info("=== Option Chain Historical Backfill ===")
     log.info(f"Date range : {from_date} → {to_date}")

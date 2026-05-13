@@ -26,11 +26,14 @@ stage  →  CI tests pass  →  auto-merge to master  (daily 17:00 UTC Mon–Fri
 - Every prod breakage must produce a failing test FIRST, then a fix. No exceptions.
 - Tests must run offline (no live ClickHouse). Use `unittest.mock.MagicMock` for DB calls.
 
-**Test files:**
+**Test files (141 tests as of 2026-05-13):**
 - `tests/test_docker_compose.py` — compose file structure, config mounts, credentials
 - `tests/test_migrations.py` — SQL file numbering, syntax validity
 - `tests/test_intraday_monitor.py` — trailing stop, timezone, column schema
 - `tests/test_compute_oi_features.py` — DataFrame duplicate column regression
+- `tests/test_dashboard.py` — 12 tests: expiry date format, nav completeness, SQL safety
+- `tests/test_data_freshness.py` — 17 tests: staleness thresholds, auto-fix, report-only mode
+- `tests/test_confidence_scorer.py` — 9 tests: duplicate-strike, EOD fallback, lot-size loading
 
 ---
 
@@ -48,21 +51,32 @@ stage  →  CI tests pass  →  auto-merge to master  (daily 17:00 UTC Mon–Fri
 
 ## Trading System Architecture
 
-**Strategy**: 0DTE straddle paper trading — sell ATM CE+PE at open, manage intraday.
+**Strategy**: Iron fly (0DTE) — sell ATM CE+PE (straddle) + buy OTM wings. Paper trading phase.
 
-**Instruments**: NIFTY (Tuesday expiry, lot=65) + BANKNIFTY (monthly expiry, lot=30)
+**Instruments** (4 NSE indices, lot sizes as of 2025-10-29 via `market.fo_lot_sizes FINAL`):
+| Symbol      | Lot Size | Weekly Expiry | Wing Points |
+|-------------|----------|---------------|-------------|
+| NIFTY       | 65       | Thursday      | 200 pts     |
+| BANKNIFTY   | 30       | Wednesday     | 500 pts     |
+| FINNIFTY    | 60       | Tuesday       | 200 pts     |
+| MIDCPNIFTY  | (DB)     | Monday        | TBD         |
 
-**Risk params**: Target ₹2000, stop ₹1000, trailing activates at target with 75% floor, entry window 09:30–14:00 IST, EOD exit 15:20 IST.
+**Risk params**: Target ₹2000/trade, stop ₹1000/trade. Trailing activates at target with 75% floor.
+Entry window 09:30–14:00 IST. EOD exit 15:20 IST. MIN_CONFIDENCE=50 gate before entering.
 
 **Pipeline order** (daily, UTC):
-1. `option_chain_intraday` — live options data during market hours
-2. `compute_oi_features` — OI/IV features (05:30 after EOD)
-3. `strategy_backtester` — historical PnL (05:30)
-4. `confidence_scorer --compare` — trains model + scores today (07:00) ← **must call score_today() after training**
-5. `strategy_selector` — picks which symbols to trade (08:00)
-6. `intraday_monitor` — paper trades during market hours (09:15 start)
+1. `option_chain_intraday` — live options data during market hours (03:40)
+2. `compute_oi_features` — OI/IV features after EOD (12:30)
+3. `strategy_backtester` — historical iron fly P&L (12:30)
+4. `confidence_scorer --compare` — full retrain + score (07:00 Sunday) **OR**
+   `confidence_scorer --score-only` — score only using saved models (13:00 Mon–Fri)
+5. `strategy_selector` — picks symbols to trade (13:30)
+6. `intraday_monitor` — paper trades during market hours (03:50 next day)
 
-**Key tables**: `market.options_chain`, `market.open_positions`, `market.trade_outcomes`, `analysis.scorecard`
+**Score pipeline rule**: `--compare` retrains models weekly. `--score-only` must run every trading day so intraday_monitor reads fresh scores from `analysis.scorecard`; without it the monitor falls back to 50.0 for all symbols.
+
+**Key tables**: `market.options_chain`, `market.open_positions`, `market.trade_outcomes`,
+`analysis.scorecard`, `market.fo_lot_sizes`, `market.options_eod_summary`
 
 ---
 
@@ -70,8 +84,18 @@ stage  →  CI tests pass  →  auto-merge to master  (daily 17:00 UTC Mon–Fri
 
 **Duplicate DataFrame columns → ClickHouse crash**: When building column lists dynamically, use `list(dict.fromkeys(col_list))` to deduplicate before selecting. Selecting a column that appears twice returns a DataFrame instead of Series; ClickHouse driver then crashes with `AttributeError: dtype`.
 
+**Duplicate strike index in options chain** (`extract_chain_features`): Multiple intraday snapshots on the same date create duplicate strikes after `set_index("strike")`. `.get(atm, 0)` returns a Series instead of a scalar → `float()` crashes. Fix: `.groupby(level=0).last()` after every `set_index("strike")` call.
+
 **UTC→IST timezone in ClickHouse queries**: ClickHouse returns UTC-naive datetimes. When comparing against IST time, add `timedelta(hours=5, minutes=30)` before computing age/staleness. Without this, age calculations are 5.5h off.
+
+**EOD fallback in score_today()**: `options_eod_summary` only has data through the last bhavcopy date. `latest_snap` = today means `extract_eod_features()` returns `{}` → zero IV/VIX → UNRELIABLE SCORE. Use `_nearest_eod()` helper to fall back to the most recent available past date.
+
+**load_lot_sizes() non-deterministic**: `SELECT symbol, lot_size FROM ... FINAL` without `ORDER BY` gives random results when multiple effective dates exist. Always use `argMax(lot_size, effective_from) GROUP BY symbol`.
 
 **query() parameterization**: The local `query()` helper in `dashboard/app.py` does NOT accept a `params=` kwarg. Use f-strings for trusted internal values (DB query results), or ClickHouse `{param:Type}` syntax for external input.
 
 **confidence_scorer --compare**: After training, must call `score_today(ch, mc, sym)` for each symbol. Without this, intraday_monitor reads no scores from `analysis.scorecard` and defaults to 50.0 confidence.
+
+**options_eod_summary is NIFTY-only**: The `market.options_eod_summary` table only has NIFTY data. Using it for BANKNIFTY/FINNIFTY/MIDCPNIFTY IV-rank and PCR features silently returns wrong values. ← **KNOWN BUG — not yet fixed** (see TODO.md CRIT-003).
+
+**ReplacingMergeTree re-insert**: Never use `ALTER TABLE UPDATE` on the `version` column — ClickHouse raises CANNOT_UPDATE_COLUMN. To refresh a row: re-insert with `version = int(datetime.now().timestamp())`.
