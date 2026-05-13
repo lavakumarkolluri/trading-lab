@@ -154,6 +154,7 @@ page = st.sidebar.radio("", [
     "Model",
     "Trade Log",
     "Market Data",
+    "MF Advisor",
 ])
 
 
@@ -1708,3 +1709,737 @@ elif page == "Market Data":
             st.dataframe(fund_df, use_container_width=True, hide_index=True)
         else:
             st.info("No fundamentals data.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MF ADVISOR PAGE
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "MF Advisor":
+    try:
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.primitives import hashes
+        import base64
+        import hashlib
+    except ImportError:
+        st.error("cryptography package missing — rebuild the dashboard image.")
+        st.stop()
+
+    # ── Encryption helpers ────────────────────────────────────────────────────
+    def _pid(pp: str) -> str:
+        return hashlib.sha256(pp.encode()).hexdigest()
+
+    def _fernet(pp: str, salt_hex: str) -> Fernet:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(), length=32,
+            salt=bytes.fromhex(salt_hex), iterations=480_000,
+        )
+        return Fernet(base64.urlsafe_b64encode(kdf.derive(pp.encode())))
+
+    def _save_profile(pp: str, profile: dict) -> None:
+        salt = os.urandom(16).hex()
+        cipher = _fernet(pp, salt).encrypt(json.dumps(profile).encode()).decode()
+        get_ch().insert(
+            "system_meta.investor_profiles",
+            [[_pid(pp), salt, cipher]],
+            column_names=["profile_id", "profile_salt", "profile_data"],
+        )
+
+    def _load_profile(pp: str) -> dict | None:
+        pid = _pid(pp)
+        try:
+            df = get_ch().query_df(
+                "SELECT profile_salt, profile_data "
+                "FROM system_meta.investor_profiles FINAL "
+                f"WHERE profile_id = '{pid}' LIMIT 1"
+            )
+        except Exception:
+            return None
+        if df.empty:
+            return None
+        try:
+            return json.loads(
+                _fernet(pp, df.iloc[0]["profile_salt"]).decrypt(
+                    df.iloc[0]["profile_data"].encode()
+                )
+            )
+        except Exception:
+            return None
+
+    # ── Page header ───────────────────────────────────────────────────────────
+    st.header("MF Advisor")
+
+    # ── Passphrase ────────────────────────────────────────────────────────────
+    with st.expander("🔐 Load / Save Profile",
+                     expanded="mf_profile" not in st.session_state):
+        pp_input = st.text_input("Passphrase", type="password", key="mf_pp")
+        pp_c1, pp_c2 = st.columns(2)
+        if pp_c1.button("Load Profile"):
+            if pp_input:
+                _loaded = _load_profile(pp_input)
+                if _loaded:
+                    st.session_state.mf_profile = _loaded
+                    st.success("Profile loaded.")
+                    st.rerun()
+                else:
+                    st.error("No profile found or wrong passphrase.")
+            else:
+                st.warning("Enter a passphrase first.")
+        if pp_c2.button("Save Profile"):
+            if pp_input:
+                if "mf_profile" in st.session_state:
+                    _save_profile(pp_input, st.session_state.mf_profile)
+                    st.success("Profile saved.")
+                else:
+                    st.warning("Fill the profile form first.")
+            else:
+                st.warning("Enter a passphrase first.")
+
+    # ── Questionnaire ─────────────────────────────────────────────────────────
+    st.subheader("Investor Profile")
+    prof = st.session_state.get("mf_profile", {})
+
+    with st.form("mf_profile_form"):
+        st.markdown("**Personal Context**")
+        pc1, pc2, pc3 = st.columns(3)
+        p_name       = pc1.text_input("Name / alias (optional)", value=prof.get("name", ""))
+        p_age        = pc2.number_input("Age", min_value=18, max_value=80,
+                                        value=int(prof.get("age", 35)))
+        p_dependents = pc3.number_input("Number of dependents (spouse, kids, parents)",
+                                        min_value=0, max_value=15,
+                                        value=int(prof.get("dependents", 0)))
+
+        st.markdown("**Monthly Cash Flows (₹)** — helps us suggest a realistic SIP")
+        cf1, cf2, cf3 = st.columns(3)
+        p_income = cf1.number_input("Take-home income",
+                                    min_value=0, value=int(prof.get("monthly_income", 0)),
+                                    step=10_000, help="Monthly in-hand salary / business income")
+        p_nec    = cf2.number_input("Monthly necessities",
+                                    min_value=0, value=int(prof.get("monthly_necessities", 0)),
+                                    step=5_000,
+                                    help="Non-negotiable fixed costs: rent, groceries, utilities, insurance premiums")
+        p_fam    = cf3.number_input("Family commitments",
+                                    min_value=0, value=int(prof.get("monthly_family", 0)),
+                                    step=5_000,
+                                    help="School/college fees, elderly parent support, home loan EMI, other EMIs")
+        _avail   = max(0, p_income - p_nec - p_fam)
+        st.caption(
+            f"Surplus after necessities + family commitments: **₹{_avail:,.0f}/month** "
+            f"(thumb rule: invest 50–70% of surplus)"
+        )
+
+        st.markdown("**Investment Profile**")
+        ip1, ip2 = st.columns(2)
+        _HOR_OPTS  = ["< 1 year", "1–3 years", "3–7 years", "7+ years"]
+        _RISK_OPTS = ["Conservative", "Moderate", "Aggressive", "Very Aggressive"]
+        p_horizon = ip1.radio(
+            "Investment horizon", _HOR_OPTS,
+            index=_HOR_OPTS.index(prof["horizon_label"])
+                  if prof.get("horizon_label") in _HOR_OPTS else 3,
+        )
+        p_risk = ip2.radio(
+            "Risk tolerance", _RISK_OPTS,
+            index=_RISK_OPTS.index(prof["risk"])
+                  if prof.get("risk") in _RISK_OPTS else 2,
+        )
+
+        _GOAL_OPTS = [
+            "Wealth Creation", "Retirement",
+            "Children's Education / Marriage", "Home Purchase",
+            "Tax Saving (ELSS)", "Regular Income (IDCW)",
+        ]
+        p_goals = st.multiselect(
+            "Financial goals (select all that apply)", _GOAL_OPTS,
+            default=[g for g in prof.get("goals", ["Wealth Creation"]) if g in _GOAL_OPTS],
+        )
+
+        p_emergency = st.checkbox(
+            "I already have 6+ months of expenses saved as an emergency fund",
+            value=bool(prof.get("emergency_ok", False)),
+        )
+        if not p_emergency:
+            st.info(
+                "Tip: park 3–6 months of (necessities + family commitments) in a Liquid fund "
+                "before starting aggressive SIPs. It protects you from redeeming equity at the wrong time."
+            )
+
+        st.markdown("**SIP & Tax**")
+        st1, st2, st3 = st.columns(3)
+        _sip_default = int(prof.get("sip_inr", max(500, int(_avail * 0.6))))
+        p_sip  = st1.number_input("Monthly SIP (₹)", min_value=500,
+                                   value=_sip_default, step=500)
+        _TAX   = [0, 10, 20, 30]
+        _td    = int(prof.get("tax_bracket", 30))
+        p_tax  = st2.selectbox("Income tax bracket (%)", _TAX,
+                               index=_TAX.index(_td) if _td in _TAX else 3)
+        _PLAN  = ["Direct", "Regular", "Both"]
+        p_plan = st3.radio(
+            "Fund plan preference", _PLAN,
+            index=_PLAN.index(prof["plan_type"]) if prof.get("plan_type") in _PLAN else 0,
+            help="Direct plans have lower expense ratios — recommended if you don't use a distributor.",
+        )
+
+        st.markdown("**Existing Holdings — categories to avoid duplicating**")
+        _CAT_OPTS = [
+            "Large Cap", "Mid Cap", "Small Cap", "Flexi Cap", "Multi Cap",
+            "Large & Mid Cap", "ELSS", "Balanced Advantage",
+            "International / Global", "Liquid", "Ultra Short Duration",
+            "Short Duration", "Thematic",
+        ]
+        p_exclude = st.multiselect(
+            "Already heavily invested in", _CAT_OPTS,
+            default=[c for c in prof.get("exclude_categories", []) if c in _CAT_OPTS],
+        )
+
+        p_submitted = st.form_submit_button(
+            "Update Profile & Get Recommendations", use_container_width=True
+        )
+
+    if p_submitted:
+        _HOR_MAP = {"< 1 year": 0.5, "1–3 years": 2.0, "3–7 years": 5.0, "7+ years": 10.0}
+        st.session_state.mf_profile = {
+            "name": p_name, "age": int(p_age), "dependents": int(p_dependents),
+            "monthly_income": int(p_income), "monthly_necessities": int(p_nec),
+            "monthly_family": int(p_fam), "emergency_ok": bool(p_emergency),
+            "horizon_label": p_horizon, "horizon_years": _HOR_MAP[p_horizon],
+            "risk": p_risk, "goals": p_goals,
+            "sip_inr": int(p_sip), "tax_bracket": int(p_tax),
+            "plan_type": p_plan, "exclude_categories": p_exclude,
+            "saved_at": date.today().isoformat(),
+        }
+        st.rerun()
+
+    if "mf_profile" not in st.session_state:
+        st.info("Complete the profile form above to get fund recommendations.")
+        st.stop()
+
+    prof = st.session_state.mf_profile
+
+    if not prof.get("emergency_ok", True):
+        st.warning(
+            "⚠️  Build your emergency fund first (Liquid / Ultra Short Duration funds). "
+            "Rushing into equity SIPs without a buffer often leads to panic withdrawals."
+        )
+
+    # ── Category mapping + SIP allocation ─────────────────────────────────────
+    horizon_yrs  = float(prof.get("horizon_years", 10.0))
+    risk         = prof.get("risk", "Aggressive")
+    goals        = prof.get("goals", [])
+    tax_goal     = "Tax Saving (ELSS)" in goals
+    income_goal  = "Regular Income (IDCW)" in goals
+    exclude_cats = set(prof.get("exclude_categories", []))
+
+    def _hb(y: float) -> str:
+        return "short" if y < 3 else ("mid" if y < 7 else "long")
+
+    _rk = (risk, "any") if risk == "Conservative" else (risk, _hb(horizon_yrs))
+
+    _BASE_W: dict[tuple, dict] = {
+        ("Conservative",    "any"):  {"Liquid": 0.20, "Ultra Short Duration": 0.20,
+                                      "Short Duration": 0.30, "Balanced Advantage": 0.30},
+        ("Moderate",        "short"): {"Balanced Advantage": 0.40, "Large Cap": 0.30,
+                                       "Short Duration": 0.30},
+        ("Moderate",        "mid"):   {"Large Cap": 0.35, "Flexi Cap": 0.30,
+                                       "Large & Mid Cap": 0.25, "ELSS": 0.10},
+        ("Moderate",        "long"):  {"Large Cap": 0.30, "Flexi Cap": 0.25,
+                                       "Large & Mid Cap": 0.20, "Mid Cap": 0.15, "ELSS": 0.10},
+        ("Aggressive",      "mid"):   {"Flexi Cap": 0.35, "Multi Cap": 0.25,
+                                       "Large & Mid Cap": 0.25, "ELSS": 0.10,
+                                       "International / Global": 0.05},
+        ("Aggressive",      "long"):  {"Large Cap": 0.25, "Flexi Cap": 0.30,
+                                       "Small Cap": 0.20, "Multi Cap": 0.10,
+                                       "ELSS": 0.10, "International / Global": 0.05},
+        ("Very Aggressive", "long"):  {"Small Cap": 0.30, "Mid Cap": 0.25,
+                                       "Flexi Cap": 0.30, "Thematic": 0.15},
+    }
+
+    _weights = dict(_BASE_W.get(_rk, _BASE_W.get((risk, "long"), {"Flexi Cap": 1.0})))
+
+    for _ec in list(_weights.keys()):
+        if _ec in exclude_cats:
+            del _weights[_ec]
+
+    _ELSS_CAP = 12_500
+    if not tax_goal and "ELSS" in _weights:
+        _ew = _weights.pop("ELSS")
+        for _fb in ["Flexi Cap", "Large Cap", "Multi Cap", "Balanced Advantage"]:
+            if _fb in _weights:
+                _weights[_fb] += _ew
+                break
+    elif tax_goal and "ELSS" not in _weights and "ELSS" not in exclude_cats:
+        _weights["ELSS"] = 0.10
+
+    _tw = sum(_weights.values()) or 1.0
+    _weights = {k: v / _tw for k, v in _weights.items()}
+
+    sip = int(prof.get("sip_inr", 5_000))
+    alloc: dict[str, float] = {}
+    _overflow = 0.0
+    for _cat, _w in _weights.items():
+        _amt = sip * _w
+        if _cat == "ELSS" and tax_goal and _amt > _ELSS_CAP:
+            _overflow = _amt - _ELSS_CAP
+            _amt = _ELSS_CAP
+        alloc[_cat] = _amt
+    if _overflow > 0:
+        for _fb in ["Flexi Cap", "Large Cap", "Multi Cap", "Balanced Advantage"]:
+            if _fb in alloc:
+                alloc[_fb] += _overflow
+                break
+
+    if not alloc:
+        st.error("All recommended categories are excluded. Remove some from the exclusion list.")
+        st.stop()
+
+    alloc_df = pd.DataFrame([
+        {"Category": k, "Amount (₹)": round(v), "Pct": round(v / sip * 100, 1)}
+        for k, v in alloc.items()
+    ])
+
+    # ── SIP allocation display ────────────────────────────────────────────────
+    st.subheader("Recommended SIP Allocation")
+    _pc, _tc = st.columns([1, 1])
+    with _pc:
+        _fp = px.pie(alloc_df, names="Category", values="Amount (₹)",
+                     title=f"Monthly SIP: ₹{sip:,.0f}")
+        _fp.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(_fp, use_container_width=True)
+    with _tc:
+        _da = alloc_df.copy()
+        _da["Amount (₹)"] = _da["Amount (₹)"].apply(lambda x: f"₹{x:,.0f}")
+        _da["Pct"]        = _da["Pct"].apply(lambda x: f"{x:.1f}%")
+        st.dataframe(_da, use_container_width=True, hide_index=True)
+        st.caption(f"Total: ₹{sum(alloc.values()):,.0f} / month")
+        if income_goal:
+            st.caption("Income goal → prefer IDCW plans (change plan type filter above).")
+        if tax_goal and "ELSS" in alloc:
+            st.caption(f"ELSS capped at ₹{_ELSS_CAP:,}/month = ₹{_ELSS_CAP*12:,}/year (full 80C deduction at {prof.get('tax_bracket',30)}%).")
+
+    # ── Fund scoring ──────────────────────────────────────────────────────────
+    st.subheader("Fund Recommendations")
+
+    _score_cats = list(alloc.keys())
+    _cats_sql   = ", ".join(f"'{c}'" for c in _score_cats)
+    _plan_type  = prof.get("plan_type", "Direct")
+    if _plan_type == "Direct":
+        _plan_filter = "lower(s.scheme_name) LIKE '%direct%'"
+    elif _plan_type == "Regular":
+        _plan_filter = "lower(s.scheme_name) NOT LIKE '%direct%'"
+    else:
+        _plan_filter = "1=1"
+
+    _enr = query(f"""
+        SELECT e.scheme_code, s.scheme_name, s.scheme_category, s.fund_house,
+               e.cagr_5y, e.cagr_3y, e.consistency_score, e.sip_return_5y,
+               e.sortino_1y, e.sharpe_1y, e.max_drawdown_pct, e.volatility_1y,
+               e.beta_vs_nifty, e.return_1y, e.return_3y, e.return_5y
+        FROM market.mf_nav_enriched e FINAL
+        JOIN market.mf_schemes s ON e.scheme_code = s.scheme_code
+        WHERE s.scheme_category IN ({_cats_sql})
+          AND s.is_active = 1
+          AND {_plan_filter}
+          AND e.return_5y > 0
+          AND e.cagr_5y IS NOT NULL
+        ORDER BY e.date DESC
+        LIMIT 1 BY e.scheme_code
+    """)
+
+    if _enr.empty:
+        st.warning("No fund data found for selected categories. Ensure mf_nav_enriched is populated.")
+        st.stop()
+
+    # ── Scoring helpers ───────────────────────────────────────────────────────
+    _W11 = {
+        "cagr_5y":           +0.15,
+        "consistency_score": +0.15,
+        "sip_return_5y":     +0.15,
+        "sortino_1y":        +0.12,
+        "sharpe_1y":         +0.12,
+        "upside_capture":    +0.10,
+        "alpha":             +0.05,
+        "downside_capture":  -0.12,
+        "max_drawdown_pct":  -0.09,
+        "volatility_1y":     -0.06,
+        "beta_vs_nifty":     -0.04,
+    }
+    _W9 = {k: v for k, v in _W11.items()
+           if k not in ("upside_capture", "downside_capture", "alpha")}
+
+    def _norm_score(sub: pd.DataFrame, weights: dict) -> pd.Series:
+        sub = sub.copy()
+        _pk = [k for k, v in weights.items() if v > 0 and k in sub.columns]
+        _nk = [k for k, v in weights.items() if v < 0 and k in sub.columns]
+        for k in _pk + _nk:
+            mn, mx = sub[k].min(), sub[k].max()
+            sub[k] = (sub[k] - mn) / (mx - mn) if mx > mn else 0.5
+        _s = sum(sub[k] * weights[k] for k in _pk) if _pk else pd.Series(0.0, index=sub.index)
+        _s -= sum(sub[k] * abs(weights[k]) for k in _nk)
+        mn_s, mx_s = _s.min(), _s.max()
+        return (_s - mn_s) / (mx_s - mn_s) * 100 if mx_s > mn_s else _s * 0 + 50.0
+
+    # Ensure all metric columns exist and are numeric
+    _enr = _enr.copy()
+    for _col in list(_W11.keys()):
+        if _col not in _enr.columns:
+            _enr[_col] = 0.0
+        else:
+            _enr[_col] = pd.to_numeric(_enr[_col], errors="coerce").fillna(0.0)
+
+    # First pass: 9-metric score → shortlist top-30 per category for capture query
+    _enr["_s9"] = 0.0
+    for _cat in _score_cats:
+        _m = _enr["scheme_category"] == _cat
+        if _m.sum() > 0:
+            _enr.loc[_m, "_s9"] = _norm_score(_enr.loc[_m], _W9).values
+
+    _top30_codes = (
+        _enr.sort_values("_s9", ascending=False)
+            .groupby("scheme_category")
+            .head(30)["scheme_code"]
+            .astype(str).tolist()
+    )
+    _top30_sql = ", ".join(f"'{c}'" for c in _top30_codes)
+
+    # Upside / downside capture for shortlisted funds
+    _cap_df = query(f"""
+        WITH
+        nifty_m AS (
+            SELECT toStartOfMonth(date) AS m,
+                   (argMax(close, date) - argMin(close, date))
+                    / nullIf(argMin(close, date), 0) * 100 AS nr
+            FROM market.ohlcv_daily
+            WHERE symbol = '^NSEI' AND date >= today() - INTERVAL 5 YEAR
+            GROUP BY m
+        ),
+        fund_m AS (
+            SELECT scheme_code, toStartOfMonth(date) AS m,
+                   (argMax(nav, date) - argMin(nav, date))
+                    / nullIf(argMin(nav, date), 0) * 100 AS fr
+            FROM market.mf_nav
+            WHERE scheme_code IN ({_top30_sql})
+              AND date >= today() - INTERVAL 5 YEAR
+            GROUP BY scheme_code, m
+        ),
+        jnd AS (
+            SELECT f.scheme_code, f.fr, n.nr
+            FROM fund_m f JOIN nifty_m n ON f.m = n.m
+            WHERE n.nr != 0
+        )
+        SELECT scheme_code,
+               avgIf(fr / nr * 100, nr > 0) AS upside_capture,
+               avgIf(fr / nr * 100, nr < 0) AS downside_capture
+        FROM jnd GROUP BY scheme_code
+    """) if _top30_sql else pd.DataFrame()
+
+    # Nifty 5Y CAGR for alpha
+    _nc_df = query("""
+        SELECT argMax(close, date) / nullIf(argMin(close, date), 0) AS ratio,
+               dateDiff('year', min(date), max(date)) AS yrs
+        FROM market.ohlcv_daily
+        WHERE symbol = '^NSEI' AND date >= today() - INTERVAL 5 YEAR
+    """)
+    if not _nc_df.empty and float(_nc_df.iloc[0]["yrs"]) > 0:
+        _nifty5y = (float(_nc_df.iloc[0]["ratio"]) ** (1.0 / float(_nc_df.iloc[0]["yrs"])) - 1) * 100
+    else:
+        _nifty5y = 12.0
+
+    if not _cap_df.empty:
+        _enr = _enr.merge(_cap_df, on="scheme_code", how="left")
+        for _cc in ("upside_capture", "downside_capture"):
+            _enr[_cc] = pd.to_numeric(_enr[_cc], errors="coerce").fillna(0.0)
+    else:
+        _enr["upside_capture"]   = 0.0
+        _enr["downside_capture"] = 0.0
+
+    _enr["alpha"] = (_enr["cagr_5y"] - _enr["beta_vs_nifty"] * _nifty5y).fillna(0.0)
+
+    # Second pass: full 11-metric score
+    _enr["Quality Score"] = 0.0
+    for _cat in _score_cats:
+        _m = _enr["scheme_category"] == _cat
+        if _m.sum() > 0:
+            _enr.loc[_m, "Quality Score"] = _norm_score(_enr.loc[_m], _W11).values
+
+    _enr["Fund"] = _enr["scheme_name"].str[:46]
+
+    _DCOLS = ["Fund", "Quality Score", "return_1y", "cagr_5y", "sharpe_1y",
+              "sortino_1y", "beta_vs_nifty", "upside_capture", "downside_capture",
+              "alpha", "max_drawdown_pct", "volatility_1y"]
+    _DREN  = {
+        "return_1y": "1Y%", "cagr_5y": "5Y CAGR",
+        "sharpe_1y": "Sharpe", "sortino_1y": "Sortino",
+        "beta_vs_nifty": "Beta", "upside_capture": "Up Cap",
+        "downside_capture": "Dn Cap", "alpha": "Alpha",
+        "max_drawdown_pct": "MaxDD%", "volatility_1y": "Vol%",
+    }
+
+    # ── Per-category tabs (top 5) ─────────────────────────────────────────────
+    st.markdown("**Top 5 per Category**")
+    _tabs = st.tabs(_score_cats)
+    for _tab, _cat in zip(_tabs, _score_cats):
+        with _tab:
+            _sub = (_enr[_enr["scheme_category"] == _cat]
+                    .sort_values("Quality Score", ascending=False)
+                    .head(5))
+            if _sub.empty:
+                st.info(f"No data for {_cat}")
+                continue
+            _d = _sub[[c for c in _DCOLS if c in _sub.columns]].rename(columns=_DREN)
+            _nc = [c for c in _d.columns if c != "Fund"]
+            st.dataframe(
+                _d.style.format({c: "{:.1f}" for c in _nc}, na_rep="—"),
+                use_container_width=True, hide_index=True,
+            )
+
+    # ── Combined top 10 ───────────────────────────────────────────────────────
+    st.markdown("**Combined Top 10 (all categories)**")
+    _top10 = _enr.sort_values("Quality Score", ascending=False).head(10)
+    _d10   = _top10[["Fund", "scheme_category"] + [c for c in _DCOLS[1:] if c in _top10.columns]].rename(
+        columns={"scheme_category": "Category", **_DREN}
+    )
+    _nc10  = [c for c in _d10.columns if c not in ("Fund", "Category")]
+    st.dataframe(
+        _d10.style.format({c: "{:.1f}" for c in _nc10}, na_rep="—"),
+        use_container_width=True, hide_index=True,
+    )
+
+    with st.expander("How is the Quality Score calculated?"):
+        # Build a human-readable narrative from the actual weights dict
+        _pos_items = sorted(
+            [(k, v) for k, v in _W11.items() if v > 0], key=lambda x: -x[1]
+        )
+        _neg_items = sorted(
+            [(k, abs(v)) for k, v in _W11.items() if v < 0], key=lambda x: -x[1]
+        )
+        _total_pos = sum(v for _, v in _pos_items)
+        _total_neg = sum(v for _, v in _neg_items)
+        _metric_labels = {
+            "cagr_5y": "5-year CAGR", "consistency_score": "consistency score",
+            "sip_return_5y": "5-year SIP return", "sortino_1y": "Sortino ratio (1Y)",
+            "sharpe_1y": "Sharpe ratio (1Y)", "upside_capture": "upside capture ratio",
+            "alpha": "alpha vs Nifty", "downside_capture": "downside capture ratio",
+            "max_drawdown_pct": "max drawdown", "volatility_1y": "1-year volatility",
+            "beta_vs_nifty": "beta vs Nifty",
+        }
+        _pos_desc = ", ".join(
+            f"**{_metric_labels.get(k, k)}** ({v:.0%})" for k, v in _pos_items
+        )
+        _neg_desc = ", ".join(
+            f"**{_metric_labels.get(k, k)}** ({v:.0%})" for k, v in _neg_items
+        )
+        st.markdown(
+            f"Each fund is given a **Quality Score from 0 to 100**, computed separately "
+            f"within its category so funds are always compared to peers — not the entire universe.\n\n"
+            f"**{_total_pos:.0%} of the score rewards higher values:** {_pos_desc}.\n\n"
+            f"**{_total_neg:.0%} of the score penalises higher values** (lower is safer/better): "
+            f"{_neg_desc}.\n\n"
+            f"Every metric is first normalised 0–1 within the category (min-max), then multiplied "
+            f"by its weight and summed. The final score is scaled so the best fund in a category "
+            f"scores 100 and the worst scores 0.\n\n"
+            f"*Upside capture* = how much of the market's rally the fund captured; "
+            f"*downside capture* = how much of the market's fall the fund absorbed (lower = better). "
+            f"*Alpha* = fund's 5Y CAGR minus (beta × Nifty 5Y CAGR) — skill beyond market exposure. "
+            f"Both are computed from 5 years of monthly returns against Nifty 50."
+        )
+        st.dataframe(
+            pd.DataFrame([
+                {"Metric": _metric_labels.get(k, k),
+                 "Direction": "↑ higher is better" if v > 0 else "↓ lower is better",
+                 "Weight": f"{abs(v):.0%}"}
+                for k, v in _W11.items()
+            ]),
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── NAV trend (indexed to 100, last 3 years) ──────────────────────────────
+    st.markdown("**NAV Trend — Top 10 (indexed to 100)**")
+    _t10_sql = ", ".join(f"'{c}'" for c in _top10["scheme_code"].astype(str))
+    if _t10_sql:
+        _nav_df = query(f"""
+            SELECT n.scheme_code, n.date, n.nav, s.scheme_name
+            FROM market.mf_nav n
+            JOIN market.mf_schemes s ON n.scheme_code = s.scheme_code
+            WHERE n.scheme_code IN ({_t10_sql})
+              AND n.date >= today() - INTERVAL 3 YEAR
+            ORDER BY n.scheme_code, n.date
+        """)
+        if not _nav_df.empty:
+            _nav_df["date"] = pd.to_datetime(_nav_df["date"])
+            _nav_df = _nav_df.sort_values(["scheme_code", "date"])
+
+            def _idx100(g):
+                g = g.copy()
+                _f = g["nav"].iloc[0]
+                g["indexed"] = g["nav"] / _f * 100 if _f > 0 else g["nav"]
+                return g
+
+            _nav_df = _nav_df.groupby("scheme_code", group_keys=False).apply(_idx100)
+            _nav_df["label"] = _nav_df["scheme_name"].str[:32]
+            _fn = px.line(_nav_df, x="date", y="indexed", color="label",
+                          labels={"indexed": "NAV (indexed 100)", "date": "", "label": "Fund"},
+                          height=420)
+            _fn.update_layout(legend=dict(orientation="h", y=-0.32, font_size=9))
+            st.plotly_chart(_fn, use_container_width=True)
+
+    # ── Portfolio Review ───────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Portfolio Review")
+
+    _sch_df = query("""
+        SELECT scheme_code, scheme_name, scheme_category
+        FROM market.mf_schemes WHERE is_active = 1
+        ORDER BY scheme_name
+    """)
+
+    if _sch_df.empty:
+        st.info("No scheme data available for fund lookup.")
+        st.stop()
+
+    _sch_map = dict(zip(_sch_df["scheme_name"], _sch_df["scheme_code"].astype(str)))
+
+    st.markdown("Enter your current mutual fund holdings:")
+    _hd = prof.get("holdings", [])
+    _htmpl = (
+        pd.DataFrame(_hd)[["Fund", "Units", "Avg NAV"]]
+        if isinstance(_hd, list) and _hd and isinstance(_hd[0], dict) and "Fund" in _hd[0]
+        else pd.DataFrame([{"Fund": "", "Units": 0.0, "Avg NAV": 0.0}])
+    )
+
+    _hedit = st.data_editor(
+        _htmpl,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Fund": st.column_config.SelectboxColumn(
+                "Fund Name", options=list(_sch_map.keys()), required=False,
+            ),
+            "Units": st.column_config.NumberColumn("Units held", min_value=0.0, format="%.3f"),
+            "Avg NAV": st.column_config.NumberColumn("Avg purchase NAV (₹)", min_value=0.0, format="%.2f"),
+        },
+    )
+
+    if st.checkbox("Save holdings with profile on next 'Save Profile'"):
+        st.session_state.mf_profile["holdings"] = _hedit.to_dict("records")
+
+    if st.button("Analyse Portfolio", use_container_width=True):
+        _valid = _hedit[
+            _hedit["Fund"].notna() & (_hedit["Fund"] != "") &
+            (_hedit["Units"] > 0) & (_hedit["Avg NAV"] > 0)
+        ].copy()
+
+        if _valid.empty:
+            st.warning("Add at least one holding with units and avg NAV.")
+        else:
+            _valid["scheme_code"] = _valid["Fund"].map(_sch_map)
+            _hcodes = _valid["scheme_code"].dropna().astype(str).tolist()
+            _hsql   = ", ".join(f"'{c}'" for c in _hcodes)
+
+            _lat = query(f"""
+                SELECT n.scheme_code,
+                       argMax(n.nav, n.date) AS current_nav,
+                       any(s.scheme_category) AS category,
+                       any(e.return_1y)  AS ret1y,
+                       any(e.return_3y)  AS ret3y,
+                       any(e.return_5y)  AS ret5y
+                FROM market.mf_nav n
+                JOIN market.mf_schemes s ON n.scheme_code = s.scheme_code
+                LEFT JOIN (
+                    SELECT scheme_code, return_1y, return_3y, return_5y
+                    FROM market.mf_nav_enriched FINAL
+                    LIMIT 1 BY scheme_code
+                ) e ON n.scheme_code = e.scheme_code
+                WHERE n.scheme_code IN ({_hsql})
+                GROUP BY n.scheme_code
+            """)
+
+            if _lat.empty:
+                st.warning("Could not fetch current NAV for selected funds.")
+            else:
+                _valid["scheme_code"] = _valid["scheme_code"].astype(str)
+                _lat["scheme_code"]   = _lat["scheme_code"].astype(str)
+                _mg = _valid.merge(_lat, on="scheme_code", how="left")
+                _mg["current_nav"]    = pd.to_numeric(_mg["current_nav"], errors="coerce")
+                _mg["current_value"]  = _mg["Units"] * _mg["current_nav"]
+                _mg["invested_value"] = _mg["Units"] * _mg["Avg NAV"]
+                _mg["return_pct"]     = ((_mg["current_nav"] / _mg["Avg NAV"] - 1) * 100).round(2)
+
+                _bench = query("""
+                    SELECT
+                        (argMax(close, date) -
+                         argMaxIf(close, date, date <= today() - INTERVAL 1 YEAR)) /
+                         nullIf(argMaxIf(close, date, date <= today() - INTERVAL 1 YEAR), 0)
+                         * 100 AS b1y,
+                        (argMax(close, date) -
+                         argMaxIf(close, date, date <= today() - INTERVAL 3 YEAR)) /
+                         nullIf(argMaxIf(close, date, date <= today() - INTERVAL 3 YEAR), 0)
+                         * 100 AS b3y
+                    FROM market.ohlcv_daily WHERE symbol = '^NSEI'
+                """)
+                _b1 = float(_bench.iloc[0]["b1y"]) if not _bench.empty else 0.0
+                _b3 = float(_bench.iloc[0]["b3y"]) if not _bench.empty else 0.0
+
+                _mg["alpha_1y"] = (pd.to_numeric(_mg["ret1y"], errors="coerce") - _b1).round(2)
+                _mg["alpha_3y"] = (pd.to_numeric(_mg["ret3y"], errors="coerce") - _b3).round(2)
+
+                _ti = _mg["invested_value"].sum()
+                _tc = _mg["current_value"].sum()
+                _tg = _tc - _ti
+
+                _m1, _m2, _m3 = st.columns(3)
+                _m1.metric("Total Invested",  f"₹{_ti:,.0f}")
+                _m2.metric("Current Value",   f"₹{_tc:,.0f}")
+                _m3.metric("Gain / Loss",     f"₹{_tg:,.0f}",
+                           f"{_tg / _ti * 100:.1f}%" if _ti > 0 else "—")
+
+                _sh = _mg[["Fund", "category", "Units", "Avg NAV",
+                            "current_nav", "current_value", "return_pct",
+                            "ret1y", "alpha_1y", "ret3y", "alpha_3y"]].rename(columns={
+                    "category": "Category", "current_nav": "Curr NAV",
+                    "current_value": "Value (₹)", "return_pct": "Return%",
+                    "ret1y": "1Y%", "alpha_1y": "Alpha 1Y",
+                    "ret3y": "3Y%", "alpha_3y": "Alpha 3Y",
+                })
+                st.dataframe(
+                    _sh.style.format({
+                        "Value (₹)": "₹{:,.0f}", "Return%": "{:.2f}",
+                        "1Y%": "{:.1f}", "Alpha 1Y": "{:.1f}",
+                        "3Y%": "{:.1f}", "Alpha 3Y": "{:.1f}",
+                    }, na_rep="—"),
+                    use_container_width=True, hide_index=True,
+                )
+
+                # Rebalancing vs target allocation
+                st.markdown("**Rebalancing vs Target**")
+                _cg = (_mg.groupby("category")["current_value"]
+                          .sum().reset_index()
+                          .rename(columns={"category": "Category",
+                                           "current_value": "Current (₹)"}))
+                _cg["Current%"] = (_cg["Current (₹)"] / _tc * 100 if _tc > 0 else 0)
+                _tp = {k: v / sip * 100 for k, v in alloc.items()}
+                _cg["Target%"] = _cg["Category"].map(_tp).fillna(0)
+                _cg["Delta%"]  = _cg["Current%"] - _cg["Target%"]
+
+                for _tc2, _tw2 in _tp.items():
+                    if _tc2 not in _cg["Category"].values:
+                        _cg = pd.concat([_cg, pd.DataFrame([{
+                            "Category": _tc2, "Current (₹)": 0,
+                            "Current%": 0.0, "Target%": _tw2, "Delta%": -_tw2,
+                        }])], ignore_index=True)
+
+                _cg["Action"] = _cg["Delta%"].apply(
+                    lambda d: "🔴 REDUCE" if d > 5 else ("🟡 ADD" if d < -5 else "🟢 OK")
+                )
+                _rd = _cg[["Category", "Target%", "Current%", "Delta%", "Action"]].copy()
+                _rd["Target%"]  = _rd["Target%"].apply(lambda x: f"{x:.1f}%")
+                _rd["Current%"] = _rd["Current%"].apply(lambda x: f"{x:.1f}%")
+                _rd["Delta%"]   = _rd["Delta%"].apply(lambda x: f"{x:+.1f}%")
+                st.dataframe(_rd, use_container_width=True, hide_index=True)
+
+                _p1, _p2 = st.columns(2)
+                with _p1:
+                    _fcp = px.pie(_cg, names="Category", values="Current (₹)",
+                                  title="Current Allocation")
+                    st.plotly_chart(_fcp, use_container_width=True)
+                with _p2:
+                    _ftp = px.pie(alloc_df, names="Category", values="Amount (₹)",
+                                  title="Target Allocation")
+                    st.plotly_chart(_ftp, use_container_width=True)
