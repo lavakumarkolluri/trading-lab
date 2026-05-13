@@ -413,31 +413,12 @@ if page == "System Health":
         ok_days=1, warn_days=3,
     ))
 
-    # OI features (EOD summary) — per symbol
-    eod_sym_df = query("""
-        SELECT symbol, max(date) AS last_date
-        FROM market.options_eod_summary FINAL
-        GROUP BY symbol ORDER BY symbol
-    """)
-    if eod_sym_df.empty:
-        freshness_rows.append({
-            "Source": "OI Features (EOD)", "Table": "market.options_eod_summary",
-            "Latest Date": "—", "At (IST)": "—", "Age": "—", "Status": "⚫ no data",
-        })
-    else:
-        for _, r in eod_sym_df.iterrows():
-            ld_raw = r["last_date"]
-            ld = ld_raw.date() if hasattr(ld_raw, "date") else (
-                date.fromisoformat(str(ld_raw)[:10]) if ld_raw else None)
-            age_days = (today - ld).days if ld else 99
-            freshness_rows.append({
-                "Source":      f"OI Features (EOD) · {r['symbol']}",
-                "Table":       "market.options_eod_summary",
-                "Latest Date": str(ld) if ld else "—",
-                "At (IST)":    "—",
-                "Age":         f"{age_days}d ago" if ld else "—",
-                "Status":      traffic_light(age_days <= 1, age_days <= 4),
-            })
+    # OI features — options_eod_summary is NIFTY-only (no symbol column)
+    freshness_rows.append(_freshness_row(
+        "OI Features (EOD) · NIFTY", "market.options_eod_summary",
+        "SELECT max(date) FROM market.options_eod_summary FINAL",
+        ok_days=1, warn_days=4,
+    ))
 
     # OHLCV by market
     ohlcv_df = query("""
