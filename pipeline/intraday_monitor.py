@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-intraday_monitor.py — Paper trading intraday straddle monitor
+intraday_monitor.py — Intraday straddle monitor (paper + live)
 
 Runs Mon–Fri 09:20–15:25 IST. Every 15 minutes:
   • If no open position: evaluate entry conditions and enter if favorable
@@ -20,8 +20,12 @@ Entry window: 09:30–14:00 IST (not before open settles, not too late)
 Re-entry   : allowed after target/trail exit; 30-min cooling after stop loss
 
 Usage:
-    python intraday_monitor.py          # live paper trading loop
-    python intraday_monitor.py --dry-run  # log signals, no DB writes
+    python intraday_monitor.py           # paper trading loop (default)
+    python intraday_monitor.py --live    # live trading via Kite API
+    python intraday_monitor.py --dry-run # log signals, no DB writes, no orders
+
+Live trading requires env vars:
+    KITE_API_KEY, KITE_ACCESS_TOKEN  (refresh daily via kite_auth.py)
 """
 
 import json
@@ -36,6 +40,7 @@ import zoneinfo
 from datetime import datetime, time as dtime, date, timedelta
 
 import clickhouse_connect
+from kite_orders import KiteOrderManager, build_kite_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -455,7 +460,8 @@ def last_stop_time(ch, symbol: str) -> datetime | None:
         return None
 
 
-def record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run=False) -> str:
+def record_entry(ch, symbol, snap, lot_size, scorecard_conf,
+                 dry_run=False, kite_mgr: KiteOrderManager | None = None) -> str:
     trade_id = str(uuid.uuid4())
     target_pts  = TARGET_INR / lot_size
     stop_pts    = STOPLOSS_INR / lot_size
@@ -476,6 +482,15 @@ def record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run=False) -> s
              f"premium={snap['straddle']:.1f} target={target_pts:.1f}pts "
              f"stop={stop_pts:.1f}pts conf={scorecard_conf:.0f}")
 
+    # Live order placement
+    ce_order_id = pe_order_id = ""
+    if kite_mgr is not None and not dry_run:
+        margin = kite_mgr.check_margin(symbol, snap["expiry"], snap["strike"], lot_size, lots=1)
+        log.info(f"[{symbol}] Margin required: ₹{margin:.0f}")
+        ce_order_id, pe_order_id = kite_mgr.place_straddle_entry(
+            symbol, snap["expiry"], snap["strike"], lot_size, lots=1
+        )
+
     if not dry_run:
         ch.insert(
             "trades.open_positions",
@@ -483,18 +498,21 @@ def record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run=False) -> s
               snap["strike"], snap["ce_ltp"], snap["pe_ltp"], snap["straddle"],
               lot_size, target_pts, stop_pts, TARGET_INR, STOPLOSS_INR,
               scorecard_conf, "open",
-              0, 0.0, 0.0, entry_time, features, 0.0, 0.0]],
+              0, 0.0, 0.0, entry_time, features, 0.0, 0.0,
+              ce_order_id, pe_order_id]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
-                          "entry_features","net_delta","hedge_lots_cum"],
+                          "entry_features","net_delta","hedge_lots_cum",
+                          "kite_ce_order_id","kite_pe_order_id"],
         )
     return trade_id
 
 
-def record_exit(ch, pos, current_straddle, exit_reason, dry_run=False):
+def record_exit(ch, pos, current_straddle, exit_reason,
+                dry_run=False, kite_mgr: KiteOrderManager | None = None):
     pnl_pts = pos["entry_premium"] - current_straddle
     pnl_inr = pnl_pts * pos["lot_size"]
     exit_time = ist_naive()
@@ -503,6 +521,14 @@ def record_exit(ch, pos, current_straddle, exit_reason, dry_run=False):
              f"entry={pos['entry_premium']:.1f} exit={current_straddle:.1f} "
              f"pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f}")
 
+    # Live exit orders
+    exit_ce_order_id = exit_pe_order_id = ""
+    if kite_mgr is not None and not dry_run:
+        exit_ce_order_id, exit_pe_order_id = kite_mgr.place_straddle_exit(
+            pos["symbol"], pos["expiry"], float(pos["strike"]),
+            pos["lot_size"], lots=1
+        )
+
     if not dry_run:
         ch.insert(
             "trades.trade_outcomes",
@@ -510,11 +536,13 @@ def record_exit(ch, pos, current_straddle, exit_reason, dry_run=False):
               pos["entry_time"], exit_time,
               pos["strike"], pos["entry_premium"], current_straddle,
               pnl_pts, pnl_inr, pos["lot_size"], exit_reason,
-              pos["scorecard_conf"], pos.get("entry_features", "{}")]],
+              pos["scorecard_conf"], pos.get("entry_features", "{}"),
+              exit_ce_order_id, exit_pe_order_id]],
             column_names=["trade_id","symbol","expiry","entry_time","exit_time",
                           "strike","entry_premium","exit_premium",
                           "pnl_pts","pnl_inr","lot_size","exit_reason",
-                          "scorecard_conf","entry_features"],
+                          "scorecard_conf","entry_features",
+                          "kite_ce_order_id","kite_pe_order_id"],
         )
         # Close position by inserting updated row with status=closed
         ch.insert(
@@ -567,7 +595,8 @@ def update_trail(ch, pos, pnl_inr, dry_run=False):
 
 # ── Per-symbol tick ───────────────────────────────────────────────────────────
 
-def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
+def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
+         kite_mgr: KiteOrderManager | None = None):
     """One monitoring cycle for a symbol."""
     t = ist_time()
     lot_size = lot_sizes.get(symbol, DEFAULT_LOT_SIZES.get(symbol, 75))
@@ -600,19 +629,19 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
 
         # EOD exit
         if t >= EOD_EXIT:
-            record_exit(ch, pos, current, "eod", dry_run)
+            record_exit(ch, pos, current, "eod", dry_run, kite_mgr)
             return
 
         # Hard stop loss
         if pnl_inr <= -STOPLOSS_INR:
-            record_exit(ch, pos, current, "stop", dry_run)
+            record_exit(ch, pos, current, "stop", dry_run, kite_mgr)
             return
 
         # Trailing logic
         if pos["trailing_active"]:
             peak, trail = update_trail(ch, pos, pnl_inr, dry_run)
             if pnl_inr <= trail:
-                record_exit(ch, pos, current, "trail", dry_run)
+                record_exit(ch, pos, current, "trail", dry_run, kite_mgr)
             return
 
         # Target hit — activate trailing instead of exiting
@@ -670,7 +699,7 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
 
     scorecard_conf = get_scorecard_confidence(ch, symbol)
     log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} — ENTERING")
-    record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run)
+    record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run, kite_mgr)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -679,10 +708,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true",
                         help="Evaluate and log signals but do not write to DB")
+    parser.add_argument("--live", action="store_true",
+                        help="Place real orders via Kite API (requires KITE_API_KEY + KITE_ACCESS_TOKEN)")
     args = parser.parse_args()
 
     _assert_env("CH_PASSWORD")
-    log.info("=== Intraday Straddle Monitor (paper trading) ===")
+
+    # Build Kite order manager (None in paper mode)
+    kite_mgr = None
+    if args.live:
+        kite_client = build_kite_client()
+        if kite_client is None:
+            log.error("--live requires KITE_API_KEY and KITE_ACCESS_TOKEN env vars. Exiting.")
+            raise SystemExit(1)
+        kite_mgr = KiteOrderManager(kite_client)
+        kite_mgr.load_instruments()
+        log.info("=== Intraday Straddle Monitor (LIVE — real orders via Kite) ===")
+    else:
+        log.info("=== Intraday Straddle Monitor (paper trading) ===")
+
     log.info(f"Symbols        : {SYMBOLS}")
     log.info(f"Target         : ₹{TARGET_INR:.0f} → trailing at {TRAIL_PCT:.0%} of peak")
     log.info(f"Stop loss      : ₹{STOPLOSS_INR:.0f}")
@@ -706,7 +750,7 @@ def main():
         log.info(f"--- Tick at {ist_now().strftime('%H:%M:%S')} IST ---")
         for symbol in SYMBOLS:
             try:
-                tick(ch, symbol, lot_sizes, args.dry_run)
+                tick(ch, symbol, lot_sizes, args.dry_run, kite_mgr)
             except Exception as e:
                 log.error(f"[{symbol}] tick failed: {e}", exc_info=True)
         # Heartbeat for Docker healthcheck

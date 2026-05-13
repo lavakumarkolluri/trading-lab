@@ -23,3 +23,6 @@ scikit-learn==1.6.1
 
 # Added for events_pipeline HTML scraping
 beautifulsoup4==4.12.3
+
+# Zerodha Kite Connect — live order placement
+kiteconnect==5.0.1

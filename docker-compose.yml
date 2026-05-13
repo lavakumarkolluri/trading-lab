@@ -502,6 +502,8 @@ services:
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
       - TZ=Asia/Kolkata
+      - KITE_API_KEY=${KITE_API_KEY:-}
+      - KITE_ACCESS_TOKEN=${KITE_ACCESS_TOKEN:-}
     depends_on:
       clickhouse:
         condition: service_healthy

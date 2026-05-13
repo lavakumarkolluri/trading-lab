@@ -81,5 +81,7 @@ COPY weekend_theta_backtest.py .
 COPY price_action.py .
 COPY compute_greeks.py .
 COPY compute_vol_surface.py .
+COPY kite_orders.py .
+COPY kite_auth.py .
 
 CMD ["python", "main.py"]
