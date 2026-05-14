@@ -463,17 +463,46 @@ def job_vix_pipeline():
     _run("vix_pipeline")
 
 
+def _log_cleanup(task: str, status: str, items: int = 0, freed: int = 0, detail: str = ""):
+    """Write one row to system_meta.cleanup_log."""
+    if not _TRACKING_OK:
+        return
+    try:
+        import json as _json
+        ch = _ch_client()
+        ch.command(
+            "INSERT INTO system_meta.cleanup_log "
+            "(task_name, status, items_freed, bytes_freed, detail) "
+            "VALUES ({t:String},{s:String},{i:Int64},{f:Int64},{d:String})",
+            parameters={"t": task, "s": status, "i": items, "f": freed, "d": detail},
+        )
+    except Exception as e:
+        log.warning("cleanup_log write failed for %s: %s", task, e)
+
+
 def job_cleanup():
-    """Weekly disk cleanup: MinIO intraday snapshots >30 days, workspace logs >7 days."""
+    """Weekly maintenance: MinIO snapshots, workspace logs, Docker assessment, CH system tables."""
     log.info("=== Weekly cleanup triggered ===")
     try:
         _cleanup_minio_intraday()
     except Exception as e:
         log.error("MinIO cleanup failed: %s", e)
+        _log_cleanup("minio_intraday", "error", detail=str(e))
     try:
         _cleanup_logs()
     except Exception as e:
         log.error("Log cleanup failed: %s", e)
+        _log_cleanup("workspace_logs", "error", detail=str(e))
+    try:
+        _assess_docker_resources()
+    except Exception as e:
+        log.error("Docker assessment failed: %s", e)
+        _log_cleanup("docker_assessment", "error", detail=str(e))
+    try:
+        _assess_clickhouse_system_tables()
+    except Exception as e:
+        log.error("ClickHouse system table assessment failed: %s", e)
+        _log_cleanup("clickhouse_system_tables", "error", detail=str(e))
 
 
 def _cleanup_minio_intraday():
@@ -483,6 +512,7 @@ def _cleanup_minio_intraday():
     minio_pass = os.getenv("MINIO_PASSWORD", "")
     if not minio_pass:
         log.warning("MINIO_PASSWORD not set — skipping MinIO cleanup")
+        _log_cleanup("minio_intraday", "skipped", detail="MINIO_PASSWORD not set")
         return
 
     try:
@@ -492,16 +522,22 @@ def _cleanup_minio_intraday():
         cutoff = datetime.utcnow() - timedelta(days=30)
         bucket = "trading-data"
         if not mc.bucket_exists(bucket):
+            _log_cleanup("minio_intraday", "skipped", detail="bucket not found")
             return
         objects = mc.list_objects(bucket, prefix="option_chain/intraday/", recursive=True)
         deleted = 0
+        bytes_freed = 0
         for obj in objects:
             if obj.last_modified and obj.last_modified.replace(tzinfo=None) < cutoff:
+                bytes_freed += obj.size or 0
                 mc.remove_object(bucket, obj.object_name)
                 deleted += 1
         log.info("MinIO cleanup: deleted %d intraday objects older than 30 days", deleted)
+        _log_cleanup("minio_intraday", "ok", items=deleted, freed=bytes_freed,
+                     detail=f"removed {deleted} objects >30d old")
     except ImportError:
         log.warning("minio package not available — skipping MinIO cleanup")
+        _log_cleanup("minio_intraday", "skipped", detail="minio package not installed")
 
 
 def _cleanup_logs():
@@ -509,15 +545,114 @@ def _cleanup_logs():
     import glob as _glob
     log_dir = os.getenv("LOG_DIR", "/trading-lab/workspace/logs")
     cutoff = datetime.utcnow() - timedelta(days=7)
+    truncated = 0
+    freed = 0
     for path in _glob.glob(f"{log_dir}/*.log"):
         try:
             mtime = datetime.utcfromtimestamp(os.path.getmtime(path))
-            size_mb = os.path.getsize(path) / (1024 * 1024)
+            size_b = os.path.getsize(path)
+            size_mb = size_b / (1024 * 1024)
             if mtime < cutoff or size_mb > 50:
                 open(path, "w").close()  # truncate
                 log.info("Truncated log: %s (was %.1f MB)", path, size_mb)
+                truncated += 1
+                freed += size_b
         except Exception as e:
             log.warning("Could not truncate %s: %s", path, e)
+    _log_cleanup("workspace_logs", "ok", items=truncated, freed=freed,
+                 detail=f"truncated {truncated} log files")
+
+
+def _assess_docker_resources():
+    """Assess Docker disk usage (images, containers, volumes, build cache) and log summary."""
+    import json as _json
+
+    def _docker(*args, timeout=15):
+        r = subprocess.run(["docker"] + list(args), capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+
+    # Dangling images
+    dangling_ids = [l for l in _docker("images", "-f", "dangling=true", "-q").splitlines() if l]
+    n_dangling = len(dangling_ids)
+
+    # All images
+    all_ids = [l for l in _docker("images", "-q").splitlines() if l]
+    n_images = len(all_ids)
+
+    # Stopped containers (exited / created / dead)
+    stopped_ids = [l for l in _docker(
+        "ps", "-a", "-f", "status=exited", "-f", "status=created", "-f", "status=dead", "-q"
+    ).splitlines() if l]
+    n_stopped = len(stopped_ids)
+
+    # All containers
+    all_ct = [l for l in _docker("ps", "-a", "-q").splitlines() if l]
+    n_containers = len(all_ct)
+
+    # Volumes (all, then dangling)
+    all_vols   = [l for l in _docker("volume", "ls", "-q").splitlines() if l]
+    dang_vols  = [l for l in _docker("volume", "ls", "-f", "dangling=true", "-q").splitlines() if l]
+    n_vols     = len(all_vols)
+    n_dang_vol = len(dang_vols)
+
+    # docker system df text → parse sizes
+    df_txt = _docker("system", "df")
+    # Approximate reclaimable bytes from text: look for lines with sizes
+    reclaimable_gb = 0.0
+    for line in df_txt.splitlines():
+        parts = line.split()
+        if len(parts) >= 5:
+            reclaim_field = parts[-1].strip("(%)")
+            try:
+                val_str = parts[-2] if "GB" in parts[-1] or "MB" in parts[-1] else parts[-1]
+                if "GB" in val_str:
+                    reclaimable_gb += float(val_str.replace("GB", ""))
+                elif "MB" in val_str:
+                    reclaimable_gb += float(val_str.replace("MB", "")) / 1024
+            except ValueError:
+                pass
+
+    detail = _json.dumps({
+        "images_total": n_images,
+        "images_dangling": n_dangling,
+        "containers_total": n_containers,
+        "containers_stopped": n_stopped,
+        "volumes_total": n_vols,
+        "volumes_dangling": n_dang_vol,
+        "reclaimable_gb_approx": round(reclaimable_gb, 2),
+        "system_df": df_txt[:1500],
+    })
+    reclaimable_bytes = int(reclaimable_gb * 1024**3)
+    log.info("Docker assessment: %d images (%d dangling), %d containers (%d stopped), "
+             "%d volumes (%d dangling)", n_images, n_dangling, n_containers, n_stopped,
+             n_vols, n_dang_vol)
+    _log_cleanup("docker_assessment", "ok",
+                 items=n_dangling + n_stopped + n_dang_vol,
+                 freed=reclaimable_bytes, detail=detail)
+
+
+def _assess_clickhouse_system_tables():
+    """Check ClickHouse system table sizes and log the result."""
+    import json as _json
+    if not _TRACKING_OK:
+        return
+    try:
+        ch = _ch_client()
+        rows = ch.query(
+            "SELECT table, sum(bytes_on_disk) AS bytes "
+            "FROM system.parts WHERE database='system' GROUP BY table ORDER BY bytes DESC"
+        ).result_rows
+        tbl_sizes = {r[0]: r[1] for r in rows}
+        total_bytes = sum(tbl_sizes.values())
+        detail = _json.dumps({
+            "tables": {k: f"{v/1e6:.1f}MB" for k, v in tbl_sizes.items()},
+            "total_mb": round(total_bytes / 1e6, 1),
+        })
+        log.info("ClickHouse system tables: %.1f MB total", total_bytes / 1e6)
+        _log_cleanup("clickhouse_system_tables", "ok",
+                     freed=0, detail=detail)
+    except Exception as e:
+        _log_cleanup("clickhouse_system_tables", "error", detail=str(e))
 
 
 def job_option_chain_intraday():

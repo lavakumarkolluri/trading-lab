@@ -591,6 +591,8 @@ services:
       # Mount app.py directly so edits are picked up by Streamlit hot-reload
       # without rebuilding the image.
       - ./dashboard/app.py:/app/app.py:ro
+      # Read-only Docker socket so the Resources page can query image/container/volume sizes.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - CH_HOST=clickhouse
       - CH_PORT=8123

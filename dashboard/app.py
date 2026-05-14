@@ -532,6 +532,341 @@ if page == "System Health":
                         delta_color="normal" if signal_ok else "inverse",
                     )
 
+    st.divider()
+
+    # ── Resources & Cleanup ───────────────────────────────────────────────────
+    st.subheader("🗄️ Resources & Cleanup")
+
+    def _fmt_bytes(n: int) -> str:
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if abs(n) < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} PB"
+
+    _res_tabs = st.tabs(["Host", "Docker", "Cleanup Log", "Suggestions"])
+
+    # ── Host tab ─────────────────────────────────────────────────────────────
+    with _res_tabs[0]:
+        import shutil as _shutil
+
+        # Memory — /proc/meminfo is the host kernel's view even inside a container
+        try:
+            _mem = {}
+            with open("/proc/meminfo") as _mf:
+                for _ml in _mf:
+                    _mp = _ml.split()
+                    if len(_mp) >= 2:
+                        _mem[_mp[0].rstrip(":")] = int(_mp[1]) * 1024
+            _mem_total = _mem.get("MemTotal", 0)
+            _mem_avail = _mem.get("MemAvailable", 0)
+            _mem_used  = _mem_total - _mem_avail
+            _mem_pct   = _mem_used / _mem_total * 100 if _mem_total else 0
+            _hc1, _hc2, _hc3 = st.columns(3)
+            _hc1.metric("RAM Total",     _fmt_bytes(_mem_total))
+            _hc2.metric("RAM Used",      _fmt_bytes(_mem_used),
+                        f"{_mem_pct:.0f}%",
+                        delta_color="inverse" if _mem_pct > 85 else "normal")
+            _hc3.metric("RAM Available", _fmt_bytes(_mem_avail))
+        except Exception as _e:
+            st.caption(f"Memory read error: {_e}")
+
+        st.markdown("**Filesystem usage**")
+        try:
+            import subprocess as _sp
+            _df_out = _sp.run(
+                ["df", "-B1", "--output=target,size,used,avail,pcent"],
+                capture_output=True, text=True, timeout=5
+            ).stdout.splitlines()
+            _disk_rows = []
+            for _dl in _df_out[1:]:
+                _dp = _dl.split()
+                if len(_dp) >= 5:
+                    try:
+                        _disk_rows.append({
+                            "Mount": _dp[0], "Total": _fmt_bytes(int(_dp[1])),
+                            "Used": _fmt_bytes(int(_dp[2])), "Free": _fmt_bytes(int(_dp[3])),
+                            "Used%": _dp[4],
+                        })
+                    except ValueError:
+                        pass
+            if _disk_rows:
+                _dk_df = pd.DataFrame(_disk_rows)
+                st.dataframe(_dk_df, use_container_width=True, hide_index=True)
+        except Exception as _e:
+            st.caption(f"Disk read error: {_e}")
+
+        _cpu_count = os.cpu_count() or "?"
+        try:
+            with open("/proc/loadavg") as _lf:
+                _load = _lf.read().split()[:3]
+                _load_str = "  /  ".join(_load)
+        except Exception:
+            _load_str = "—"
+        st.caption(f"CPU cores: {_cpu_count}   |   Load avg (1/5/15 min): {_load_str}")
+
+    # ── Docker tab ────────────────────────────────────────────────────────────
+    with _res_tabs[1]:
+        try:
+            import docker as _docker_sdk
+            _dc = _docker_sdk.from_env()
+
+            # Images
+            _all_imgs   = _dc.images.list()
+            _dang_imgs  = _dc.images.list(filters={"dangling": True})
+            _img_bytes  = sum(i.attrs.get("Size", 0) for i in _all_imgs)
+            _dang_bytes = sum(i.attrs.get("Size", 0) for i in _dang_imgs)
+
+            # Containers
+            _all_cts   = _dc.containers.list(all=True)
+            _run_cts   = [c for c in _all_cts if c.status == "running"]
+            _stop_cts  = [c for c in _all_cts if c.status in ("exited", "created", "dead")]
+            # Orphaned = stopped for more than 7 days (no FinishedAt or very old)
+            import datetime as _dt_mod
+            _now_utc = _dt_mod.datetime.now(_dt_mod.timezone.utc)
+            _orphans = []
+            for _ct in _stop_cts:
+                _fa = (_ct.attrs.get("State") or {}).get("FinishedAt", "")
+                if _fa and _fa != "0001-01-01T00:00:00Z":
+                    try:
+                        _fin = _dt_mod.datetime.fromisoformat(_fa.replace("Z", "+00:00"))
+                        if (_now_utc - _fin).days >= 7:
+                            _orphans.append(_ct)
+                    except Exception:
+                        pass
+
+            # Volumes
+            _all_vols  = _dc.volumes.list()
+            _dang_vols = _dc.volumes.list(filters={"dangling": True})
+
+            # Build cache via system df
+            try:
+                _sysdf = _dc.df()
+                _cache_bytes = sum(
+                    (c.get("Size", 0) or 0)
+                    for c in (_sysdf.get("BuildCache") or [])
+                )
+            except Exception:
+                _cache_bytes = 0
+
+            # Display
+            _d1, _d2, _d3, _d4 = st.columns(4)
+            _d1.metric("Images",          f"{len(_all_imgs)}",
+                       f"{_fmt_bytes(_img_bytes)} total")
+            _d2.metric("Containers",      f"{len(_all_cts)}",
+                       f"{len(_run_cts)} running  /  {len(_stop_cts)} stopped")
+            _d3.metric("Volumes",         f"{len(_all_vols)}",
+                       f"{len(_dang_vols)} dangling")
+            _d4.metric("Build Cache",     _fmt_bytes(_cache_bytes))
+
+            # Dangling images table
+            if _dang_imgs:
+                st.markdown(f"**Dangling images** ({len(_dang_imgs)}, {_fmt_bytes(_dang_bytes)}) — safe to prune")
+                _di_rows = []
+                for _im in _dang_imgs:
+                    _di_rows.append({
+                        "Image ID": _im.short_id,
+                        "Size": _fmt_bytes(_im.attrs.get("Size", 0)),
+                        "Created": _im.attrs.get("Created", "")[:10],
+                    })
+                st.dataframe(pd.DataFrame(_di_rows), use_container_width=True, hide_index=True)
+
+            # All containers status table
+            st.markdown("**All containers**")
+            _ct_rows = []
+            for _ct in sorted(_all_cts, key=lambda c: c.name):
+                _fa = (_ct.attrs.get("State") or {}).get("FinishedAt", "")
+                _fin_str = _fa[:19].replace("T", " ") if _fa and _fa != "0001-01-01T00:00:00Z" else "—"
+                _sz = (_ct.attrs.get("SizeRootFs") or 0)
+                _ct_rows.append({
+                    "Container": _ct.name,
+                    "Status": _ct.status,
+                    "Image": (_ct.image.tags[0] if _ct.image and _ct.image.tags else _ct.image.short_id if _ct.image else "—"),
+                    "Stopped at": _fin_str,
+                    "Orphan": "⚠️ yes" if _ct in _orphans else "",
+                })
+            st.dataframe(pd.DataFrame(_ct_rows), use_container_width=True, hide_index=True)
+
+            # Dangling volumes
+            if _dang_vols:
+                st.markdown(f"**Dangling volumes** ({len(_dang_vols)}) — not mounted by any container")
+                _dv_rows = [{"Volume": v.name, "Driver": v.attrs.get("Driver", "")} for v in _dang_vols]
+                st.dataframe(pd.DataFrame(_dv_rows), use_container_width=True, hide_index=True)
+
+        except Exception as _e:
+            st.warning(f"Docker SDK unavailable: {_e}")
+            st.caption("Ensure /var/run/docker.sock is mounted and the `docker` package is installed.")
+
+    # ── Cleanup Log tab ───────────────────────────────────────────────────────
+    with _res_tabs[2]:
+        _cl_df = query("""
+            SELECT task_name, status, items_freed, bytes_freed, detail,
+                   ran_at
+            FROM system_meta.cleanup_log
+            ORDER BY ran_at DESC
+            LIMIT 50
+        """)
+        if _cl_df.empty:
+            st.info("No cleanup runs recorded yet. Cleanup runs every Sunday 09:00 UTC.")
+        else:
+            _cl_df["bytes_freed"] = _cl_df["bytes_freed"].apply(
+                lambda x: _fmt_bytes(int(x)) if x and int(x) > 0 else "—"
+            )
+            _cl_df["ran_at"] = pd.to_datetime(_cl_df["ran_at"])
+            _cl_df["ran_at"] = _cl_df["ran_at"].apply(
+                lambda d: d.strftime("%Y-%m-%d %H:%M") if pd.notna(d) else "—"
+            )
+            st.dataframe(
+                _cl_df.rename(columns={
+                    "task_name": "Task", "status": "Status",
+                    "items_freed": "Items Freed", "bytes_freed": "Bytes Freed",
+                    "detail": "Detail", "ran_at": "Ran At",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+            # Show docker system df from latest docker_assessment detail
+            _last_docker = _cl_df[_cl_df["Task"] == "docker_assessment"].head(1)
+            if not _last_docker.empty:
+                try:
+                    _d = json.loads(_last_docker.iloc[0]["Detail"])
+                    if _d.get("system_df"):
+                        with st.expander("docker system df (from last assessment)"):
+                            st.code(_d["system_df"])
+                except Exception:
+                    pass
+
+    # ── Suggestions tab ───────────────────────────────────────────────────────
+    with _res_tabs[3]:
+        st.markdown("**Automated cleanup suggestions** (based on current Docker state)")
+        try:
+            import docker as _docker_sdk2
+            _dc2 = _docker_sdk2.from_env()
+
+            _sugg = []
+
+            _dang2      = _dc2.images.list(filters={"dangling": True})
+            _stop2      = [c for c in _dc2.containers.list(all=True)
+                           if c.status in ("exited", "created", "dead")]
+            _dang_vol2  = _dc2.volumes.list(filters={"dangling": True})
+
+            _dang_sz2  = sum(i.attrs.get("Size", 0) for i in _dang2)
+            if _dang2:
+                _sugg.append({
+                    "Priority": "🟡 Medium", "Issue": f"{len(_dang2)} dangling image(s) ({_fmt_bytes(_dang_sz2)})",
+                    "Command": "docker image prune -f",
+                    "Impact": f"Frees ~{_fmt_bytes(_dang_sz2)}",
+                })
+
+            if _stop2:
+                _sugg.append({
+                    "Priority": "🟢 Low", "Issue": f"{len(_stop2)} stopped container(s)",
+                    "Command": "docker container prune -f",
+                    "Impact": "Frees stopped container layers",
+                })
+
+            if _dang_vol2:
+                _sugg.append({
+                    "Priority": "🟡 Medium", "Issue": f"{len(_dang_vol2)} dangling volume(s)",
+                    "Command": "docker volume prune -f",
+                    "Impact": "Frees anonymous/unused volume data",
+                })
+
+            # Build cache
+            try:
+                _sysdf2 = _dc2.df()
+                _cache2 = sum(
+                    (c.get("Size", 0) or 0) for c in (_sysdf2.get("BuildCache") or [])
+                )
+                if _cache2 > 500 * 1024 * 1024:  # > 500 MB
+                    _sugg.append({
+                        "Priority": "🟡 Medium", "Issue": f"Build cache {_fmt_bytes(_cache2)}",
+                        "Command": "docker builder prune -f",
+                        "Impact": f"Frees ~{_fmt_bytes(_cache2)}",
+                    })
+            except Exception:
+                pass
+
+            # Disk pressure check
+            try:
+                _root_du = _shutil.disk_usage("/")
+                _disk_pct = _root_du.used / _root_du.total * 100
+                if _disk_pct > 85:
+                    _sugg.insert(0, {
+                        "Priority": "🔴 High", "Issue": f"Root filesystem {_disk_pct:.0f}% full",
+                        "Command": "docker system prune -f --volumes",
+                        "Impact": "Full prune: removes stopped containers, dangling images, unused volumes",
+                    })
+                elif _disk_pct > 70:
+                    _sugg.append({
+                        "Priority": "🟡 Medium", "Issue": f"Root filesystem {_disk_pct:.0f}% full (approaching limit)",
+                        "Command": "docker system prune -f",
+                        "Impact": "Removes stopped containers + dangling images",
+                    })
+            except Exception:
+                pass
+
+            # Orphaned containers (project containers not in docker-compose)
+            _compose_names = {
+                "clickhouse", "dashboard", "scheduler", "minio", "portainer",
+                "pipeline", "meta_pipeline", "compute_oi_features",
+                "intraday_monitor", "option_chain_intraday",
+            }
+            _all2 = _dc2.containers.list(all=True)
+            _orphan_cts = [c for c in _all2
+                           if c.status in ("exited", "created", "dead")
+                           and not any(n in c.name for n in _compose_names)]
+            if _orphan_cts:
+                _sugg.append({
+                    "Priority": "🟢 Low",
+                    "Issue": f"{len(_orphan_cts)} orphan container(s) (not part of compose project)",
+                    "Command": "docker container prune -f",
+                    "Impact": "Removes containers with no running compose service",
+                })
+
+            if not _sugg:
+                st.success("✅ No cleanup needed — Docker is in good shape.")
+            else:
+                st.dataframe(pd.DataFrame(_sugg), use_container_width=True, hide_index=True)
+                st.caption(
+                    "Run commands on the **host** (or inside the scheduler container which has "
+                    "Docker socket access). Commands with `-f` skip the confirmation prompt."
+                )
+
+        except Exception as _e:
+            st.warning(f"Docker SDK unavailable: {_e}")
+
+        # ClickHouse system table advice
+        st.markdown("**ClickHouse system tables**")
+        _ch_sys = query("""
+            SELECT table,
+                   formatReadableSize(sum(bytes_on_disk)) AS size_on_disk,
+                   sum(rows) AS rows
+            FROM system.parts
+            WHERE database = 'system'
+            GROUP BY table
+            ORDER BY sum(bytes_on_disk) DESC
+        """)
+        if not _ch_sys.empty:
+            st.dataframe(_ch_sys, use_container_width=True, hide_index=True)
+            _ch_sys["_bytes"] = query("""
+                SELECT table, sum(bytes_on_disk) AS b
+                FROM system.parts WHERE database='system'
+                GROUP BY table ORDER BY b DESC
+            """).set_index("table").get("b", pd.Series(dtype=float))
+            _total_sys_mb = query("""
+                SELECT sum(bytes_on_disk)/1e6 AS mb FROM system.parts WHERE database='system'
+            """)
+            if not _total_sys_mb.empty:
+                _smb = float(_total_sys_mb.iloc[0]["mb"])
+                if _smb > 500:
+                    st.warning(
+                        f"ClickHouse system tables use {_smb:.0f} MB. "
+                        "Logs older than TTL will be purged automatically. "
+                        "Check `clickhouse/config/log-retention.xml` if this keeps growing."
+                    )
+                else:
+                    st.caption(f"System tables total: {_smb:.0f} MB — within normal range.")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 2 — MODEL
@@ -2076,9 +2411,13 @@ elif page == "MF Advisor":
         mn_s, mx_s = _s.min(), _s.max()
         return (_s - mn_s) / (mx_s - mn_s) * 100 if mx_s > mn_s else _s * 0 + 50.0
 
-    # Ensure all metric columns exist and are numeric
+    # Ensure all metric columns exist and are numeric.
+    # upside_capture / downside_capture / alpha come from later joins — skip here.
     _enr = _enr.copy()
+    _LATE_COLS = {"upside_capture", "downside_capture", "alpha"}
     for _col in list(_W11.keys()):
+        if _col in _LATE_COLS:
+            continue
         if _col not in _enr.columns:
             _enr[_col] = 0.0
         else:
