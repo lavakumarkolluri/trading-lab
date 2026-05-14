@@ -280,3 +280,57 @@ def test_get_graduation_stage_defaults_to_1_on_error():
     ch.query.side_effect = Exception("connection refused")
     stage = monitor.get_graduation_stage(ch, "iron_fly_0dte")
     assert stage == 1
+
+
+# ── MIN_CONFIDENCE raised to 60 ───────────────────────────────────────────────
+
+def test_min_confidence_at_least_60():
+    """MIN_CONFIDENCE=50 is a coin-flip — must be ≥ 60 to be meaningful."""
+    assert monitor.MIN_CONFIDENCE >= 60, (
+        f"MIN_CONFIDENCE={monitor.MIN_CONFIDENCE} is too low. "
+        "A score of 50-59 is essentially random for this model."
+    )
+
+
+# ── critical_features_all_zero gate ──────────────────────────────────────────
+
+def test_critical_features_all_zero_true_when_iv_missing():
+    """Returns True when iv_rank, atm_ce_iv, and vix are all zero (CRIT-003 symptom)."""
+    features = {"iv_rank": 0.0, "atm_ce_iv": 0.0, "vix": 0.0, "pcr_oi": 0.8}
+    assert monitor.critical_features_all_zero(features) is True
+
+
+def test_critical_features_all_zero_false_when_vix_present():
+    """Returns False when at least one critical feature is non-zero."""
+    features = {"iv_rank": 0.0, "atm_ce_iv": 0.0, "vix": 14.5, "pcr_oi": 0.8}
+    assert monitor.critical_features_all_zero(features) is False
+
+
+def test_critical_features_all_zero_false_on_empty_dict():
+    """Empty dict (score not available) must NOT block — returns False so logic falls through."""
+    assert monitor.critical_features_all_zero({}) is False
+
+
+def test_get_score_features_json_returns_dict_on_hit():
+    """Returns parsed dict from features_json column."""
+    import json
+    ch = MagicMock()
+    ch.query.return_value.result_rows = [('{"iv_rank": 24.5, "vix": 18.0}',)]
+    result = monitor.get_score_features_json(ch, "NIFTY")
+    assert result == {"iv_rank": 24.5, "vix": 18.0}
+
+
+def test_get_score_features_json_returns_empty_on_miss():
+    """Returns {} when no score exists (within 7 days)."""
+    ch = MagicMock()
+    ch.query.return_value.result_rows = []
+    result = monitor.get_score_features_json(ch, "NIFTY")
+    assert result == {}
+
+
+def test_get_score_features_json_returns_empty_on_error():
+    """Returns {} on DB exception — must not crash."""
+    ch = MagicMock()
+    ch.query.side_effect = Exception("timeout")
+    result = monitor.get_score_features_json(ch, "NIFTY")
+    assert result == {}

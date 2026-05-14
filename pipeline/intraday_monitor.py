@@ -63,7 +63,7 @@ MONITOR_EXIT     = dtime(15, 25)
 STOP_COOLDOWN_M  = 30         # minutes to wait before re-entry after stop hit
 
 MIN_PREMIUM       = {"NIFTY": 40.0, "BANKNIFTY": 80.0, "FINNIFTY": 50.0}
-MIN_CONFIDENCE    = 50.0   # skip entry if scorecard below this
+MIN_CONFIDENCE    = 60.0   # skip entry if scorecard below this (raised from 50 — coin-flip threshold)
 
 # Iron fly wing distances (OTM strikes to buy for defined-risk structure)
 WING_PTS = {"NIFTY": 200.0, "BANKNIFTY": 500.0, "FINNIFTY": 200.0}
@@ -472,6 +472,35 @@ def get_scorecard_confidence(ch, symbol: str) -> float:
         return 50.0
 
 
+_CRITICAL_SCORE_FEATURES = ["iv_rank", "atm_ce_iv", "vix"]
+
+def get_score_features_json(ch, symbol: str) -> dict:
+    """Return features_json dict from the latest confidence score, or {} on failure."""
+    import json
+    try:
+        r = ch.query("""
+            SELECT features_json FROM analysis.confidence_scores FINAL
+            WHERE symbol = {sym:String}
+              AND score_date >= today() - 7
+            ORDER BY score_date DESC
+            LIMIT 1
+        """, parameters={"sym": symbol})
+        if not r.result_rows:
+            return {}
+        raw = r.result_rows[0][0]
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def critical_features_all_zero(features: dict) -> bool:
+    """Return True when all critical IV/VIX features are zero — CRIT-003 symptom.
+    Returns False on empty dict (score unavailable) so callers don't block incorrectly."""
+    if not features:
+        return False
+    return all(float(features.get(f, 0) or 0) == 0.0 for f in _CRITICAL_SCORE_FEATURES)
+
+
 # ── Position management ───────────────────────────────────────────────────────
 
 def get_open_position(ch, symbol: str) -> dict | None:
@@ -809,6 +838,15 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
     if scorecard_conf < MIN_CONFIDENCE:
         log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} < {MIN_CONFIDENCE:.0f} — skip (low confidence)")
         return
+
+    # Gate: block entry when critical IV/VIX features are all zero — indicates
+    # corrupted or missing EOD data (CRIT-003: options_eod_summary is NIFTY-only)
+    features = get_score_features_json(ch, symbol)
+    if features and critical_features_all_zero(features):
+        log.warning(f"[{symbol}] critical features all zero (iv_rank/atm_ce_iv/vix) — "
+                    "score may be unreliable; skipping entry")
+        return
+
     log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} — ENTERING")
     record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run, kite_mgr)
 

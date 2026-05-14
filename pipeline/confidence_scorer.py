@@ -60,8 +60,18 @@ SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 INDEX_MAP = {
     "NIFTY":      "^NSEI",
     "BANKNIFTY":  "^NSEBANK",
-    "FINNIFTY":   "^NSEI",
-    "MIDCPNIFTY": "^NSEI",
+    "FINNIFTY":   "^CNXFIN",    # CRIT-004: was ^NSEI (wrong — NIFTY 50 signals for a fin-services index)
+    "MIDCPNIFTY": "^NSMIDCP",   # CRIT-004: was ^NSEI (wrong — NIFTY 50 signals for a midcap index)
+}
+
+# Per-symbol breakeven in points: approximate iron fly wing cost + transaction costs.
+# A WIN requires straddle P&L > this threshold, not just > 0 (CRIT-001).
+# Wing cost ≈ OTM option premium at WING_PTS distance, both sides.
+_BREAKEVEN = {
+    "NIFTY":      35,   # ±200 pt wings ≈ 30 pts + 5 pts txn
+    "BANKNIFTY":  50,   # ±500 pt wings ≈ 45 pts + 5 pts txn
+    "FINNIFTY":   35,   # ±200 pt wings ≈ 30 pts + 5 pts txn
+    "MIDCPNIFTY": 30,   # smaller premium range, tighter cost
 }
 
 XGB_PARAMS = dict(
@@ -79,7 +89,7 @@ XGB_PARAMS = dict(
 
 TRAIN_MONTHS = 12
 TEST_MONTHS  = 1
-MIN_TRAIN    = 25
+MIN_TRAIN    = 60   # HIGH-004: was 25 — too few rows for XGBoost, causes overfitting
 
 
 # ── Connections ───────────────────────────────────────────────────────────────
@@ -539,7 +549,10 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df["target"] = (df["pnl_pts"] > 0).astype(int)
+    # CRIT-001: use per-symbol breakeven so the model learns "profitable after iron fly costs"
+    # not just "straddle P&L > 0" (which ignores ~30–50 pts of wing cost)
+    breakeven = _BREAKEVEN.get(symbol, 35)
+    df["target"] = (df["pnl_pts"] > breakeven).astype(int)
     df.sort_values("expiry", inplace=True)
     df.reset_index(drop=True, inplace=True)
     log.info(f"[{symbol}] dataset: {len(df)} rows, win_rate={df.target.mean():.1%}")
@@ -604,9 +617,15 @@ def _walk_forward_cv(df: pd.DataFrame, model_type: str,
         return pd.DataFrame()
 
     df = df.copy()
+    # CRIT-002: split on entry_date (when features were observed), not expiry_dt.
+    # Using expiry_dt allowed trades entered before the test window to leak into
+    # training when their expiry fell after the fold boundary.
+    df["entry_dt"] = pd.to_datetime(df["entry_date"])
     df["expiry_dt"] = pd.to_datetime(df["expiry"])
-    max_date = df["expiry_dt"].max()
-    first_test_start = df.iloc[MIN_TRAIN]["expiry_dt"].to_period("M").to_timestamp()
+    df.sort_values("entry_dt", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    max_date = df["entry_dt"].max()
+    first_test_start = df.iloc[MIN_TRAIN]["entry_dt"].to_period("M").to_timestamp()
 
     all_preds = []
     fold = 0
@@ -616,8 +635,8 @@ def _walk_forward_cv(df: pd.DataFrame, model_type: str,
         test_end   = test_start + pd.DateOffset(months=TEST_MONTHS)
         train_start = test_start - pd.DateOffset(months=TRAIN_MONTHS)
 
-        train_df = df[(df.expiry_dt >= train_start) & (df.expiry_dt < test_start)]
-        test_df  = df[(df.expiry_dt >= test_start)  & (df.expiry_dt < test_end)]
+        train_df = df[(df.entry_dt >= train_start) & (df.entry_dt < test_start)]
+        test_df  = df[(df.entry_dt >= test_start)  & (df.entry_dt < test_end)]
 
         if len(train_df) < 15 or test_df.empty:
             test_start = test_end

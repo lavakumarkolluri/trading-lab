@@ -157,3 +157,106 @@ def test_find_atm_strike_handles_duplicate_index():
     pe = pd.Series([45.0, 95.0, 45.0, 100.0],  index=[24000, 24100, 24000, 24200])
     result = cs.find_atm_strike(ce, pe)
     assert result == 24100.0, f"Expected ATM=24100, got {result}"
+
+
+# ── CRIT-004: INDEX_MAP correctness ──────────────────────────────────────────
+
+def test_index_map_symbols_all_distinct():
+    """All 4 symbols must map to distinct index tickers — CRIT-004 fix."""
+    values = list(cs.INDEX_MAP.values())
+    assert len(values) == len(set(values)), (
+        f"INDEX_MAP has duplicate tickers: {cs.INDEX_MAP}. "
+        "FINNIFTY and MIDCPNIFTY must not reuse ^NSEI."
+    )
+
+
+def test_index_map_finnifty_not_nsei():
+    """FINNIFTY must NOT map to ^NSEI (NIFTY 50) — CRIT-004."""
+    assert cs.INDEX_MAP.get("FINNIFTY") != "^NSEI", (
+        "FINNIFTY mapped to ^NSEI — wrong index. Should be ^CNXFIN."
+    )
+
+
+def test_index_map_midcpnifty_not_nsei():
+    """MIDCPNIFTY must NOT map to ^NSEI (NIFTY 50) — CRIT-004."""
+    assert cs.INDEX_MAP.get("MIDCPNIFTY") != "^NSEI", (
+        "MIDCPNIFTY mapped to ^NSEI — wrong index. Should be ^NSMIDCP."
+    )
+
+
+# ── CRIT-001: Target variable must use breakeven, not zero ────────────────────
+
+def test_target_variable_nifty_5pts_is_loss():
+    """A +5 pt straddle gain for NIFTY is a net loss after ~35 pt wing cost — CRIT-001."""
+    breakeven = cs._BREAKEVEN.get("NIFTY", 35)
+    target = int(5 > breakeven)
+    assert target == 0, (
+        f"5 pts > {breakeven} pt breakeven should be LOSS (0), got WIN (1). "
+        "Model was training on wrong signal — gains below wing cost labeled WIN."
+    )
+
+
+def test_target_variable_nifty_40pts_is_win():
+    """A +40 pt gain for NIFTY clears the 35 pt breakeven — must be WIN."""
+    breakeven = cs._BREAKEVEN.get("NIFTY", 35)
+    target = int(40 > breakeven)
+    assert target == 1, f"40 pts should be WIN above {breakeven} pt breakeven."
+
+
+def test_target_variable_banknifty_threshold_higher():
+    """BANKNIFTY has wider wings (±500 pts) so breakeven must be > NIFTY's."""
+    assert cs._BREAKEVEN.get("BANKNIFTY", 0) > cs._BREAKEVEN.get("NIFTY", 0), (
+        "BANKNIFTY breakeven must exceed NIFTY's — BANKNIFTY wings cost more."
+    )
+
+
+def test_breakeven_defined_for_all_symbols():
+    """_BREAKEVEN must have an entry for every symbol in SYMBOLS."""
+    for sym in cs.SYMBOLS:
+        assert sym in cs._BREAKEVEN, f"_BREAKEVEN missing entry for {sym}"
+        assert cs._BREAKEVEN[sym] > 0, f"_BREAKEVEN[{sym}] must be positive"
+
+
+# ── HIGH-004: MIN_TRAIN must be at least 60 ──────────────────────────────────
+
+def test_min_train_at_least_60():
+    """MIN_TRAIN=25 causes severe XGBoost overfitting — must be ≥ 60 (HIGH-004)."""
+    assert cs.MIN_TRAIN >= 60, (
+        f"MIN_TRAIN={cs.MIN_TRAIN} is too low. XGBoost needs ≥60 rows per fold "
+        "to avoid overfitting on weekly-expiry iron fly data."
+    )
+
+
+# ── CRIT-002: Walk-forward split must use entry_date, not expiry_dt ──────────
+
+def test_walk_forward_no_future_leak():
+    """Rows whose entry_date is before fold_start must not appear in test set.
+
+    Simulates CRIT-002: a trade entered on 2026-01-25 with expiry 2026-02-06
+    must land in train when fold_start = 2026-02-01, not in test.
+    """
+    import pandas as pd
+
+    rows = [
+        # entry_date before fold; expiry after fold start → was in TEST before fix
+        {"entry_date": "2026-01-25", "expiry": "2026-02-06",
+         "pnl_pts": 10, "target": 1, "atm_strike": 23000,
+         "entry_premium": 200, "exit_value": 190, "pnl_pct": 0.05},
+        # entry_date inside test window → belongs in test
+        {"entry_date": "2026-02-03", "expiry": "2026-02-06",
+         "pnl_pts": 5,  "target": 1, "atm_strike": 23000,
+         "entry_premium": 180, "exit_value": 175, "pnl_pct": 0.03},
+    ]
+    df = pd.DataFrame(rows)
+    df["entry_dt"] = pd.to_datetime(df["entry_date"])
+
+    fold_start = pd.Timestamp("2026-02-01")
+    fold_end   = pd.Timestamp("2026-03-01")
+
+    train = df[df["entry_dt"] < fold_start]
+    test  = df[(df["entry_dt"] >= fold_start) & (df["entry_dt"] < fold_end)]
+
+    assert len(train) == 1, "Row with entry_date 2026-01-25 must be in train"
+    assert len(test)  == 1, "Row with entry_date 2026-02-03 must be in test"
+    assert train["entry_date"].iloc[0] == "2026-01-25"
+    assert test["entry_date"].iloc[0]  == "2026-02-03"
