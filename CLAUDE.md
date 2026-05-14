@@ -56,7 +56,7 @@ stage  →  CI tests pass  →  auto-merge to master  (daily 17:00 UTC Mon–Fri
 **Instruments** (4 NSE indices, lot sizes as of 2025-10-29 via `market.fo_lot_sizes FINAL`):
 | Symbol      | Lot Size | Weekly Expiry | Wing Points |
 |-------------|----------|---------------|-------------|
-| NIFTY       | 65       | Thursday      | 200 pts     |
+| NIFTY       | 65       | Tuesday       | 200 pts     |
 | BANKNIFTY   | 30       | Wednesday     | 500 pts     |
 | FINNIFTY    | 60       | Tuesday       | 200 pts     |
 | MIDCPNIFTY  | (DB)     | Monday        | TBD         |

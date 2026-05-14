@@ -185,3 +185,210 @@ def test_dashboard_health_recovers_state_when_up():
          patch.object(s, "_send_telegram"):
         s.job_check_dashboard_health()
     assert s._dashboard_was_down is False
+
+
+# ── _is_intraday_market_hours ─────────────────────────────────────────────────
+
+def test_market_hours_true_tuesday_0400_utc():
+    """04:00 UTC on a Tuesday (weekday=1) is inside the 03:30-10:00 window."""
+    import scheduler as s
+    from datetime import datetime as real_dt
+    now = real_dt(2026, 5, 19, 4, 0, 0)   # Tuesday
+    assert s._is_intraday_market_hours(now) is True
+
+
+def test_market_hours_false_tuesday_1030_utc():
+    """10:30 UTC on Tuesday is outside the window (after 10:00)."""
+    import scheduler as s
+    from datetime import datetime as real_dt
+    now = real_dt(2026, 5, 19, 10, 30, 0)   # Tuesday after window
+    assert s._is_intraday_market_hours(now) is False
+
+
+def test_market_hours_false_saturday():
+    """Saturday is not a weekday — no market hours."""
+    import scheduler as s
+    from datetime import datetime as real_dt
+    now = real_dt(2026, 5, 16, 5, 0, 0)   # Saturday 05:00 UTC
+    assert s._is_intraday_market_hours(now) is False
+
+
+def test_market_hours_false_at_midnight():
+    """00:30 UTC on Monday is before the 03:30 window start."""
+    import scheduler as s
+    from datetime import datetime as real_dt
+    now = real_dt(2026, 5, 18, 0, 30, 0)   # Monday 00:30 UTC
+    assert s._is_intraday_market_hours(now) is False
+
+
+# ── auto-deploy market-hours gate ─────────────────────────────────────────────
+
+def test_auto_deploy_no_restart_during_market_hours():
+    """sys.exit must NOT be called when pipeline changes during market hours."""
+    import scheduler as s
+    from datetime import datetime as real_dt
+
+    market_now = real_dt(2026, 5, 19, 4, 0, 0)   # Tuesday 04:00 UTC
+
+    git_result = MagicMock()
+    git_result.returncode = 0
+    git_result.stdout = "abc1234\n"
+
+    diff_result = MagicMock()
+    diff_result.returncode = 0
+    diff_result.stdout = "pipeline/scheduler.py\n"
+
+    def fake_git(args, **kwargs):
+        if "fetch" in args:
+            return git_result
+        if "rev-parse" in args:
+            return git_result
+        if "diff" in args:
+            return diff_result
+        return MagicMock(returncode=0, stdout="")
+
+    with patch.object(s, "_get_last_deployed_sha", return_value="old1234"), \
+         patch.object(s, "_save_deployed_sha"), \
+         patch.object(s, "_git", side_effect=fake_git), \
+         patch.object(s, "_is_intraday_market_hours", return_value=True), \
+         patch.object(s, "_run_tests_and_record"), \
+         patch("sys.exit") as mock_exit:
+        s.job_auto_deploy()
+
+    mock_exit.assert_not_called()
+
+
+def test_auto_deploy_restarts_outside_market_hours():
+    """sys.exit(0) IS called when pipeline changes outside market hours."""
+    import scheduler as s
+
+    git_result = MagicMock()
+    git_result.returncode = 0
+    git_result.stdout = "abc1234\n"
+
+    diff_result = MagicMock()
+    diff_result.returncode = 0
+    diff_result.stdout = "pipeline/scheduler.py\n"
+
+    def fake_git(args, **kwargs):
+        if "fetch" in args:
+            return git_result
+        if "rev-parse" in args:
+            return git_result
+        if "diff" in args:
+            return diff_result
+        return MagicMock(returncode=0, stdout="")
+
+    with patch.object(s, "_get_last_deployed_sha", return_value="old1234"), \
+         patch.object(s, "_save_deployed_sha"), \
+         patch.object(s, "_git", side_effect=fake_git), \
+         patch.object(s, "_is_intraday_market_hours", return_value=False), \
+         patch.object(s, "_run_tests_and_record"), \
+         patch.object(s, "_compose"), \
+         patch("sys.exit") as mock_exit:
+        s.job_auto_deploy()
+
+    mock_exit.assert_called_once_with(0)
+
+
+# ── _startup_recovery intraday recovery ──────────────────────────────────────
+
+def _make_intraday_now():
+    """Return a datetime within the intraday recovery window (05:00 UTC Tuesday)."""
+    from datetime import datetime as real_dt
+    return real_dt(2026, 5, 19, 5, 0, 0)   # Tuesday 05:00 UTC
+
+
+def test_startup_recovery_launches_monitor_if_not_running():
+    """If intraday_monitor is not running during market hours, job must be fired."""
+    import scheduler as s
+
+    def fake_container(name):
+        return False   # nothing running
+
+    with patch.object(s, "datetime") as mock_dt, \
+         patch.object(s, "_container_is_running", side_effect=fake_container), \
+         patch.object(s, "job_intraday_monitor") as mock_monitor, \
+         patch.object(s, "job_option_chain_intraday") as mock_oc, \
+         patch.object(s, "_TRACKING_OK", False), \
+         patch.dict("os.environ", {"CH_PASSWORD": "secret"}):
+        mock_dt.utcnow.return_value = _make_intraday_now()
+        s._startup_recovery()
+
+    mock_monitor.assert_called_once()
+
+
+def test_startup_recovery_skips_monitor_if_already_running():
+    """If intraday_monitor is already running, do not launch a second instance."""
+    import scheduler as s
+
+    def fake_container(name):
+        return True   # everything running
+
+    with patch.object(s, "datetime") as mock_dt, \
+         patch.object(s, "_container_is_running", side_effect=fake_container), \
+         patch.object(s, "job_intraday_monitor") as mock_monitor, \
+         patch.object(s, "_TRACKING_OK", False), \
+         patch.dict("os.environ", {"CH_PASSWORD": "secret"}):
+        mock_dt.utcnow.return_value = _make_intraday_now()
+        s._startup_recovery()
+
+    mock_monitor.assert_not_called()
+
+
+def test_startup_recovery_skips_when_no_ch_password():
+    """If CH_PASSWORD is not set, _startup_recovery must return early (A3)."""
+    import scheduler as s
+    import os
+
+    with patch.object(s, "job_intraday_monitor") as mock_monitor, \
+         patch.object(s, "job_option_chain_intraday") as mock_oc, \
+         patch.dict("os.environ", {}, clear=True):   # no CH_PASSWORD
+        s._startup_recovery()
+
+    mock_monitor.assert_not_called()
+    mock_oc.assert_not_called()
+
+
+# ── job_intraday_post_check ───────────────────────────────────────────────────
+
+def test_post_check_alerts_when_monitor_not_running_and_no_trades():
+    """Alert fires when intraday_monitor is not running and DB shows 0 trades."""
+    import scheduler as s
+
+    ch = MagicMock()
+    ch.query.return_value.result_rows = [(0,)]
+
+    with patch.object(s, "_container_is_running", return_value=False), \
+         patch.object(s, "_ch_client", return_value=ch), \
+         patch.object(s, "_send_telegram") as mock_tg:
+        s.job_intraday_post_check()
+
+    mock_tg.assert_called_once()
+    assert "intraday_monitor" in mock_tg.call_args[0][0]
+
+
+def test_post_check_no_alert_when_monitor_still_running():
+    """No alert when intraday_monitor container is still running (session in progress)."""
+    import scheduler as s
+
+    with patch.object(s, "_container_is_running", return_value=True), \
+         patch.object(s, "_send_telegram") as mock_tg:
+        s.job_intraday_post_check()
+
+    mock_tg.assert_not_called()
+
+
+def test_post_check_no_alert_when_trades_recorded():
+    """No alert when trades were recorded today even if container exited normally."""
+    import scheduler as s
+
+    ch = MagicMock()
+    ch.query.return_value.result_rows = [(3,)]   # 3 trades recorded
+
+    with patch.object(s, "_container_is_running", return_value=False), \
+         patch.object(s, "_ch_client", return_value=ch), \
+         patch.object(s, "_send_telegram") as mock_tg:
+        s.job_intraday_post_check()
+
+    mock_tg.assert_not_called()
