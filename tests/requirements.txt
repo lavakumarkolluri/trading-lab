@@ -9,3 +9,4 @@ minio>=7.0
 xgboost>=2.0
 scikit-learn>=1.4
 numpy>=1.26
+curl_cffi>=0.7
