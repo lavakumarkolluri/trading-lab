@@ -1005,6 +1005,8 @@ elif page == "Model":
         ORDER BY date DESC
     """)
 
+    if scores_df.empty:
+        st.warning("No confidence scores yet. Run: `docker compose run --rm confidence_scorer --score-only`")
     cols = st.columns(4)
     for i, sym in enumerate(SYMBOLS):
         with cols[i]:
@@ -1493,80 +1495,91 @@ elif page == "Model":
             sym_sel_e = st.selectbox("Symbol", ["All"] + sorted(edge_df["symbol"].unique().tolist()), key="edge_sym")
             ev = edge_df if sym_sel_e == "All" else edge_df[edge_df["symbol"] == sym_sel_e]
             ev = ev.copy()
-            ev["expiry_date"] = pd.to_datetime(ev["expiry_date"])
+            if ev.empty:
+                st.info(f"No edge data for {sym_sel_e}.")
+            else:
+                ev["expiry_date"] = pd.to_datetime(ev["expiry_date"])
 
-            # Summary KPIs
-            e1, e2, e3, e4 = st.columns(4)
-            e1.metric("Expiries", len(ev))
-            e2.metric("0DTE Win Rate", f"{ev['win_0dte'].mean():.1%}")
-            e3.metric("1DTE Win Rate", f"{ev['win_1dte'].mean():.1%}")
-            e4.metric("Avg VRP", f"{ev['vrp'].mean():.2f}")
+                # Summary KPIs
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Expiries", len(ev))
+                e2.metric("0DTE Win Rate", f"{ev['win_0dte'].mean():.1%}")
+                e3.metric("1DTE Win Rate", f"{ev['win_1dte'].mean():.1%}")
+                e4.metric("Avg VRP", f"{ev['vrp'].mean():.2f}")
 
-            # Win rate by symbol (summary table)
-            if sym_sel_e == "All":
-                summary = (ev.groupby("symbol").agg(
-                    n=("win_0dte", "count"),
-                    wr_0dte=("win_0dte", "mean"),
-                    wr_1dte=("win_1dte", "mean"),
-                    avg_vrp=("vrp", "mean"),
-                    avg_profit_0dte=("profit_0dte_pts", "mean"),
+                # Win rate by symbol (summary table)
+                if sym_sel_e == "All":
+                    summary = (ev.groupby("symbol").agg(
+                        n=("win_0dte", "count"),
+                        wr_0dte=("win_0dte", "mean"),
+                        wr_1dte=("win_1dte", "mean"),
+                        avg_vrp=("vrp", "mean"),
+                        avg_profit_0dte=("profit_0dte_pts", "mean"),
+                    ).reset_index())
+                    summary["wr_0dte"] = (summary["wr_0dte"] * 100).round(1)
+                    summary["wr_1dte"] = (summary["wr_1dte"] * 100).round(1)
+                    summary.columns = ["Symbol", "N", "0DTE Win%", "1DTE Win%", "Avg VRP", "Avg 0DTE P&L (pts)"]
+                    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+                # VRP vs win scatter
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    st.markdown("**VRP vs 0DTE Profit**")
+                    fig_e1 = px.scatter(
+                        ev, x="vrp", y="profit_0dte_pts",
+                        color="symbol" if sym_sel_e == "All" else "day_of_week",
+                        opacity=0.6, height=300,
+                        labels={"vrp": "VRP (impl - realised)", "profit_0dte_pts": "0DTE P&L (pts)"},
+                    )
+                    fig_e1.add_hline(y=0, line_dash="dash", line_color="gray")
+                    fig_e1.add_vline(x=0, line_dash="dash", line_color="gray")
+                    st.plotly_chart(fig_e1, use_container_width=True)
+
+                with col_e2:
+                    st.markdown("**IV Rank vs 0DTE Win Rate (by quartile)**")
+                    n_unique_ivr = ev["iv_rank"].nunique()
+                    if n_unique_ivr < 2:
+                        st.info("Not enough IV rank diversity for quartile chart.")
+                    else:
+                        _q_labels_all = ["Q1 (Low)", "Q2", "Q3", "Q4 (High)"]
+                        _, _ivr_bins = pd.qcut(ev["iv_rank"], q=min(4, n_unique_ivr),
+                                               retbins=True, duplicates="drop")
+                        _n_bins = len(_ivr_bins) - 1
+                        ev["iv_rank_q"] = pd.qcut(ev["iv_rank"], q=min(4, n_unique_ivr),
+                                                   labels=_q_labels_all[:_n_bins],
+                                                   duplicates="drop")
+                        ivq = (ev.groupby("iv_rank_q", observed=True)
+                                 .agg(wr=("win_0dte", "mean"), n=("win_0dte", "count"))
+                                 .reset_index())
+                        fig_e2 = go.Figure(go.Bar(
+                            x=ivq["iv_rank_q"].astype(str),
+                            y=(ivq["wr"] * 100).round(1),
+                            text=ivq["n"].astype(str) + " trades",
+                            textposition="outside",
+                            marker_color="#3498db",
+                        ))
+                        fig_e2.add_hline(y=50, line_dash="dash", line_color="gray",
+                                         annotation_text="50%")
+                        fig_e2.update_layout(height=300, yaxis_title="Win Rate %", yaxis_range=[0, 110])
+                        st.plotly_chart(fig_e2, use_container_width=True)
+
+                # Win rate by day of week
+                dow = (ev.groupby("day_of_week").agg(
+                    wr_0dte=("win_0dte", "mean"), n=("win_0dte", "count")
                 ).reset_index())
-                summary["wr_0dte"] = (summary["wr_0dte"] * 100).round(1)
-                summary["wr_1dte"] = (summary["wr_1dte"] * 100).round(1)
-                summary.columns = ["Symbol", "N", "0DTE Win%", "1DTE Win%", "Avg VRP", "Avg 0DTE P&L (pts)"]
-                st.dataframe(summary, use_container_width=True, hide_index=True)
-
-            # VRP vs win scatter
-            col_e1, col_e2 = st.columns(2)
-            with col_e1:
-                st.markdown("**VRP vs 0DTE Profit**")
-                fig_e1 = px.scatter(
-                    ev, x="vrp", y="profit_0dte_pts",
-                    color="symbol" if sym_sel_e == "All" else "day_of_week",
-                    opacity=0.6, height=300,
-                    labels={"vrp": "VRP (impl - realised)", "profit_0dte_pts": "0DTE P&L (pts)"},
-                )
-                fig_e1.add_hline(y=0, line_dash="dash", line_color="gray")
-                fig_e1.add_vline(x=0, line_dash="dash", line_color="gray")
-                st.plotly_chart(fig_e1, use_container_width=True)
-
-            with col_e2:
-                st.markdown("**IV Rank vs 0DTE Win Rate (by quartile)**")
-                ev["iv_rank_q"] = pd.qcut(ev["iv_rank"], q=4,
-                                           labels=["Q1 (Low)", "Q2", "Q3", "Q4 (High)"],
-                                           duplicates="drop")
-                ivq = (ev.groupby("iv_rank_q", observed=True)
-                         .agg(wr=("win_0dte", "mean"), n=("win_0dte", "count"))
-                         .reset_index())
-                fig_e2 = go.Figure(go.Bar(
-                    x=ivq["iv_rank_q"].astype(str),
-                    y=(ivq["wr"] * 100).round(1),
-                    text=ivq["n"].astype(str) + " trades",
+                dow["wr_0dte_pct"] = (dow["wr_0dte"] * 100).round(1)
+                fig_e3 = go.Figure(go.Bar(
+                    x=dow["day_of_week"],
+                    y=dow["wr_0dte_pct"],
+                    text=dow["n"].astype(str) + " trades",
                     textposition="outside",
-                    marker_color="#3498db",
+                    marker_color="#2ecc71",
                 ))
-                fig_e2.add_hline(y=50, line_dash="dash", line_color="gray",
-                                  annotation_text="50%")
-                fig_e2.update_layout(height=300, yaxis_title="Win Rate %", yaxis_range=[0, 110])
-                st.plotly_chart(fig_e2, use_container_width=True)
-
-            # Win rate by day of week
-            dow = (ev.groupby("day_of_week").agg(
-                wr_0dte=("win_0dte", "mean"), n=("win_0dte", "count")
-            ).reset_index())
-            dow["wr_0dte_pct"] = (dow["wr_0dte"] * 100).round(1)
-            fig_e3 = go.Figure(go.Bar(
-                x=dow["day_of_week"],
-                y=dow["wr_0dte_pct"],
-                text=dow["n"].astype(str) + " trades",
-                textposition="outside",
-                marker_color="#2ecc71",
-            ))
-            fig_e3.add_hline(y=50, line_dash="dash", line_color="gray",
-                              annotation_text="50% baseline")
-            fig_e3.update_layout(height=280, title="0DTE Win Rate by Day of Week",
-                                  yaxis_title="Win Rate %", yaxis_range=[0, 110])
-            st.plotly_chart(fig_e3, use_container_width=True)
+                fig_e3.add_hline(y=50, line_dash="dash", line_color="gray",
+                                 annotation_text="50% baseline")
+                fig_e3.update_layout(height=280, title="0DTE Win Rate by Day of Week",
+                                     yaxis_title="Win Rate %", yaxis_range=[0, 110])
+                st.plotly_chart(fig_e3, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
