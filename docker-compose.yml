@@ -920,6 +920,48 @@ services:
     entrypoint: ["python", "monitor_agent.py"]
     command: []
 
+  pipeline_watchdog:
+    build: *pipeline-build
+    container_name: pipeline_watchdog
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/trading-lab:ro
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - COMPOSE_FILE=/trading-lab/docker-compose.yml
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TZ=Asia/Kolkata
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    entrypoint: ["python", "pipeline_watchdog.py"]
+    command: []
+
+  pre_market_check:
+    build: *pipeline-build
+    container_name: pre_market_check
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TZ=Asia/Kolkata
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "pre_market_check.py"]
+    command: []
+
   scheduler:
     build: *pipeline-build
     container_name: scheduler

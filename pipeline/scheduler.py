@@ -757,6 +757,60 @@ def job_check_dashboard_health():
             _dashboard_was_down = False
 
 
+_watchdog_was_down = False
+
+
+def job_check_watchdog_health():
+    """Every-15-min check: alert via Telegram if the pipeline_watchdog container is not running."""
+    global _watchdog_was_down
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format={{.State.Status}}", "trading-lab-pipeline_watchdog-1"],
+            capture_output=True, text=True, timeout=10,
+        )
+        status = result.stdout.strip()
+    except Exception as e:
+        log.warning("Watchdog health check failed: %s", e)
+        return
+
+    if status != "running":
+        if not _watchdog_was_down:
+            msg = f"🚨 Pipeline watchdog is DOWN — status: {status or 'not found'}"
+            log.warning(msg)
+            _send_telegram(msg)
+            _watchdog_was_down = True
+    else:
+        if _watchdog_was_down:
+            log.info("Pipeline watchdog is back UP")
+            _watchdog_was_down = False
+
+
+def job_pre_market_check():
+    """Mon–Fri 03:00 UTC (08:30 IST) — GO/NO-GO readiness gate before market open."""
+    log.info("=== Pre-market system readiness check ===")
+    _run("pre_market_check")
+
+
+def job_cleanup_kpi_check():
+    """Daily 10:00 UTC — alert if any cleanup task has not run in >10 days."""
+    if not _TRACKING_OK:
+        return
+    try:
+        ch = _ch_client()
+        rows = ch.query(
+            "SELECT task_name, max(ran_at) AS last_ran "
+            "FROM system_meta.cleanup_log GROUP BY task_name"
+        ).result_rows
+    except Exception as e:
+        log.warning("Cleanup KPI check failed: %s", e)
+        return
+    now = datetime.utcnow()
+    for task, last_ran in rows:
+        age_days = (now - last_ran).days if last_ran else 999
+        if age_days > 10:
+            _send_telegram(f"⚠️ Cleanup overdue: {task} last ran {age_days}d ago")
+
+
 def _startup_recovery():
     """
     On scheduler restart, check if today's critical EOD jobs were missed.
@@ -870,6 +924,9 @@ def main():
     log.info("  FII/DII + ParticOI  : Mon-Fri 10:45 UTC (16:15 IST) pre-feed for meta_pipeline")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
     log.info("  Dashboard health    : every 15 min — Telegram alert if container down")
+    log.info("  Watchdog health     : every 15 min — Telegram alert if watchdog container down")
+    log.info("  Pre-market check    : Mon–Fri 03:00 UTC (08:30 IST) — GO/NO-GO before open")
+    log.info("  Cleanup KPI check   : daily 10:00 UTC — alert if cleanup overdue >10 days")
     log.info("  Auto-deploy         : every 15 min — git pull + rebuild on change")
 
     # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
@@ -944,6 +1001,17 @@ def main():
     # Dashboard health check: every 15 min, always-on (not market-hours gated)
     schedule.every(15).minutes.do(job_check_dashboard_health)
     job_check_dashboard_health()  # check immediately on startup
+
+    # Watchdog health check: every 15 min
+    schedule.every(15).minutes.do(job_check_watchdog_health)
+    job_check_watchdog_health()  # check immediately on startup
+
+    # Pre-market GO/NO-GO check: 08:30 IST (03:00 UTC) Mon–Fri
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("03:00").do(job_pre_market_check)
+
+    # Cleanup KPI check: daily 10:00 UTC
+    schedule.every().day.at("10:00").do(job_cleanup_kpi_check)
 
     # Auto-deploy: pull master every 15 min, rebuild+restart if code changed
     schedule.every(15).minutes.do(job_auto_deploy)
