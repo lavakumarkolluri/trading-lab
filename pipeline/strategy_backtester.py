@@ -294,12 +294,12 @@ def compute_iron_fly(idx, entry_date, expiry, atm,
         return None
     max_loss = wing_m * step - net_credit
 
-    xsce = get_ltp(idx, expiry, expiry, atm, "CE")
-    xspe = get_ltp(idx, expiry, expiry, atm, "PE")
-    xlce = get_ltp(idx, expiry, expiry, atm + wing_m * step, "CE")
-    xlpe = get_ltp(idx, expiry, expiry, atm - wing_m * step, "PE")
-    if any(v is None for v in (xsce, xspe, xlce, xlpe)):
-        return None
+    # Settlement: missing = option expired OTM (worthless = 0.0).
+    # load_chain filters ltp > 0.05, so deep-OTM legs are absent on expiry day.
+    xsce = get_ltp(idx, expiry, expiry, atm, "CE") or 0.0
+    xspe = get_ltp(idx, expiry, expiry, atm, "PE") or 0.0
+    xlce = get_ltp(idx, expiry, expiry, atm + wing_m * step, "CE") or 0.0
+    xlpe = get_ltp(idx, expiry, expiry, atm - wing_m * step, "PE") or 0.0
     exit_cost = (xsce + xspe) - (xlce + xlpe)
     pnl = max(net_credit - exit_cost, -max_loss) if max_loss > 0 else net_credit - exit_cost
 

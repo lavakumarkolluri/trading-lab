@@ -257,12 +257,24 @@ def test_iron_fly_returns_none_when_debit():
     assert r is None
 
 
-def test_iron_fly_returns_none_on_missing_leg():
-    """Missing settlement price for any leg → return None."""
+def test_iron_fly_missing_settlement_treated_as_zero():
+    """Missing settlement price = option expired OTM (value 0), not a skip."""
     entry  = date(2025, 5, 6)
     expiry = date(2025, 5, 13)
     prices = _if_prices(entry, expiry)
-    del prices[(expiry, expiry, 24200.0, "CE")]   # remove wing CE settlement
+    del prices[(expiry, expiry, 24200.0, "CE")]   # wing CE expired OTM, absent in DB
+    idx = _make_idx(prices)
+    r = bt.compute_iron_fly(idx, entry, expiry, 24000, 50, "NIFTY")
+    assert r is not None
+    assert r["long_ce_settle"] == pytest.approx(0.0)  # treated as worthless
+
+
+def test_iron_fly_returns_none_on_missing_entry_leg():
+    """Missing entry-day price (not settlement) → return None."""
+    entry  = date(2025, 5, 6)
+    expiry = date(2025, 5, 13)
+    prices = _if_prices(entry, expiry)
+    del prices[(entry, expiry, 24200.0, "CE")]   # missing entry price → can't size trade
     idx = _make_idx(prices)
     r = bt.compute_iron_fly(idx, entry, expiry, 24000, 50, "NIFTY")
     assert r is None
