@@ -11,6 +11,8 @@ Usage:
 """
 
 import os
+import logging
+from datetime import datetime, timezone
 import clickhouse_connect
 from minio import Minio
 
@@ -37,3 +39,16 @@ def ch_client():
 
 def minio_client() -> Minio:
     return Minio(MINIO_HOST, access_key=MINIO_USER, secret_key=MINIO_PASSWORD, secure=False)
+
+
+def write_alert_log(ch, source: str, level: str, message: str) -> None:
+    """Write an alert entry to system_meta.alert_log. Silent on failure."""
+    try:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        ch.insert(
+            "system_meta.alert_log",
+            [[now, source, level, message[:500]]],
+            column_names=["alert_time", "source", "level", "message"],
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning("alert_log write failed: %s", e)

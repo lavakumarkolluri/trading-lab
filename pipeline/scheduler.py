@@ -55,8 +55,32 @@ _COMPOSE_BASE = [
     "--project-directory", _PROJECT_DIR,
 ]
 
-from ch_utils import ch_client as _ch_client, GIT_SHA
+from ch_utils import ch_client as _ch_client, GIT_SHA, write_alert_log
 _TRACKING_OK = True
+
+_TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+def _send_telegram(msg: str) -> None:
+    try:
+        ch = _ch_client()
+        write_alert_log(ch, "scheduler", "CRIT", msg)
+    except Exception:
+        pass
+    if not (_TG_TOKEN and _TG_CHAT_ID):
+        log.info("Telegram not configured — would send: %s", msg[:80])
+        return
+    try:
+        import urllib.request, json as _json
+        payload = _json.dumps({"chat_id": _TG_CHAT_ID, "text": msg}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage",
+            data=payload, headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        log.warning("Telegram send failed: %s", e)
 
 
 def _record_run(service: str, started_at: datetime, status: str,
@@ -705,6 +729,34 @@ def job_data_freshness_check():
     _run("data_freshness_check")
 
 
+_dashboard_was_down = False  # track transitions to avoid repeat alerts
+
+
+def job_check_dashboard_health():
+    """Every-15-min check: alert via Telegram if the dashboard container is not running."""
+    global _dashboard_was_down
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format={{.State.Status}}", "trading-lab-dashboard-1"],
+            capture_output=True, text=True, timeout=10,
+        )
+        status = result.stdout.strip()
+    except Exception as e:
+        log.warning("Dashboard health check failed: %s", e)
+        return
+
+    if status != "running":
+        if not _dashboard_was_down:
+            msg = f"🚨 Dashboard container is DOWN — status: {status or 'not found'}"
+            log.warning(msg)
+            _send_telegram(msg)
+            _dashboard_was_down = True
+    else:
+        if _dashboard_was_down:
+            log.info("Dashboard container is back UP")
+            _dashboard_was_down = False
+
+
 def _startup_recovery():
     """
     On scheduler restart, check if today's critical EOD jobs were missed.
@@ -817,6 +869,7 @@ def main():
     log.info("  Strategy recommend  : Mon-Thu 10:30 UTC (16:00 IST) --recommend")
     log.info("  FII/DII + ParticOI  : Mon-Fri 10:45 UTC (16:15 IST) pre-feed for meta_pipeline")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
+    log.info("  Dashboard health    : every 15 min — Telegram alert if container down")
     log.info("  Auto-deploy         : every 15 min — git pull + rebuild on change")
 
     # Intraday option chain: start at 09:10 IST (03:40 UTC), self-exits at 15:35 IST
@@ -887,6 +940,10 @@ def main():
 
     # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
     schedule.every().day.at("04:00").do(job_holidays)
+
+    # Dashboard health check: every 15 min, always-on (not market-hours gated)
+    schedule.every(15).minutes.do(job_check_dashboard_health)
+    job_check_dashboard_health()  # check immediately on startup
 
     # Auto-deploy: pull master every 15 min, rebuild+restart if code changed
     schedule.every(15).minutes.do(job_auto_deploy)

@@ -19,7 +19,7 @@ import argparse
 import subprocess
 from datetime import datetime, date, timedelta
 
-from ch_utils import ch_client as get_ch
+from ch_utils import ch_client as get_ch, write_alert_log
 from logging_utils import get_logger
 
 log = get_logger(__name__)
@@ -31,8 +31,12 @@ _COMPOSE_CMD  = ["docker", "compose", "-f", _COMPOSE_FILE, "--project-directory"
 _TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+_ch_ref = None  # set in main() so _send_telegram() can write to alert_log
 
-def _send_telegram(msg: str):
+
+def _send_telegram(msg: str, level: str = "WARN"):
+    if _ch_ref is not None:
+        write_alert_log(_ch_ref, "data_freshness_check", level, msg)
     if not (_TG_TOKEN and _TG_CHAT_ID):
         return
     try:
@@ -164,7 +168,9 @@ def main():
     args = parser.parse_args()
 
     log.info("=== Data Freshness Check ===")
+    global _ch_ref
     ch = get_ch()
+    _ch_ref = ch
 
     all_issues = []
     all_issues.extend(_check_ohlcv(ch))

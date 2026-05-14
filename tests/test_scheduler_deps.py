@@ -133,3 +133,55 @@ def test_upstream_ok_returns_true_when_tracking_disabled():
     with patch.object(s, "_TRACKING_OK", False):
         ok, reason = s._upstream_ok("confidence_scorer", "2026-05-13")
     assert ok is True
+
+
+# ── job_check_dashboard_health ────────────────────────────────────────────────
+
+def test_dashboard_health_sends_alert_when_down():
+    """Alert is sent when docker inspect returns non-running status."""
+    import scheduler as s
+    s._dashboard_was_down = False  # reset state
+    result = MagicMock()
+    result.stdout = "exited\n"
+    result.returncode = 0
+    with patch("subprocess.run", return_value=result), \
+         patch.object(s, "_send_telegram") as mock_tg:
+        s.job_check_dashboard_health()
+    mock_tg.assert_called_once()
+    assert "DOWN" in mock_tg.call_args[0][0]
+
+
+def test_dashboard_health_no_alert_when_running():
+    """No alert when dashboard is running."""
+    import scheduler as s
+    s._dashboard_was_down = False
+    result = MagicMock()
+    result.stdout = "running\n"
+    with patch("subprocess.run", return_value=result), \
+         patch.object(s, "_send_telegram") as mock_tg:
+        s.job_check_dashboard_health()
+    mock_tg.assert_not_called()
+
+
+def test_dashboard_health_alert_only_once_while_down():
+    """Alert fires once on transition to down, not on every poll."""
+    import scheduler as s
+    s._dashboard_was_down = True  # already alerted
+    result = MagicMock()
+    result.stdout = "exited\n"
+    with patch("subprocess.run", return_value=result), \
+         patch.object(s, "_send_telegram") as mock_tg:
+        s.job_check_dashboard_health()
+    mock_tg.assert_not_called()
+
+
+def test_dashboard_health_recovers_state_when_up():
+    """_dashboard_was_down resets to False when container comes back up."""
+    import scheduler as s
+    s._dashboard_was_down = True
+    result = MagicMock()
+    result.stdout = "running\n"
+    with patch("subprocess.run", return_value=result), \
+         patch.object(s, "_send_telegram"):
+        s.job_check_dashboard_health()
+    assert s._dashboard_was_down is False

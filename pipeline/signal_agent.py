@@ -7,7 +7,7 @@ Reads today's scores from analysis.confidence_scores, parses the features_json,
 and sends a plain-English Telegram summary explaining WHY each symbol's
 confidence score is what it is.
 
-Read-only: never writes to ClickHouse.
+Writes to system_meta.alert_log after Telegram send.
 """
 
 import os
@@ -17,7 +17,7 @@ import zoneinfo
 import argparse
 from datetime import date
 
-from ch_utils import ch_client
+from ch_utils import ch_client, write_alert_log
 from logging_utils import get_logger
 
 log = get_logger(__name__)
@@ -30,7 +30,12 @@ _TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
-def _send(msg: str) -> None:
+_ch_ref = None
+
+
+def _send(msg: str, level: str = "INFO") -> None:
+    if _ch_ref is not None:
+        write_alert_log(_ch_ref, "signal_agent", level, msg)
     if not (_TG_TOKEN and _TG_CHAT_ID):
         print(msg)
         return
@@ -216,7 +221,9 @@ def main():
     score_date = date.fromisoformat(args.date)
     log.info("Signal Agent: fetching scores for %s", score_date)
 
+    global _ch_ref
     ch = ch_client()
+    _ch_ref = ch
     scores = fetch_today_scores(ch, score_date)
 
     if not scores:

@@ -5,3 +5,4 @@ clickhouse-connect
 numpy
 cryptography
 docker
+openpyxl>=3.1

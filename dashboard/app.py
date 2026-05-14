@@ -155,6 +155,7 @@ def _to_ist_str(dt) -> str:
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("📈 Trading Lab")
+st.sidebar.caption(f"🟢 Live · {datetime.now(IST).strftime('%H:%M IST')}")
 if st.sidebar.button("🔄 Refresh"):
     st.cache_data.clear()
     st.rerun()
@@ -508,9 +509,9 @@ if page == "System Health":
     st.divider()
 
     # ── Confidence Scores ─────────────────────────────────────────────────────
-    st.subheader("Confidence Scores")
+    st.subheader("🧠 Confidence Scores")
     scores_df = query("""
-        SELECT symbol, score_date, confidence
+        SELECT symbol, score_date, confidence, expected_pnl_pct, features_json
         FROM analysis.confidence_scores FINAL
         WHERE score_date >= today() - 7
         ORDER BY symbol, score_date DESC
@@ -522,25 +523,38 @@ if page == "System Health":
         scores_df["score_date"] = pd.to_datetime(scores_df["score_date"]).dt.date
         latest_scores = scores_df.groupby("symbol").first().reset_index()
 
-        cols = st.columns(4)
-        for i, sym in enumerate(SYMBOLS):
+        score_rows = []
+        for sym in SYMBOLS:
             row = latest_scores[latest_scores["symbol"] == sym]
-            with cols[i]:
-                if row.empty:
-                    st.metric(sym, "—", delta="NO SCORE")
-                    st.write("🔴 Never scored")
-                else:
-                    r = row.iloc[0]
-                    conf     = float(r["confidence"])
-                    age_days = (today - r["score_date"]).days
-                    signal_ok = conf >= MIN_CONFIDENCE
-                    icon     = traffic_light(age_days == 0, age_days <= 1)
-                    st.metric(
-                        label=f"{icon} {sym}",
-                        value=f"{conf:.0f}/100",
-                        delta=f"{'✅ GO' if signal_ok else '❌ NO-GO'} · {age_days}d ago",
-                        delta_color="normal" if signal_ok else "inverse",
-                    )
+            if row.empty:
+                score_rows.append({
+                    "🎯 Symbol": sym, "📊 Confidence": "—", "🚦 Gate": "🔴 NO-GO",
+                    "📈 Exp P&L": "—", "📅 Score Date": "—",
+                    "🔬 IV Rank": "—", "🌡️ VIX": "—", "📉 PCR": "—",
+                    "⚠️ Missing": "no score",
+                })
+            else:
+                r = row.iloc[0]
+                conf     = float(r["confidence"])
+                age_days = (today - r["score_date"]).days
+                age_flag = "" if age_days == 0 else f" 🔴{age_days}d" if age_days > 1 else f" 🟡{age_days}d"
+                try:
+                    feats = json.loads(str(r.get("features_json", "") or "{}"))
+                except Exception:
+                    feats = {}
+                miss = missing_features(str(r.get("features_json", "") or ""))
+                score_rows.append({
+                    "🎯 Symbol":   sym,
+                    "📊 Confidence": f"{conf:.0f}/100",
+                    "🚦 Gate":     "🟢 GO" if conf >= MIN_CONFIDENCE else "🔴 NO-GO",
+                    "📈 Exp P&L":  f"{float(r.get('expected_pnl_pct', 0)):+.1f}%",
+                    "📅 Score Date": str(r["score_date"]) + age_flag,
+                    "🔬 IV Rank":  f"{feats.get('iv_rank', 0):.0f}" if feats.get("iv_rank") else "—",
+                    "🌡️ VIX":      f"{feats.get('vix', 0):.1f}" if feats.get("vix") else "—",
+                    "📉 PCR":      f"{feats.get('pcr_oi', 0):.2f}" if feats.get("pcr_oi") else "—",
+                    "⚠️ Missing":  ", ".join(miss) if miss else "—",
+                })
+        st.dataframe(pd.DataFrame(score_rows), use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -876,6 +890,37 @@ if page == "System Health":
                     )
                 else:
                     st.caption(f"System tables total: {_smb:.0f} MB — within normal range.")
+
+    st.divider()
+
+    # ── Alert Log ─────────────────────────────────────────────────────────────
+    st.subheader("🔔 Alert Log")
+    st.caption("Last 50 Telegram alerts sent by any agent.")
+    alert_df = query("""
+        SELECT alert_time, source, level, message
+        FROM system_meta.alert_log FINAL
+        ORDER BY alert_time DESC
+        LIMIT 50
+    """)
+
+    if alert_df.empty:
+        st.info("No alerts logged yet — agents write here after each Telegram send.")
+    else:
+        _level_icon = {"INFO": "🔵", "WARN": "🟡", "CRIT": "🔴"}
+        alert_rows = []
+        for _, r in alert_df.iterrows():
+            ts_utc = pd.Timestamp(r["alert_time"])
+            if ts_utc.tzinfo is None:
+                ts_utc = ts_utc.tz_localize("UTC")
+            ts_ist = ts_utc.astimezone("Asia/Kolkata").strftime("%d-%b %H:%M IST")
+            lvl = str(r["level"])
+            alert_rows.append({
+                "🕐 Time":     ts_ist,
+                "🤖 Source":   str(r["source"]),
+                "🚦 Level":    _level_icon.get(lvl, "⚪") + " " + lvl,
+                "💬 Message":  str(r["message"])[:120],
+            })
+        st.dataframe(pd.DataFrame(alert_rows), use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1487,27 +1532,101 @@ elif page == "Model":
 # PAGE 3 — TRADE LOG
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "Trade Log":
+    import io as _io
     st.title("💼 Trade Log")
-    st.caption("Paper trades — iron fly 0DTE. Will expand to live trades.")
+    st.caption("Paper trades — iron fly 0DTE.")
 
     _BROKERAGE    = 20.0
     _STT_PCT      = 0.0005
     _EXCHANGE_PCT = 0.0005
     _GST          = 0.18
 
+    def est_txn_cost_itemized(entry_premium: float, wing_cost: float,
+                              lot_size: int, lots: int, is_iron_fly: bool) -> dict:
+        n_orders = 8 if is_iron_fly else 4
+        brok  = round(n_orders * _BROKERAGE * (1 + _GST), 2)
+        stt   = round(entry_premium * _STT_PCT * lot_size * lots * 2, 2)
+        total_prem = (entry_premium + wing_cost) * lot_size * lots
+        exch  = round(total_prem * _EXCHANGE_PCT * 2, 2)
+        return {"brok": brok, "stt": stt, "exch": exch, "total": round(brok + stt + exch, 2)}
+
     def est_txn_cost(entry_premium: float, wing_cost: float,
                      lot_size: int, lots: int, is_iron_fly: bool) -> float:
-        n_orders = 8 if is_iron_fly else 4
-        brok  = n_orders * _BROKERAGE * (1 + _GST)
-        stt   = entry_premium * _STT_PCT * lot_size * lots * 2
-        total_prem = (entry_premium + wing_cost) * lot_size * lots
-        exch  = total_prem * _EXCHANGE_PCT * 2
-        return round(brok + stt + exch)
+        return est_txn_cost_itemized(entry_premium, wing_cost, lot_size, lots, is_iron_fly)["total"]
 
     _IST = pd.Timedelta(hours=5, minutes=30)
 
-    # ── Open Positions ────────────────────────────────────────────────────────
-    st.subheader("Open Positions")
+    def _excel_bytes(df: pd.DataFrame) -> bytes:
+        buf = _io.BytesIO()
+        df.to_excel(buf, index=False, engine="openpyxl")
+        return buf.getvalue()
+
+    def _exit_emoji(reason: str) -> str:
+        return {"target": "🎯", "stop": "🛑", "eod": "🕐", "trail": "🔒"}.get(str(reason), "📤")
+
+    # ── D1: Summary Banner ────────────────────────────────────────────────────
+    st.subheader("📊 Summary")
+    all_trades_df = query("""
+        SELECT entry_time, exit_time, exit_reason,
+               entry_premium, exit_premium,
+               pnl_inr, lot_size, lots,
+               wing_ce_strike, wing_ce_ltp, wing_pe_ltp, net_premium
+        FROM trades.trade_outcomes FINAL
+        ORDER BY exit_time DESC
+    """)
+
+    if not all_trades_df.empty:
+        def _add_costs(df):
+            df = df.copy()
+            def _cost_row(r):
+                is_fly = float(r.get("wing_ce_strike", 0) or 0) > 0
+                wc = float(r.get("wing_ce_ltp", 0) or 0) + float(r.get("wing_pe_ltp", 0) or 0)
+                return est_txn_cost(float(r["entry_premium"]), wc,
+                                    int(r["lot_size"]), int(r.get("lots", 1)), is_fly)
+            df["txn_cost"] = df.apply(_cost_row, axis=1)
+            df["net_pnl"]  = df["pnl_inr"] - df["txn_cost"]
+            return df
+
+        all_trades_df["exit_time"] = pd.to_datetime(all_trades_df["exit_time"])
+        all_trades_df["entry_time"] = pd.to_datetime(all_trades_df["entry_time"])
+        atdf = _add_costs(all_trades_df)
+        now_ist_ts = pd.Timestamp.now(tz="Asia/Kolkata")
+
+        def _period_stats(mask, label):
+            sub = atdf[mask]
+            if sub.empty:
+                return {"Period": label, "💰 Net P&L": "—", "🎯 Win Rate": "—",
+                        "💸 Costs": "—", "📊 Trades": 0}
+            wins = int((sub["net_pnl"] > 0).sum())
+            n    = len(sub)
+            return {
+                "Period":      label,
+                "💰 Net P&L":  fmt_inr(float(sub["net_pnl"].sum())),
+                "🎯 Win Rate": f"{wins}/{n} ({wins/n*100:.0f}%)" if n else "—",
+                "💸 Costs":    fmt_inr(float(sub["txn_cost"].sum())),
+                "📊 Trades":   n,
+            }
+
+        today_mask  = atdf["exit_time"].dt.date == now_ist_ts.date()
+        week_start  = now_ist_ts.date() - pd.Timedelta(days=now_ist_ts.weekday())
+        week_mask   = atdf["exit_time"].dt.date >= week_start
+        month_mask  = ((atdf["exit_time"].dt.year == now_ist_ts.year) &
+                       (atdf["exit_time"].dt.month == now_ist_ts.month))
+
+        summary_rows = [
+            _period_stats(today_mask, "📅 Today"),
+            _period_stats(week_mask,  "📆 This Week"),
+            _period_stats(month_mask, "🗓️ This Month"),
+            _period_stats(pd.Series([True]*len(atdf), index=atdf.index), "🏦 All-Time"),
+        ]
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No completed trades yet.")
+
+    st.divider()
+
+    # ── D2: Open Positions ────────────────────────────────────────────────────
+    st.subheader("📂 Open Positions")
     if st.button("🔄 Refresh positions", key="refresh_pos"):
         query_live.clear()
     open_df = query_live("""
@@ -1518,6 +1637,7 @@ elif page == "Trade Log":
                scorecard_conf,
                wing_ce_strike, wing_pe_strike, wing_ce_ltp, wing_pe_ltp, net_premium
         FROM trades.open_positions FINAL
+        WHERE status = 'open'
         ORDER BY entry_time DESC
     """)
 
@@ -1563,35 +1683,63 @@ elif page == "Trade Log":
                            else float(r["entry_premium"]))
             lot_size  = int(r["lot_size"])
             lots      = int(r.get("lots", 1))
+            wing_cost = float(r.get("wing_ce_ltp", 0) or 0) + float(r.get("wing_pe_ltp", 0) or 0)
+            hedge_cost_inr = wing_cost * lot_size * lots
+            wing_dist = abs(wce - strike) if is_fly else 0
+            max_loss_inr = (wing_dist - entry_value) * lot_size * lots if is_fly else None
+            margin_est   = max_loss_inr * 1.10 if max_loss_inr is not None else entry_value * lot_size * 2 * 0.30
+
             unreal_pts = (entry_value - curr_net) if curr_net is not None else None
             unreal_inr = (unreal_pts * lot_size * lots) if curr_net is not None else None
-            wing_cost  = float(r.get("wing_ce_ltp", 0) or 0) + float(r.get("wing_pe_ltp", 0) or 0)
             txn_cost   = est_txn_cost(float(r["entry_premium"]), wing_cost, lot_size, lots, is_fly)
             net_inr    = (unreal_inr - txn_cost) if unreal_inr is not None else None
 
+            entry_dt = pd.to_datetime(r["entry_time"]) + _IST
+            dur_min  = int((datetime.now() - entry_dt.to_pydatetime()).total_seconds() // 60)
+            dur_str  = f"{dur_min // 60}h {dur_min % 60}m" if dur_min >= 60 else f"{dur_min}m"
+
+            target_pct = (unreal_inr / float(r["target_inr"]) * 100) if (unreal_inr and float(r["target_inr"])) else 0
+            stop_pct   = (abs(unreal_inr) / float(r["stoploss_inr"]) * 100) if (unreal_inr and unreal_inr < 0 and float(r["stoploss_inr"])) else 0
+            alert_tag  = ("🔒 Trailing" if r["trailing_active"]
+                          else "🎯 Near target" if target_pct > 70
+                          else "🛑 Near stop" if stop_pct > 70
+                          else "📈 Normal")
+
             rows.append({
-                "Symbol":     sym,
-                "ATM":        f"{int(strike)}",
-                "Wing CE":    f"{int(wce)}" if is_fly else "—",
-                "Wing PE":    f"{int(wpe)}" if is_fly else "—",
-                "Expiry":     expiry,
-                "Entry":      (pd.to_datetime(r["entry_time"]) + _IST).strftime("%d-%b %I:%M %p"),
+                "🎯 Symbol":   sym,
+                "ATM Strike": int(strike),
+                "Wing CE ↑":  int(wce) if is_fly else "—",
+                "Wing PE ↓":  int(wpe) if is_fly else "—",
+                "📅 Expiry":  expiry,
+                "⏱️ Duration": dur_str,
+                "Entry IST":  entry_dt.strftime("%d-%b %H:%M"),
                 "Net Prem":   f"{entry_value:.1f}",
                 "Lots":       lots,
-                "Conf":       f"{r['scorecard_conf']:.0f}",
-                "Target":     fmt_inr(float(r["target_inr"])),
-                "Stop":       fmt_inr(float(r["stoploss_inr"])),
-                "Gross P&L":  (f"{'+' if unreal_inr>=0 else ''}₹{unreal_inr:.0f} ({unreal_pts:+.1f}pts)"
+                "📊 Conf":    int(float(r["scorecard_conf"])),
+                "🎯 Target":  fmt_inr(float(r["target_inr"])),
+                "🛑 Stop":    fmt_inr(float(r["stoploss_inr"])),
+                "💼 Hedge ₹": f"₹{hedge_cost_inr:.0f}" if is_fly else "—",
+                "📐 Max Loss":fmt_inr(max_loss_inr) if max_loss_inr is not None else "∞",
+                "📊 Margin":  fmt_inr(margin_est),
+                "Gross P&L":  (f"{'+' if unreal_inr>=0 else ''}₹{unreal_inr:.0f}"
                                if unreal_inr is not None else "—"),
-                "TxCost":     f"-₹{txn_cost:.0f}",
-                "Net P&L":    (f"{'+' if net_inr>=0 else ''}₹{net_inr:.0f}"
+                "💸 TxCost":  f"₹{txn_cost:.0f}",
+                "💰 Net P&L": (f"{'+' if net_inr>=0 else ''}₹{net_inr:.0f}"
                                if net_inr is not None else "—"),
-                "Trailing":   "🔒" if r["trailing_active"] else "—",
+                "🔔 Alert":   alert_tag,
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        pos_df = pd.DataFrame(rows)
+        st.dataframe(pos_df, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Download Excel",
+                           data=_excel_bytes(pos_df),
+                           file_name=f"open_positions_{date.today()}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="dl_open")
 
-    # ── Today's Completed Trades ──────────────────────────────────────────────
-    st.subheader("Today's Trades")
+    st.divider()
+
+    # ── D3: Today's Completed Trades ──────────────────────────────────────────
+    st.subheader("📋 Today's Trades")
     today_df = query_live("""
         SELECT symbol, strike, expiry,
                entry_time, exit_time, exit_reason,
@@ -1606,61 +1754,201 @@ elif page == "Trade Log":
     if today_df.empty:
         st.info("No completed trades today.")
     else:
-        def _row_txn_cost(row):
+        def _row_costs(row):
             is_fly = float(row.get("wing_ce_strike", 0) or 0) > 0
             wc = float(row.get("wing_ce_ltp", 0) or 0) + float(row.get("wing_pe_ltp", 0) or 0)
-            return est_txn_cost(float(row["entry_premium"]), wc,
-                                int(row["lot_size"]), int(row.get("lots", 1)), is_fly)
+            return est_txn_cost_itemized(float(row["entry_premium"]), wc,
+                                         int(row["lot_size"]), int(row.get("lots", 1)), is_fly)
 
-        today_df["txn_cost"] = today_df.apply(_row_txn_cost, axis=1)
+        costs_list = today_df.apply(_row_costs, axis=1)
+        today_df["brok"]     = [c["brok"]  for c in costs_list]
+        today_df["stt"]      = [c["stt"]   for c in costs_list]
+        today_df["exch"]     = [c["exch"]  for c in costs_list]
+        today_df["txn_cost"] = [c["total"] for c in costs_list]
         today_df["net_pnl"]  = today_df["pnl_inr"] - today_df["txn_cost"]
 
         total_gross = float(today_df["pnl_inr"].sum())
         total_cost  = float(today_df["txn_cost"].sum())
         total_net   = float(today_df["net_pnl"].sum())
-        wins = int((today_df["net_pnl"] > 0).sum())
+        wins        = int((today_df["net_pnl"] > 0).sum())
 
-        # Graduation: headline KPIs prominent
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Net P&L", fmt_inr(total_net),
-                  delta=f"{'▲' if total_net>=0 else '▼'} Gross {fmt_inr(total_gross)}",
+        c1.metric("💰 Net P&L", fmt_inr(total_net),
+                  delta=f"Gross {fmt_inr(total_gross)}",
                   delta_color="normal" if total_net >= 0 else "inverse")
-        c2.metric("TxCost", f"-₹{total_cost:.0f}")
-        c3.metric("Trades", len(today_df))
-        c4.metric("Wins (net)", wins)
-        c5.metric("Stops", int((today_df["exit_reason"] == "stop").sum()))
+        c2.metric("💸 TxCost", f"-₹{total_cost:.0f}")
+        c3.metric("📊 Trades", len(today_df))
+        c4.metric("🎯 Wins", wins)
+        c5.metric("🛑 Stops", int((today_df["exit_reason"] == "stop").sum()))
 
         rows = []
         for _, r in today_df.iterrows():
             is_fly = float(r.get("wing_ce_strike", 0) or 0) > 0
             wce = int(r.get("wing_ce_strike", 0) or 0)
             wpe = int(r.get("wing_pe_strike", 0) or 0)
-            net = float(r["pnl_inr"]) - float(r["txn_cost"])
+            wc_inr = (float(r.get("wing_ce_ltp", 0) or 0) + float(r.get("wing_pe_ltp", 0) or 0)) * int(r["lot_size"]) * int(r.get("lots", 1))
+            net = float(r["net_pnl"])
+            entry_dt = pd.to_datetime(r["entry_time"]) + _IST
+            exit_dt  = pd.to_datetime(r["exit_time"])  + _IST
+            dur_min  = int((exit_dt - entry_dt).total_seconds() // 60)
+            dur_str  = f"{dur_min // 60}h {dur_min % 60}m" if dur_min >= 60 else f"{dur_min}m"
             rows.append({
-                "Symbol":   r["symbol"],
-                "ATM":      int(r["strike"]),
-                "Wing CE":  wce if is_fly else "—",
-                "Wing PE":  wpe if is_fly else "—",
-                "Entry":    (pd.to_datetime(r["entry_time"])  + _IST).strftime("%d-%b %I:%M %p"),
-                "Exit":     (pd.to_datetime(r["exit_time"])   + _IST).strftime("%I:%M %p"),
-                "Reason":   r["exit_reason"],
-                "Status":   "✅ Win" if net > 0 else "❌ Loss",
-                "Net Entry": f"{float(r.get('net_premium', 0) or r['entry_premium']):.1f}",
-                "Exit Val": f"{float(r['exit_premium']):.1f}",
-                "P&L pts":  f"{float(r['pnl_pts']):+.1f}",
-                "Net P&L":  f"{'+' if net>=0 else ''}₹{net:.0f}",
-                "Conf":     f"{float(r['scorecard_conf']):.0f}",
+                "🎯 Symbol":  r["symbol"],
+                "ATM":        int(r["strike"]),
+                "Wing CE":    wce if is_fly else "—",
+                "Wing PE":    wpe if is_fly else "—",
+                "📅 Entry":   entry_dt.strftime("%d-%b %H:%M"),
+                "Exit":       exit_dt.strftime("%H:%M"),
+                "⏱️ Dur":     dur_str,
+                "Exit":       _exit_emoji(r["exit_reason"]) + " " + str(r["exit_reason"]),
+                "Net Prem":   f"{float(r.get('net_premium', 0) or r['entry_premium']):.1f}",
+                "Exit Val":   f"{float(r['exit_premium']):.1f}",
+                "P&L pts":   f"{float(r['pnl_pts']):+.1f}",
+                "Gross ₹":   f"{'+' if float(r['pnl_inr'])>=0 else ''}₹{float(r['pnl_inr']):.0f}",
+                "💼 Hedge ₹": f"₹{wc_inr:.0f}" if is_fly else "—",
+                "🏷️ Brok":    f"₹{r['brok']:.0f}",
+                "🏷️ STT":     f"₹{r['stt']:.0f}",
+                "🏷️ Exch":    f"₹{r['exch']:.0f}",
+                "💸 TxCost":  f"₹{r['txn_cost']:.0f}",
+                "💰 Net ₹":   f"{'+' if net>=0 else ''}₹{net:.0f}",
+                "📊 Conf":    int(float(r["scorecard_conf"])),
+                "Result":     "🟢 Win" if net > 0 else "🔴 Loss",
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        today_tbl = pd.DataFrame(rows)
+        st.dataframe(today_tbl, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Download Excel",
+                           data=_excel_bytes(today_tbl),
+                           file_name=f"today_trades_{date.today()}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="dl_today")
 
     st.divider()
 
-    # ── Historical Outcomes ───────────────────────────────────────────────────
-    st.subheader("Historical Outcomes")
+    # ── D4: 7-Day Rolling Audit Log ───────────────────────────────────────────
+    st.subheader("📅 7-Day Audit Log")
+    week_df = query("""
+        SELECT symbol, strike, expiry,
+               entry_time, exit_time, exit_reason,
+               entry_premium, exit_premium,
+               pnl_pts, pnl_inr, lot_size, lots, scorecard_conf,
+               wing_ce_strike, wing_ce_ltp, wing_pe_ltp, net_premium
+        FROM trades.trade_outcomes FINAL
+        WHERE exit_time >= now() - INTERVAL 7 DAY
+        ORDER BY exit_time DESC
+    """)
+
+    if week_df.empty:
+        st.info("No trades in the last 7 days.")
+    else:
+        def _week_costs(row):
+            is_fly = float(row.get("wing_ce_strike", 0) or 0) > 0
+            wc = float(row.get("wing_ce_ltp", 0) or 0) + float(row.get("wing_pe_ltp", 0) or 0)
+            return est_txn_cost_itemized(float(row["entry_premium"]), wc,
+                                         int(row["lot_size"]), int(row.get("lots", 1)), is_fly)
+
+        wk_costs = week_df.apply(_week_costs, axis=1)
+        week_df["txn_cost"] = [c["total"] for c in wk_costs]
+        week_df["net_pnl"]  = week_df["pnl_inr"] - week_df["txn_cost"]
+
+        audit_rows = []
+        for _, r in week_df.iterrows():
+            net = float(r["net_pnl"])
+            exit_dt = pd.to_datetime(r["exit_time"]) + _IST
+            entry_dt = pd.to_datetime(r["entry_time"]) + _IST
+            audit_rows.append({
+                "📅 Date":    exit_dt.strftime("%d-%b"),
+                "🕐 Exit":    exit_dt.strftime("%H:%M"),
+                "🎯 Symbol":  r["symbol"],
+                "ATM":        int(r["strike"]),
+                "Exit":       _exit_emoji(r["exit_reason"]) + " " + str(r["exit_reason"]),
+                "Gross ₹":   f"{'+' if float(r['pnl_inr'])>=0 else ''}₹{float(r['pnl_inr']):.0f}",
+                "💸 Costs":   f"₹{r['txn_cost']:.0f}",
+                "💰 Net ₹":   f"{'+' if net>=0 else ''}₹{net:.0f}",
+                "📊 Conf":    int(float(r["scorecard_conf"])),
+                "Result":     "🟢 Win" if net > 0 else "🔴 Loss",
+            })
+        audit_tbl = pd.DataFrame(audit_rows)
+        st.dataframe(audit_tbl, use_container_width=True, hide_index=True)
+
+        # Daily subtotals
+        week_df["exit_date"] = (pd.to_datetime(week_df["exit_time"]) + _IST).dt.date
+        daily = (week_df.groupby("exit_date")
+                 .agg(trades=("net_pnl", "count"),
+                      wins=("net_pnl", lambda x: (x > 0).sum()),
+                      net_pnl=("net_pnl", "sum"),
+                      costs=("txn_cost", "sum"))
+                 .reset_index()
+                 .sort_values("exit_date", ascending=False))
+        daily_rows = [{
+            "📅 Date":    str(r["exit_date"]),
+            "📊 Trades":  int(r["trades"]),
+            "🎯 Wins":    int(r["wins"]),
+            "💰 Net P&L": fmt_inr(float(r["net_pnl"])),
+            "💸 Costs":   fmt_inr(float(r["costs"])),
+        } for _, r in daily.iterrows()]
+        st.markdown("**Daily Subtotals**")
+        st.dataframe(pd.DataFrame(daily_rows), use_container_width=True, hide_index=True)
+
+        st.download_button("⬇️ Download 7-Day Excel",
+                           data=_excel_bytes(audit_tbl),
+                           file_name=f"trade_log_7d_{date.today()}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="dl_7d")
+
+    st.divider()
+
+    # ── D5: Cost Breakdown Summary ────────────────────────────────────────────
+    st.subheader("💸 Cost Breakdown")
+    if not all_trades_df.empty:
+        def _all_costs(row):
+            is_fly = float(row.get("wing_ce_strike", 0) or 0) > 0
+            wc = float(row.get("wing_ce_ltp", 0) or 0) + float(row.get("wing_pe_ltp", 0) or 0)
+            return est_txn_cost_itemized(float(row["entry_premium"]), wc,
+                                         int(row["lot_size"]), int(row.get("lots", 1)), is_fly)
+        ac_list = all_trades_df.apply(_all_costs, axis=1)
+        all_trades_df["brok"]     = [c["brok"]  for c in ac_list]
+        all_trades_df["stt"]      = [c["stt"]   for c in ac_list]
+        all_trades_df["exch"]     = [c["exch"]  for c in ac_list]
+        all_trades_df["txn_cost"] = [c["total"] for c in ac_list]
+        all_trades_df["net_pnl"]  = all_trades_df["pnl_inr"] - all_trades_df["txn_cost"]
+
+        n  = len(all_trades_df)
+        gross_total = float(all_trades_df["pnl_inr"].sum())
+        brok_total  = float(all_trades_df["brok"].sum())
+        stt_total   = float(all_trades_df["stt"].sum())
+        exch_total  = float(all_trades_df["exch"].sum())
+        cost_total  = float(all_trades_df["txn_cost"].sum())
+        net_total   = float(all_trades_df["net_pnl"].sum())
+        pct = lambda v: f"{v/gross_total*100:.1f}%" if gross_total else "—"
+
+        cost_rows = [
+            {"💸 Cost Item": "🏷️ Brokerage", "🏦 All-Time": fmt_inr(brok_total),
+             "📊 Avg/Trade": fmt_inr(brok_total/n) if n else "—", "% of Gross": pct(brok_total)},
+            {"💸 Cost Item": "🏷️ STT",        "🏦 All-Time": fmt_inr(stt_total),
+             "📊 Avg/Trade": fmt_inr(stt_total/n)  if n else "—", "% of Gross": pct(stt_total)},
+            {"💸 Cost Item": "🏷️ Exchange",    "🏦 All-Time": fmt_inr(exch_total),
+             "📊 Avg/Trade": fmt_inr(exch_total/n) if n else "—", "% of Gross": pct(exch_total)},
+            {"💸 Cost Item": "💸 Total Costs", "🏦 All-Time": fmt_inr(cost_total),
+             "📊 Avg/Trade": fmt_inr(cost_total/n) if n else "—", "% of Gross": pct(cost_total)},
+            {"💸 Cost Item": "💰 Gross P&L",   "🏦 All-Time": fmt_inr(gross_total),
+             "📊 Avg/Trade": fmt_inr(gross_total/n) if n else "—", "% of Gross": "100%"},
+            {"💸 Cost Item": "💚 Net P&L",     "🏦 All-Time": fmt_inr(net_total),
+             "📊 Avg/Trade": fmt_inr(net_total/n) if n else "—", "% of Gross": pct(net_total)},
+        ]
+        st.dataframe(pd.DataFrame(cost_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No trade data for cost breakdown.")
+
+    st.divider()
+
+    # ── D6: Historical Audit ──────────────────────────────────────────────────
+    st.subheader("📜 Historical Audit")
     hist_df = query("""
-        SELECT toDate(entry_time) AS trade_date, symbol, strike,
+        SELECT toDate(entry_time)  AS trade_date,
+               entry_time, exit_time, symbol, strike,
                exit_reason, entry_premium, exit_premium,
-               pnl_pts, pnl_inr, scorecard_conf
+               pnl_pts, pnl_inr, lot_size, lots, scorecard_conf,
+               wing_ce_strike, wing_ce_ltp, wing_pe_ltp, net_premium
         FROM trades.trade_outcomes FINAL
         ORDER BY entry_time DESC LIMIT 500
     """)
@@ -1668,11 +1956,10 @@ elif page == "Trade Log":
     if hist_df.empty:
         st.info("No historical trade data yet.")
     else:
+        # Cumulative P&L chart
         hist_df["trade_date"] = pd.to_datetime(hist_df["trade_date"])
         cum = hist_df.sort_values("trade_date").copy()
         cum["cum_pnl"] = cum["pnl_inr"].cumsum()
-
-        # Graduation: primary chart first, stats second, raw table behind expander
         fig_hist = go.Figure()
         fig_hist.add_trace(go.Scatter(
             x=cum["trade_date"], y=cum["cum_pnl"],
@@ -1692,7 +1979,6 @@ elif page == "Trade Log":
             ).reset_index()
             st.markdown("**By Exit Reason**")
             st.dataframe(by_reason, use_container_width=True, hide_index=True)
-
         with col2:
             by_sym = hist_df.groupby("symbol").agg(
                 trades=("pnl_inr", "count"),
@@ -1702,12 +1988,54 @@ elif page == "Trade Log":
             st.markdown("**By Symbol**")
             st.dataframe(by_sym, use_container_width=True, hide_index=True)
 
-        with st.expander("Full Trade Log (last 500)"):
-            st.dataframe(
-                hist_df[["trade_date", "symbol", "strike", "exit_reason",
-                          "entry_premium", "exit_premium", "pnl_pts", "pnl_inr", "scorecard_conf"]],
-                use_container_width=True, hide_index=True,
-            )
+        # Filter controls
+        st.markdown("**Filter Trade Log**")
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            sym_filter = st.multiselect("Symbol", options=sorted(hist_df["symbol"].unique()),
+                                        default=[], key="hist_sym")
+        with fc2:
+            reason_filter = st.multiselect("Exit Reason", options=sorted(hist_df["exit_reason"].unique()),
+                                           default=[], key="hist_reason")
+        filtered = hist_df.copy()
+        if sym_filter:
+            filtered = filtered[filtered["symbol"].isin(sym_filter)]
+        if reason_filter:
+            filtered = filtered[filtered["exit_reason"].isin(reason_filter)]
+
+        def _hist_cost(row):
+            is_fly = float(row.get("wing_ce_strike", 0) or 0) > 0
+            wc = float(row.get("wing_ce_ltp", 0) or 0) + float(row.get("wing_pe_ltp", 0) or 0)
+            return est_txn_cost(float(row["entry_premium"]), wc,
+                                int(row["lot_size"]), int(row.get("lots", 1)), is_fly)
+        filtered["txn_cost"] = filtered.apply(_hist_cost, axis=1)
+        filtered["net_pnl"]  = filtered["pnl_inr"] - filtered["txn_cost"]
+        filtered["exit_dt_ist"] = (pd.to_datetime(filtered["exit_time"]) + _IST).dt.strftime("%d-%b %H:%M")
+
+        hist_tbl = filtered[[
+            "trade_date", "exit_dt_ist", "symbol", "strike", "exit_reason",
+            "entry_premium", "exit_premium", "pnl_pts", "pnl_inr",
+            "txn_cost", "net_pnl", "scorecard_conf",
+        ]].rename(columns={
+            "trade_date":   "📅 Date",
+            "exit_dt_ist":  "🕐 Exit IST",
+            "symbol":       "🎯 Symbol",
+            "strike":       "ATM",
+            "exit_reason":  "Exit",
+            "entry_premium":"Entry Prem",
+            "exit_premium": "Exit Prem",
+            "pnl_pts":      "P&L pts",
+            "pnl_inr":      "Gross ₹",
+            "txn_cost":     "💸 Costs",
+            "net_pnl":      "💰 Net ₹",
+            "scorecard_conf":"📊 Conf",
+        })
+        st.dataframe(hist_tbl, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Download Audit Excel",
+                           data=_excel_bytes(hist_tbl),
+                           file_name=f"trade_audit_{date.today()}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="dl_hist")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
