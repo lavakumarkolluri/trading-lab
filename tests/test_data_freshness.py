@@ -236,3 +236,27 @@ def test_data_freshness_scheduled_in_scheduler():
         content = f.read()
     assert "job_data_freshness_check" in content
     assert "data_freshness_check" in content
+
+
+# ── alert_log wiring ──────────────────────────────────────────────────────────
+
+def test_send_telegram_writes_to_alert_log_when_ch_set():
+    """_send_telegram must call write_alert_log when _ch_ref is configured."""
+    ch = MagicMock()
+    m._ch_ref = ch
+    with patch("data_freshness_check.write_alert_log") as mock_wal, \
+         patch("urllib.request.urlopen"):
+        m._send_telegram("test alert")
+    mock_wal.assert_called_once()
+    args = mock_wal.call_args[0]
+    assert args[0] is ch
+    assert args[1] == "data_freshness_check"
+    m._ch_ref = None  # clean up
+
+
+def test_send_telegram_skips_alert_log_when_ch_not_set():
+    """_send_telegram must not crash when _ch_ref is None."""
+    m._ch_ref = None
+    with patch("data_freshness_check.write_alert_log") as mock_wal:
+        m._send_telegram("test alert")
+    mock_wal.assert_not_called()

@@ -12,7 +12,7 @@ and sends Telegram alerts for key events:
   • Position closed (trade resolved)
   • Heartbeat every 30 min with open position summary
 
-Read-only: never writes to ClickHouse.
+Writes to system_meta.alert_log after every Telegram send.
 """
 
 import os
@@ -22,7 +22,7 @@ import urllib.request
 import zoneinfo
 from datetime import datetime, time as dtime, timedelta
 
-from ch_utils import ch_client
+from ch_utils import ch_client, write_alert_log
 from logging_utils import get_logger
 
 log = get_logger(__name__)
@@ -43,7 +43,12 @@ EOD_WARN_TIME     = dtime(15, 15)  # warn about open positions
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
-def _send(msg: str) -> None:
+_ch_ref = None  # set in run() so _send() can write to alert_log
+
+
+def _send(msg: str, level: str = "INFO") -> None:
+    if _ch_ref is not None:
+        write_alert_log(_ch_ref, "monitor_agent", level, msg)
     if not (_TG_TOKEN and _TG_CHAT_ID):
         log.info("Telegram not configured — would send: %s", msg[:80])
         return
@@ -179,7 +184,9 @@ def _is_market_hours() -> bool:
 def run():
     log.info("Monitor Agent started — polling every %d min during market hours", LOOP_INTERVAL_S // 60)
 
+    global _ch_ref
     ch = ch_client()
+    _ch_ref = ch
 
     # State: trade_id → set of alerted event names
     alerted: dict[str, set[str]] = {}
