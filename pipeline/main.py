@@ -1,10 +1,7 @@
 import yfinance as yf
 import pandas as pd
-from minio import Minio
-import clickhouse_connect
 import io
 import os
-import logging
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -12,23 +9,13 @@ from datetime import datetime
 from symbols import MARKETS
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# ── Logging Setup ──────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client, minio_client as get_minio_client
+from logging_utils import get_logger
+
+log = get_logger(__name__)
 
 # ── Config ─────────────────────────────────────────────
-MINIO_HOST     = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER     = os.getenv("MINIO_USER", "admin")
-MINIO_PASSWORD = os.getenv("MINIO_PASSWORD", "password123")
 MINIO_BUCKET   = "trading-data"
-
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
 
 MAX_WORKERS             = 8    # parallel download threads
 DELAY_BETWEEN_DOWNLOADS = 0.3  # per-worker delay
@@ -36,25 +23,6 @@ DELAY_BETWEEN_DOWNLOADS = 0.3  # per-worker delay
 # ── Results Tracker ────────────────────────────────────
 results      = {"success": [], "skipped": [], "failed": []}
 results_lock = threading.Lock()
-
-
-# ── Clients ────────────────────────────────────────────
-def get_minio_client():
-    return Minio(
-        MINIO_HOST,
-        access_key=MINIO_USER,
-        secret_key=MINIO_PASSWORD,
-        secure=False
-    )
-
-
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST,
-        port=CH_PORT,
-        username=CH_USER,
-        password=CH_PASS
-    )
 
 
 def setup_minio(minio):

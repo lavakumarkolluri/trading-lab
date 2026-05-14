@@ -22,24 +22,13 @@ Only the symbol whose expiry falls on/after today is recommended on a given day.
 
 import argparse
 import json
-import logging
-import os
 import sys
 from datetime import date, timedelta
 
-import clickhouse_connect
+from ch_utils import ch_client
+from logging_utils import get_logger
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger(__name__)
-
-# ── ClickHouse ────────────────────────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "localhost")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASSWORD = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 # ── Strategy parameters ───────────────────────────────────────────────────────
 CONFIDENCE_THRESHOLD = 55.0     # minimum confidence to trade (used in --backtest only)
@@ -78,12 +67,6 @@ WEEKDAY_SYMBOL = {
     2: "BANKNIFTY",
     3: "NIFTY",
 }
-
-
-def ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASSWORD
-    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

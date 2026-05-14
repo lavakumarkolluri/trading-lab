@@ -25,21 +25,17 @@ import os
 import signal
 import sys
 import time
-import logging
 import argparse
 import zoneinfo
 from datetime import datetime, time as dtime, date
 
 import pandas as pd
-import clickhouse_connect
 from jugaad_data.nse import NSELive
 from minio import Minio
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client, minio_client as get_minio_client
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 # ── Config ───────────────────────────────────────────────
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
@@ -50,14 +46,6 @@ FETCH_INTERVAL_S = 180              # 3 minutes
 
 SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
 
-CH_HOST  = os.getenv("CH_HOST", "clickhouse")
-CH_PORT  = int(os.getenv("CH_PORT", "8123"))
-CH_USER  = os.getenv("CH_USER", "default")
-CH_PASS  = os.getenv("CH_PASSWORD", "")
-
-MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 
 HTTP_TIMEOUT = 20
@@ -91,20 +79,6 @@ def _send_telegram(message: str):
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         log.warning("Telegram alert failed: %s", e)
-
-
-# ── Clients ──────────────────────────────────────────────
-
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
-
-
-def get_minio_client() -> Minio:
-    return Minio(MINIO_HOST, access_key=MINIO_USER,
-                 secret_key=MINIO_PASS, secure=False)
 
 
 # ── NSE session ──────────────────────────────────────────

@@ -46,7 +46,6 @@ Docker usage (recommended):
 
 import os
 import sys
-import logging
 import argparse
 import subprocess
 from datetime import datetime, date
@@ -58,12 +57,9 @@ try:
 except ImportError:
     _URLLIB_OK = False
 
-# ── Logging ────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from logging_utils import get_logger
+
+log = get_logger(__name__)
 
 # ── Telegram alerting (OPS-003) ────────────────────────
 _TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")

@@ -18,24 +18,18 @@ Usage:
 """
 
 import argparse
-import logging
 import math
-import os
 from datetime import date, timedelta
 
-import clickhouse_connect
 import numpy as np
 import pandas as pd
 from scipy import stats
 from price_action import compute_price_action, PA_DEFAULTS
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch
+from logging_utils import get_logger
 
-CH_HOST     = os.getenv("CH_HOST", "clickhouse")
-CH_PORT     = int(os.getenv("CH_PORT", "8123"))
-CH_USER     = os.getenv("CH_USER", "default")
-CH_PASSWORD = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 STRIKE_STEPS = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
 DEFAULT_STRIKE_STEP  = 50
@@ -61,11 +55,6 @@ def bs_straddle(spot: float, strike: float, T_years: float, iv: float) -> float:
     return call + put
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASSWORD
-    )
 
 def load_expiries(ch, symbol: str) -> list[date]:
     rows = ch.query(

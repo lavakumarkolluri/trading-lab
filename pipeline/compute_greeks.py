@@ -20,31 +20,19 @@ Usage:
 """
 
 import argparse
-import logging
 import math
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
-import clickhouse_connect
 import pandas as pd
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch
+from logging_utils import get_logger
 
-CH_HOST     = os.getenv("CH_HOST", "clickhouse")
-CH_PORT     = int(os.getenv("CH_PORT", "8123"))
-CH_USER     = os.getenv("CH_USER", "default")
-CH_PASSWORD = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 RISK_FREE_RATE = 0.065
 SYMBOLS        = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
-
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASSWORD
-    )
 
 
 # ── Black-Scholes ─────────────────────────────────────────────────────────────

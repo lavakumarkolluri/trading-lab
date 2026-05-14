@@ -38,7 +38,6 @@ Usage:
 import os
 import math
 import json
-import logging
 import argparse
 import threading
 from datetime import datetime, date, timedelta
@@ -46,21 +45,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
-import clickhouse_connect
+from ch_utils import ch_client as get_ch_client
+from logging_utils import get_logger
 from holidays_pipeline import next_trading_day, is_trading_day
 
-# ── Logging ────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
-
-# ── Config ─────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 MAX_WORKERS      = 8
 MIN_CONFIDENCE   = 60.0   # minimum confidence % to emit a prediction
@@ -77,14 +66,6 @@ results = {
     "failed": [],
 }
 results_lock = threading.Lock()
-
-
-# ── ClickHouse client ──────────────────────────────────
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
 
 
 # ══════════════════════════════════════════════════════

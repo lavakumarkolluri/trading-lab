@@ -44,29 +44,15 @@ from curl_cffi import requests
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import clickhouse_connect
 from minio import Minio
 from minio.error import S3Error
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client, minio_client as get_minio_client
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 # Config
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
-
-MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD")
-if not MINIO_PASS:
-    raise RuntimeError("MINIO_PASSWORD env var not set — refusing to start")
 MINIO_BUCKET = "trading-data"
 
 NSE_HOME_URL  = "https://www.nseindia.com"
@@ -99,19 +85,6 @@ results = {
 }
 results_lock = threading.Lock()
 
-
-# Clients
-
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
-
-
-def get_minio_client():
-    return Minio(MINIO_HOST, access_key=MINIO_USER,
-                 secret_key=MINIO_PASS, secure=False)
 
 
 # Preflight
@@ -473,6 +446,9 @@ def main():
                         help="Skip NSE fetch; reload staged MinIO files into ClickHouse")
     parser.add_argument("--status",    action="store_true")
     args = parser.parse_args()
+
+    if not os.getenv("MINIO_PASSWORD"):
+        raise RuntimeError("MINIO_PASSWORD env var not set — refusing to start")
 
     log.info("=== FII/DII Pipeline v3 (NSE JSON API) Starting ===")
     log.info(f"Started : {datetime.now()}")

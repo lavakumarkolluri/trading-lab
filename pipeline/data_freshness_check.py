@@ -15,20 +15,14 @@ Usage:
 """
 
 import os
-import logging
 import argparse
 import subprocess
 from datetime import datetime, date, timedelta
 
-import clickhouse_connect
+from ch_utils import ch_client as get_ch
+from logging_utils import get_logger
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 _COMPOSE_FILE = os.getenv("COMPOSE_FILE", "/trading-lab/docker-compose.yml")
 _PROJECT_DIR  = os.path.dirname(_COMPOSE_FILE)
@@ -51,12 +45,6 @@ def _send_telegram(msg: str):
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         log.warning("Telegram alert failed: %s", e)
-
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
 
 
 def _run_pipeline(service: str, *args):

@@ -42,7 +42,6 @@ import os
 import re
 import json
 import uuid
-import logging
 import argparse
 import threading
 from datetime import datetime, date, timedelta
@@ -50,20 +49,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
-import clickhouse_connect
 
-# ── Logging ────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client
+from logging_utils import get_logger
 
-# ── Config ─────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 MAX_WORKERS       = 8
 INSERT_CHUNK_SIZE = 1000
@@ -82,14 +72,6 @@ results = {
     "failed":     [],
 }
 results_lock = threading.Lock()
-
-
-# ── ClickHouse client ──────────────────────────────────
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
 
 
 # ── SEC-001: input validation helper ──────────────────

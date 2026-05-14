@@ -43,27 +43,16 @@ import argparse
 from datetime import datetime, date, timedelta
 
 import pandas as pd
-import clickhouse_connect
 from curl_cffi import requests
 from minio import Minio
 from minio.error import S3Error
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client, minio_client as get_minio_client
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 # ── Config ──────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
-
-MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 
 NSE_HOME   = "https://www.nseindia.com"
@@ -74,18 +63,6 @@ REQUEST_DELAY   = 2.5
 
 # Nifty options are in 50-point increments; BankNifty in 100
 _STRIKE_STEP = {"NIFTY": 50.0, "BANKNIFTY": 100.0}
-
-
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
-
-
-def get_minio_client() -> Minio:
-    return Minio(MINIO_HOST, access_key=MINIO_USER,
-                 secret_key=MINIO_PASS, secure=False)
 
 
 def setup_minio_bucket(mc: Minio):

@@ -27,29 +27,17 @@ Docker:
 
 import os
 import sys
-import logging
 import argparse
 from datetime import date, datetime
 
 import pandas as pd
 import numpy as np
-import clickhouse_connect
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+from ch_utils import ch_client as get_ch
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 SYMBOLS = ["NIFTY"]   # options_eod_summary is NIFTY-centric (nifty_spot col, no symbol col)
-
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
 
 
 def fetch_already_computed(ch) -> set:

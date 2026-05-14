@@ -30,7 +30,7 @@ jobs:
         run: pip install -r tests/requirements.txt pyyaml
 
       - name: Lint boilerplate patterns
-        run: python scripts/lint_boilerplate.py --warn-only
+        run: python scripts/lint_boilerplate.py
 
       - name: Check env consistency
         run: python scripts/check_env_consistency.py

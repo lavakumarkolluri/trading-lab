@@ -34,7 +34,6 @@ Usage:
   python mf_aggregation.py --scheme 119598   # single scheme (debug)
 """
 
-import logging
 import argparse
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -55,12 +54,9 @@ from mf_compute_technical import compute_all_technical
 from mf_compute_returns    import compute_all_returns
 from mf_compute_risk       import compute_all_risk
 
-# ── Logging ────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from logging_utils import get_logger
+
+log = get_logger(__name__)
 
 # ── Config ─────────────────────────────────────────────
 BATCH_SIZE   = 200   # log progress every N successes
