@@ -56,6 +56,16 @@ MINIO_BUCKET = "trading-data"
 MODELS_PREFIX = "models/confidence_scorer"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
+STRATEGY_TYPES = ["iron_fly", "iron_condor", "bull_put", "bear_call"]
+
+# Standard short_n / wing_m for condor/spread strategies when loading from backtest.
+# Iron fly uses short_n=0 (fixed); others use 1 short step, 2 wing steps.
+_STANDARD_PARAMS = {
+    "iron_fly":    {"short_n": 0, "wing_m": None},   # wing_m from IRON_FLY_WINGS per symbol
+    "iron_condor": {"short_n": 1, "wing_m": 2},
+    "bull_put":    {"short_n": 1, "wing_m": 2},
+    "bear_call":   {"short_n": 1, "wing_m": 2},
+}
 
 INDEX_MAP = {
     "NIFTY":      "^NSEI",
@@ -486,6 +496,36 @@ def compute_pnl(chain, snap_date, expiry, atm_strike) -> Optional[float]:
     return entry - exit_
 
 
+def load_backtest_pnl(ch, symbol: str, strategy_type: str) -> pd.DataFrame:
+    """Load P&L rows from analysis.spread_backtest for a given symbol+strategy.
+    Returns DataFrame indexed by (expiry, entry_date) with pnl_pts column.
+    For iron_fly: only one record per expiry (short_n=0).
+    For other strategies: uses the standard short_n/wing_m config.
+    """
+    p = _STANDARD_PARAMS.get(strategy_type, {"short_n": 1, "wing_m": 2})
+    sn = p["short_n"]
+    if strategy_type == "iron_fly":
+        rows = ch.query(
+            "SELECT expiry, entry_date, pnl_pts FROM analysis.spread_backtest "
+            "WHERE symbol={sym:String} AND strategy='iron_fly' AND short_n=0",
+            parameters={"sym": symbol},
+        ).result_rows
+    else:
+        wm = p["wing_m"]
+        rows = ch.query(
+            "SELECT expiry, entry_date, pnl_pts FROM analysis.spread_backtest "
+            "WHERE symbol={sym:String} AND strategy={strat:String} "
+            "AND short_n={sn:Int32} AND wing_m={wm:Int32}",
+            parameters={"sym": symbol, "strat": strategy_type, "sn": sn, "wm": wm},
+        ).result_rows
+    if not rows:
+        return pd.DataFrame(columns=["expiry", "entry_date", "pnl_pts"])
+    df = pd.DataFrame(rows, columns=["expiry", "entry_date", "pnl_pts"])
+    df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
+    df["entry_date"] = pd.to_datetime(df["entry_date"]).dt.date
+    return df.set_index(["expiry", "entry_date"])
+
+
 # ── Dataset Builder ───────────────────────────────────────────────────────────
 
 def _tech_row(tech, snap_date, eod) -> dict:
@@ -510,8 +550,8 @@ def _tech_row(tech, snap_date, eod) -> dict:
     return out
 
 
-def build_dataset(ch, symbol: str) -> pd.DataFrame:
-    log.info(f"[{symbol}] loading data…")
+def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFrame:
+    log.info(f"[{symbol}][{strategy_type}] loading data…")
     chain       = load_options_chain(ch, symbol)
     eod         = load_eod_summary(ch, symbol)
     poi         = load_participant_oi(ch)
@@ -521,8 +561,14 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
     ohlcv       = load_index_ohlcv(ch, index_sym)
     tech        = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
 
+    # Load actual strategy P&L from backtester (pnl already deducts wing costs)
+    bt_pnl = load_backtest_pnl(ch, symbol, strategy_type)
+    if bt_pnl.empty:
+        log.warning(f"[{symbol}][{strategy_type}] no backtest rows — run strategy_backtester first")
+        return pd.DataFrame()
+
     expiries = sorted(chain["expiry"].unique())
-    log.info(f"[{symbol}] {len(expiries)} expiry dates to process")
+    log.info(f"[{symbol}][{strategy_type}] {len(expiries)} expiry dates to process")
 
     rows = []
     for expiry in expiries:
@@ -533,22 +579,21 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
             continue
         snap_date = snap_candidates[-1]
 
+        # Skip if no backtest row for this expiry+entry_date
+        key = (expiry, snap_date)
+        if key not in bt_pnl.index:
+            continue
+        pnl = float(bt_pnl.loc[key, "pnl_pts"])
+
         chain_feats = extract_chain_features(chain, snap_date, expiry)
         if chain_feats is None:
-            continue
-
-        atm = chain_feats["atm_strike"]
-        pnl = compute_pnl(chain, snap_date, expiry, atm)
-        if pnl is None:
             continue
 
         row = {
             "expiry":        expiry,
             "entry_date":    snap_date,
             "pnl_pts":       pnl,
-            "pnl_pct":       pnl / chain_feats["straddle_premium"] * 100,
-            "entry_premium": chain_feats["straddle_premium"],
-            "exit_value":    chain_feats["straddle_premium"] - pnl,
+            "strategy_type": strategy_type,
         }
         row.update(chain_feats)
         row.update(extract_eod_features(eod, snap_date))
@@ -564,21 +609,20 @@ def build_dataset(ch, symbol: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # CRIT-001: use per-symbol breakeven so the model learns "profitable after iron fly costs"
-    # not just "straddle P&L > 0" (which ignores ~30–50 pts of wing cost)
-    breakeven = _BREAKEVEN.get(symbol, 35)
-    df["target"] = (df["pnl_pts"] > breakeven).astype(int)
+    # pnl_pts from spread_backtest already accounts for wing costs and structure costs.
+    # Target: was the trade profitable after all costs?
+    df["target"] = (df["pnl_pts"] > 0).astype(int)
     df.sort_values("expiry", inplace=True)
     df.reset_index(drop=True, inplace=True)
-    log.info(f"[{symbol}] dataset: {len(df)} rows, win_rate={df.target.mean():.1%}")
+    log.info(f"[{symbol}][{strategy_type}] dataset: {len(df)} rows, win_rate={df.target.mean():.1%}")
     return df
 
 
-def build_dataset_pooled(ch) -> pd.DataFrame:
+def build_dataset_pooled(ch, strategy_type: str = "iron_fly") -> pd.DataFrame:
     """Combine all 4 symbol datasets with symbol one-hot columns."""
     dfs = []
     for sym in SYMBOLS:
-        df = build_dataset(ch, sym)
+        df = build_dataset(ch, sym, strategy_type)
         if not df.empty:
             df = df.copy()
             df["symbol_label"] = sym
@@ -735,10 +779,12 @@ def _insert_backtest_results(ch, symbol: str, results: pd.DataFrame):
 
 # ── Final Model Training ──────────────────────────────────────────────────────
 
-def train_final_model(df, symbol, mc, model_type="xgb") -> Optional[object]:
-    """Train on all available data and save per-symbol model to MinIO."""
+def train_final_model(df, symbol, mc, model_type="xgb",
+                       strategy: str = "iron_fly") -> Optional[object]:
+    """Train on all available data and save per-symbol+strategy model to MinIO."""
+    label = f"{symbol}[{strategy}]"
     if len(df) < MIN_TRAIN:
-        log.warning(f"[{symbol}] insufficient data, skipping")
+        log.warning(f"[{label}] insufficient data ({len(df)} < {MIN_TRAIN}), skipping")
         return None
 
     cols = [c for c in FEATURE_COLS if c in df.columns]
@@ -750,27 +796,28 @@ def train_final_model(df, symbol, mc, model_type="xgb") -> Optional[object]:
 
     if model_type != "scorecard":
         ext = _model_ext(model_type)
-        model_key = f"{MODELS_PREFIX}/{symbol}_model.{ext}"
+        model_key = f"{MODELS_PREFIX}/{symbol}_{strategy}_model.{ext}"
         try:
             _save_model(model, model_type, model_key, mc)
-            log.info(f"[{symbol}] model saved: {model_key}")
+            log.info(f"[{label}] model saved: {model_key}")
         except S3Error as e:
-            log.warning(f"[{symbol}] failed to save model: {e}")
+            log.warning(f"[{label}] failed to save model: {e}")
     else:
         model_key = None
 
     meta = {
-        "features":   cols,
-        "n_train":    len(df),
-        "win_rate":   float(y.mean()),
-        "model_type": model_type,
-        "is_pooled":  False,
-        "model_key":  model_key,
+        "features":      cols,
+        "n_train":       len(df),
+        "win_rate":      float(y.mean()),
+        "model_type":    model_type,
+        "is_pooled":     False,
+        "strategy_type": strategy,
+        "model_key":     model_key,
     }
     buf = io.BytesIO(json.dumps(meta).encode())
-    mc.put_object(MINIO_BUCKET, f"{MODELS_PREFIX}/{symbol}_meta.json",
+    mc.put_object(MINIO_BUCKET, f"{MODELS_PREFIX}/{symbol}_{strategy}_meta.json",
                   buf, length=buf.getbuffer().nbytes, content_type="application/json")
-    log.info(f"[{symbol}] final model: {model_type}, n={len(df)}, win_rate={y.mean():.1%}")
+    log.info(f"[{label}] final model: {model_type}, n={len(df)}, win_rate={y.mean():.1%}")
     return model
 
 
@@ -811,13 +858,22 @@ def train_final_model_pooled(pooled_df, mc, model_type="xgb_pooled"):
     return model
 
 
-def load_model(symbol: str, mc) -> tuple:
-    """Load trained model from MinIO. Returns (model, meta) or (None, None)."""
-    meta_key = f"{MODELS_PREFIX}/{symbol}_meta.json"
-    try:
-        resp = mc.get_object(MINIO_BUCKET, meta_key)
-        meta = json.loads(resp.read())
-    except S3Error:
+def load_model(symbol: str, mc, strategy: str = "iron_fly") -> tuple:
+    """Load trained model from MinIO. Returns (model, meta) or (None, None).
+    Tries strategy-specific key first ({symbol}_{strategy}_meta.json),
+    falls back to legacy key ({symbol}_meta.json) for backward compat.
+    """
+    for meta_key in [
+        f"{MODELS_PREFIX}/{symbol}_{strategy}_meta.json",
+        f"{MODELS_PREFIX}/{symbol}_meta.json",   # legacy fallback
+    ]:
+        try:
+            resp = mc.get_object(MINIO_BUCKET, meta_key)
+            meta = json.loads(resp.read())
+            break
+        except S3Error:
+            continue
+    else:
         return None, None
 
     model_type = meta.get("model_type", "xgb")
@@ -830,7 +886,7 @@ def load_model(symbol: str, mc) -> tuple:
         ext = _model_ext(model_type)
         model_key = (f"{MODELS_PREFIX}/POOLED_model.{ext}"
                      if meta.get("is_pooled")
-                     else f"{MODELS_PREFIX}/{symbol}_model.{ext}")
+                     else f"{MODELS_PREFIX}/{symbol}_{strategy}_model.{ext}")
 
     try:
         return _load_model_bytes(model_type, model_key, mc), meta
@@ -855,8 +911,8 @@ def _warn_missing_features(symbol: str, row: dict) -> None:
         )
 
 
-def score_today(ch, mc, symbol: str) -> None:
-    model, meta = load_model(symbol, mc)
+def score_today(ch, mc, symbol: str, strategy: str = "iron_fly") -> None:
+    model, meta = load_model(symbol, mc, strategy)
     if model is None:
         log.warning(f"[{symbol}] no trained model found, skipping scoring")
         return
@@ -929,7 +985,7 @@ def score_today(ch, mc, symbol: str) -> None:
     confidence = float(model.predict_proba(feat_df)[0, 1]) * 100
     expected_pnl_pct = (confidence - 50) * 1.5
 
-    log.info(f"[{symbol}] [{model_type}] next_expiry={next_expiry} "
+    log.info(f"[{symbol}][{strategy}] [{model_type}] next_expiry={next_expiry} "
              f"confidence={confidence:.1f} expected_pnl_pct={expected_pnl_pct:.1f}%")
 
     features_json = json.dumps({k: round(float(v), 4) for k, v in row.items()
@@ -937,29 +993,29 @@ def score_today(ch, mc, symbol: str) -> None:
 
     ch.insert(
         "analysis.confidence_scores",
-        [[today, symbol, next_expiry, confidence, expected_pnl_pct, features_json]],
+        [[today, symbol, next_expiry, confidence, expected_pnl_pct, features_json, strategy]],
         column_names=["score_date", "symbol", "next_expiry", "confidence",
-                      "expected_pnl_pct", "features_json"],
+                      "expected_pnl_pct", "features_json", "strategy_type"],
     )
-    log.info(f"[{symbol}] confidence score inserted: {confidence:.1f}/100")
+    log.info(f"[{symbol}][{strategy}] confidence score inserted: {confidence:.1f}/100")
 
 
 # ── Model Comparison ──────────────────────────────────────────────────────────
 
-def compare_models(ch, mc) -> tuple:
+def compare_models(ch, mc, strategy_type: str = "iron_fly") -> tuple:
     """
     Compare XGBoost per-symbol, LR per-symbol, Scorecard, Pooled XGBoost, Pooled LR.
     Returns (best_model_type, is_pooled) for the winner.
     """
-    log.info("=== Building per-symbol datasets ===")
+    log.info(f"=== Building per-symbol datasets [{strategy_type}] ===")
     sym_dfs = {}
     for sym in SYMBOLS:
-        df = build_dataset(ch, sym)
+        df = build_dataset(ch, sym, strategy_type)
         if not df.empty:
             sym_dfs[sym] = df
 
-    log.info("=== Building pooled dataset ===")
-    pooled_df = build_dataset_pooled(ch)
+    log.info(f"=== Building pooled dataset [{strategy_type}] ===")
+    pooled_df = build_dataset_pooled(ch, strategy_type)
 
     def _auc(preds):
         if preds.empty or len(set(preds["target"])) < 2:
@@ -971,7 +1027,7 @@ def compare_models(ch, mc) -> tuple:
         for sym, df in sym_dfs.items():
             p = _walk_forward_cv(df, model_type, feat_cols)
             a = _auc(p)
-            log.info(f"  [{sym}] {model_type}: AUC={a:.3f} n_oos={len(p)}")
+            log.info(f"  [{sym}][{strategy_type}] {model_type}: AUC={a:.3f} n_oos={len(p)}")
             if not np.isnan(a):
                 aucs.append(a)
         return float(np.mean(aucs)) if aucs else float("nan")
@@ -991,29 +1047,29 @@ def compare_models(ch, mc) -> tuple:
         log.info("--- Pooled XGBoost ---")
         p = _walk_forward_cv(pooled_df, "xgb_pooled", POOLED_FEATURE_COLS)
         results[("xgb_pooled", True)] = _auc(p)
-        log.info(f"  [POOLED] xgb_pooled: AUC={results[('xgb_pooled', True)]:.3f} n_oos={len(p)}")
+        log.info(f"  [POOLED][{strategy_type}] xgb_pooled: AUC={results[('xgb_pooled', True)]:.3f} n_oos={len(p)}")
 
         log.info("--- Pooled Logistic Regression ---")
         p = _walk_forward_cv(pooled_df, "lr_pooled", POOLED_FEATURE_COLS)
         results[("lr_pooled", True)] = _auc(p)
-        log.info(f"  [POOLED] lr_pooled: AUC={results[('lr_pooled', True)]:.3f} n_oos={len(p)}")
+        log.info(f"  [POOLED][{strategy_type}] lr_pooled: AUC={results[('lr_pooled', True)]:.3f} n_oos={len(p)}")
 
     sorted_r = sorted(results.items(),
                       key=lambda x: x[1] if not np.isnan(x[1]) else -1,
                       reverse=True)
     best_key, best_auc = sorted_r[0]
 
-    print("\n" + "=" * 58)
-    print(f"  {'MODEL TYPE':<22} {'POOLED':<8} {'AVG AUC'}")
-    print("  " + "-" * 54)
+    print("\n" + "=" * 62)
+    print(f"  [{strategy_type}] {'MODEL TYPE':<22} {'POOLED':<8} {'AVG AUC'}")
+    print("  " + "-" * 58)
     for (mt, pooled), auc_v in sorted_r:
         marker = " ← BEST" if (mt, pooled) == best_key else ""
         auc_s = f"{auc_v:.3f}" if not np.isnan(auc_v) else "  n/a"
         print(f"  {mt:<22} {'yes' if pooled else 'no':<8} {auc_s}{marker}")
-    print("=" * 58 + "\n")
+    print("=" * 62 + "\n")
 
     best_type, is_pooled = best_key
-    log.info(f"Winner: {best_type} (pooled={is_pooled}) AUC={best_auc:.3f}")
+    log.info(f"[{strategy_type}] Winner: {best_type} (pooled={is_pooled}) AUC={best_auc:.3f}")
     return best_type, is_pooled
 
 
@@ -1047,22 +1103,26 @@ def _check_upstream_pipelines(ch) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_symbol(symbol, ch, mc, backtest_only, score_only, model_type="xgb"):
+def run_symbol(symbol, ch, mc, backtest_only, score_only, model_type="xgb",
+               strategy: str = "iron_fly"):
     if not score_only:
-        df = build_dataset(ch, symbol)
+        df = build_dataset(ch, symbol, strategy)
         if df.empty:
-            log.warning(f"[{symbol}] empty dataset, skipping")
+            log.warning(f"[{symbol}][{strategy}] empty dataset, skipping")
             return
         walk_forward_train(df, symbol, ch, mc, model_type)
-        train_final_model(df, symbol, mc, model_type)
+        train_final_model(df, symbol, mc, model_type, strategy)
 
     if not backtest_only:
-        score_today(ch, mc, symbol)
+        score_today(ch, mc, symbol, strategy)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", help="Single symbol to run (default: all)")
+    parser.add_argument("--strategy", default=None,
+                        choices=STRATEGY_TYPES,
+                        help="Single strategy to run (default: all 4)")
     parser.add_argument("--backtest-only", action="store_true")
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--compare", action="store_true",
@@ -1079,45 +1139,50 @@ def main():
 
     _check_upstream_pipelines(ch)
 
+    target_syms = [args.symbol] if args.symbol else SYMBOLS
+    target_strategies = [args.strategy] if args.strategy else STRATEGY_TYPES
+
     started_at = datetime.utcnow()
     try:
         if args.compare:
-            best_type, is_pooled = compare_models(ch, mc)
+            for strat in target_strategies:
+                best_type, is_pooled = compare_models(ch, mc, strat)
 
-            log.info(f"Training final model: {best_type} (pooled={is_pooled})")
-            target_syms = [args.symbol] if args.symbol else SYMBOLS
-            if is_pooled:
-                pooled_df = build_dataset_pooled(ch)
-                train_final_model_pooled(pooled_df, mc, best_type)
-            else:
-                for sym in target_syms:
-                    try:
-                        df = build_dataset(ch, sym)
-                        if not df.empty:
-                            train_final_model(df, sym, mc, best_type)
-                    except Exception as e:
-                        log.error(f"[{sym}] training failed: {e}", exc_info=True)
-                        _record_run(ch, "partial_failure", started_at,
-                                    f"symbol={sym}: {e}")
+                log.info(f"[{strat}] Training final model: {best_type} (pooled={is_pooled})")
+                if is_pooled:
+                    pooled_df = build_dataset_pooled(ch, strat)
+                    train_final_model_pooled(pooled_df, mc, best_type)
+                else:
+                    for sym in target_syms:
+                        try:
+                            df = build_dataset(ch, sym, strat)
+                            if not df.empty:
+                                train_final_model(df, sym, mc, best_type, strat)
+                        except Exception as e:
+                            log.error(f"[{sym}][{strat}] training failed: {e}", exc_info=True)
+                            _record_run(ch, "partial_failure", started_at,
+                                        f"symbol={sym} strategy={strat}: {e}")
 
             # Always score today after training so intraday_monitor has fresh scores
             log.info("Scoring today after model update...")
             for sym in target_syms:
-                try:
-                    score_today(ch, mc, sym)
-                except Exception as e:
-                    log.error(f"[{sym}] score_today failed: {e}", exc_info=True)
-                    _record_run(ch, "partial_failure", started_at,
-                                f"score_today symbol={sym}: {e}")
+                for strat in target_strategies:
+                    try:
+                        score_today(ch, mc, sym, strat)
+                    except Exception as e:
+                        log.error(f"[{sym}][{strat}] score_today failed: {e}", exc_info=True)
+                        _record_run(ch, "partial_failure", started_at,
+                                    f"score_today symbol={sym} strategy={strat}: {e}")
         else:
-            symbols = [args.symbol] if args.symbol else SYMBOLS
-            for sym in symbols:
-                try:
-                    run_symbol(sym, ch, mc, args.backtest_only, args.score_only, args.model_type)
-                except Exception as e:
-                    log.error(f"[{sym}] failed: {e}", exc_info=True)
-                    _record_run(ch, "partial_failure", started_at,
-                                f"symbol={sym}: {e}")
+            for sym in target_syms:
+                for strat in target_strategies:
+                    try:
+                        run_symbol(sym, ch, mc, args.backtest_only, args.score_only,
+                                   args.model_type, strat)
+                    except Exception as e:
+                        log.error(f"[{sym}][{strat}] failed: {e}", exc_info=True)
+                        _record_run(ch, "partial_failure", started_at,
+                                    f"symbol={sym} strategy={strat}: {e}")
 
         log.info("confidence_scorer done")
         _record_run(ch, "success", started_at)
