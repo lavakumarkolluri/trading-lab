@@ -242,19 +242,20 @@ if page == "System Health":
 
     st.divider()
 
-    # ── Last 7 deployments (stage → prod propagation history) ─────────────────
-    st.subheader("Last 7 Deployments  (stage → prod)")
+    # ── Commit / Deploy History ────────────────────────────────────────────────
+    st.subheader("📋 Commit History")
     st.caption(
-        "Every auto-deploy that detects a code change runs the test suite and records here. "
-        "Stage auto-merges to prod when all tests pass."
+        "Each row = a commit detected on master by the scheduler. "
+        "Flow: push to `stage` → GitHub Actions CI → auto-merge to `master` → scheduler picks up → row appears here. "
+        "🟢 On Master = tests passed & live in prod. 🔴 CI Failed = blocked on stage."
     )
 
     deploy_df = query("""
-        SELECT branch, commit_sha, commit_msg, commit_author,
+        SELECT branch, commit_sha, commit_msg, commit_author, commit_ts,
                tests_passed, tests_failed, tests_total, duration_s, status, run_at
         FROM system_meta.deploy_log
         ORDER BY run_at DESC
-        LIMIT 7
+        LIMIT 30
     """)
 
     if deploy_df.empty:
@@ -270,16 +271,18 @@ if page == "System Health":
             n_f = int(r["tests_failed"])
             n_t = int(r["tests_total"])
             ok  = n_f == 0 and n_p > 0
-            run_ts = pd.Timestamp(r["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
+            run_ts    = pd.Timestamp(r["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
+            commit_ts = str(r.get("commit_ts", ""))[:16]
+            lifecycle = ("🟢 On Master" if ok else "🔴 CI Failed")
             deploy_rows.append({
-                "Date / Time (IST)": run_ts.astimezone(IST).strftime("%d %b %Y  %H:%M"),
-                "Branch":            str(r["branch"]),
-                "Commit":            str(r["commit_sha"])[:10],
-                "Message":           str(r["commit_msg"])[:60],
-                "Author":            str(r["commit_author"])[:20],
-                "Tests":             f"{n_p}/{n_t}",
-                "Status":            "🟢 pass" if ok else "🔴 FAIL",
-                "Dur (s)":           f"{float(r['duration_s']):.0f}",
+                "📅 Deployed (IST)": run_ts.astimezone(IST).strftime("%d %b  %H:%M"),
+                "✏️ Commit":          str(r["commit_sha"])[:10],
+                "💬 Message":         str(r["commit_msg"])[:70],
+                "👤 Author":          str(r["commit_author"])[:20],
+                "🕐 Committed":       commit_ts,
+                "🧪 Tests":           f"{n_p}/{n_t}" + (f"  ❌{n_f}" if n_f else ""),
+                "📍 Stage":           lifecycle,
+                "⏱️ CI (s)":          f"{float(r['duration_s']):.0f}",
             })
         st.dataframe(pd.DataFrame(deploy_rows), use_container_width=True, hide_index=True)
 
