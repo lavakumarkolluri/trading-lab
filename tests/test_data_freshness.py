@@ -221,11 +221,12 @@ def test_data_freshness_service_in_compose():
 
 
 def test_data_freshness_in_dockerfile():
-    """Dockerfile must COPY data_freshness_check.py."""
+    """Dockerfile must copy data_freshness_check.py (explicit or via wildcard)."""
     df_path = os.path.join(os.path.dirname(__file__), "..", "pipeline", "Dockerfile")
     with open(df_path) as f:
         content = f.read()
-    assert "data_freshness_check.py" in content, "data_freshness_check.py not copied in Dockerfile"
+    copied = "data_freshness_check.py" in content or "COPY *.py" in content
+    assert copied, "data_freshness_check.py not copied in Dockerfile"
 
 
 def test_data_freshness_scheduled_in_scheduler():

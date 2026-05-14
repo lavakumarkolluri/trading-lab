@@ -21,31 +21,19 @@ Usage:
 
 import os
 import math
-import logging
 import argparse
 from datetime import date, datetime, timezone
 
 import pandas as pd
 import numpy as np
-import clickhouse_connect
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+from ch_utils import ch_client as get_ch
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 RISK_FREE_RATE = 0.065
 MIN_PRICE      = 0.5     # minimum option price for IV calc
 OTM_RANGE      = 0.03    # strikes 1-3% OTM for skew calculation
-
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
 
 
 # ── BS IV (same as compute_historical_iv) ─────────────────

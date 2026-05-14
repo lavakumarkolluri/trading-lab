@@ -24,21 +24,19 @@ Docker:
 """
 
 import os
-import logging
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import schedule
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 import sys
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 _COMPOSE_FILE = os.getenv("COMPOSE_FILE", "docker-compose.yml")
 _PROJECT_DIR  = os.path.dirname(_COMPOSE_FILE) if "/" in _COMPOSE_FILE else "."
@@ -57,14 +55,8 @@ _COMPOSE_BASE = [
     "--project-directory", _PROJECT_DIR,
 ]
 
-try:
-    from pipeline_utils import GIT_SHA
-    from ch_utils import ch_client as _ch_client
-    _TRACKING_OK = True
-except ImportError:
-    GIT_SHA = "unknown"
-    _TRACKING_OK = False
-    log.warning("pipeline_utils/ch_utils not importable — pipeline_runs tracking disabled")
+from ch_utils import ch_client as _ch_client, GIT_SHA
+_TRACKING_OK = True
 
 
 def _record_run(service: str, started_at: datetime, status: str,

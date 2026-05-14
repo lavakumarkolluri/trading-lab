@@ -29,7 +29,6 @@ Live trading requires env vars:
 """
 
 import json
-import logging
 import math
 import os
 import signal
@@ -37,16 +36,12 @@ import time
 import uuid
 import argparse
 import zoneinfo
-from datetime import datetime, time as dtime, date, timedelta
+from datetime import datetime, time as dtime, date, timedelta, timezone
 
-import clickhouse_connect
+from ch_utils import ch_client as _ch_client
 from kite_orders import KiteOrderManager, build_kite_client
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -76,11 +71,6 @@ WING_PTS = {"NIFTY": 200.0, "BANKNIFTY": 500.0, "FINNIFTY": 200.0}
 DELTA_HEDGE_THRESHOLD = 0.15   # hedge when |net_delta| exceeds this
 RISK_FREE_RATE        = 0.065  # India 10-yr approx
 
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
-
 def _assert_env(*names: str):
     missing = [n for n in names if not os.getenv(n)]
     if missing:
@@ -102,9 +92,7 @@ signal.signal(signal.SIGTERM, _sigterm_handler)
 # ── Connections ───────────────────────────────────────────────────────────────
 
 def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
+    return _ch_client()
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────

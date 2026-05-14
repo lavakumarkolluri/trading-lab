@@ -16,35 +16,20 @@ via the incremental watermark check.
 
 import io
 import requests
-import clickhouse_connect
 import pandas as pd
 import os
-import logging
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timedelta
 from tenacity import retry, stop_after_attempt, wait_exponential
-from minio import Minio
 from minio.error import S3Error
 
-
-# ── Logging ────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client, minio_client as get_minio_client
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 # ── Config ─────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
-
-MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 
 MFAPI_BASE        = "https://api.mfapi.in/mf"
@@ -56,19 +41,6 @@ INACTIVITY_DAYS   = 10    # skip schemes with no NAV in this many days
 # ── Results Tracker ────────────────────────────────────
 results      = {"success": [], "skipped": [], "failed": []}
 results_lock = threading.Lock()
-
-
-# ── ClickHouse Client ──────────────────────────────────
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
-
-
-def get_minio_client() -> Minio:
-    return Minio(MINIO_HOST, access_key=MINIO_USER,
-                 secret_key=MINIO_PASS, secure=False)
 
 
 def setup_minio_bucket(mc: Minio):

@@ -27,7 +27,13 @@ jobs:
           python-version: '3.12'
 
       - name: Install test dependencies
-        run: pip install -r tests/requirements.txt
+        run: pip install -r tests/requirements.txt pyyaml
+
+      - name: Lint boilerplate patterns
+        run: python scripts/lint_boilerplate.py --warn-only
+
+      - name: Check env consistency
+        run: python scripts/check_env_consistency.py
 
       - name: Run tests
         run: pytest tests/ -v --tb=short --timeout=30

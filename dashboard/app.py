@@ -51,6 +51,16 @@ def query(sql: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=30)
+def query_live(sql: str) -> pd.DataFrame:
+    """30-second cache for live trade data (positions, today's P&L, mark prices)."""
+    try:
+        return get_ch().query_df(sql)
+    except Exception as e:
+        st.error(f"Query failed: {e}")
+        return pd.DataFrame()
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def fmt_inr(val: float) -> str:
     if abs(val) >= 1_00_000:
@@ -1498,7 +1508,9 @@ elif page == "Trade Log":
 
     # ── Open Positions ────────────────────────────────────────────────────────
     st.subheader("Open Positions")
-    open_df = query("""
+    if st.button("🔄 Refresh positions", key="refresh_pos"):
+        query_live.clear()
+    open_df = query_live("""
         SELECT symbol, expiry, entry_time, strike,
                entry_ce_ltp, entry_pe_ltp, entry_premium,
                lot_size, lots, target_inr, stoploss_inr,
@@ -1521,7 +1533,7 @@ elif page == "Trade Log":
             wpe    = float(r.get("wing_pe_strike", 0) or 0)
             is_fly = wce > 0
 
-            mark_df = query(f"""
+            mark_df = query_live(f"""
                 SELECT sumIf(ltp, option_type='CE') + sumIf(ltp, option_type='PE') AS curr
                 FROM market.options_chain
                 WHERE symbol='{sym}' AND strike={strike} AND expiry='{expiry}'
@@ -1533,7 +1545,7 @@ elif page == "Trade Log":
             curr_straddle = float(mark_df["curr"].iloc[0]) if not mark_df.empty else None
             curr_net = curr_straddle
             if is_fly and curr_straddle is not None:
-                wing_df = query(f"""
+                wing_df = query_live(f"""
                     SELECT
                         sumIf(ltp, option_type='CE' AND strike={wce}) AS wce_ltp,
                         sumIf(ltp, option_type='PE' AND strike={wpe}) AS wpe_ltp
@@ -1580,7 +1592,7 @@ elif page == "Trade Log":
 
     # ── Today's Completed Trades ──────────────────────────────────────────────
     st.subheader("Today's Trades")
-    today_df = query("""
+    today_df = query_live("""
         SELECT symbol, strike, expiry,
                entry_time, exit_time, exit_reason,
                entry_premium, exit_premium,

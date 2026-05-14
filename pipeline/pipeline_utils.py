@@ -102,3 +102,20 @@ class PipelineRun:
             import logging
             logging.getLogger(__name__).warning("pipeline_utils: failed to write run record: %s", e)
         return False  # never suppress exceptions
+
+
+def record_run(ch, service: str, status: str, started_at, error_msg: str = ""):
+    """Lightweight one-shot run record for scripts that don't use PipelineRun context."""
+    from datetime import datetime
+    try:
+        ch.command(
+            """INSERT INTO system_meta.pipeline_runs
+               (service, started_at, finished_at, status, git_sha, error_msg)
+               VALUES ({svc:String},{start:DateTime},{end:DateTime},{st:String},{sha:String},{err:String})""",
+            parameters={"svc": service, "start": started_at,
+                        "end": datetime.utcnow(), "st": status,
+                        "sha": GIT_SHA, "err": error_msg},
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("pipeline_runs write failed: %s", e)
