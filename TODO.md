@@ -1,5 +1,5 @@
 # Trading Lab — Prioritised Backlog
-**Last updated:** 2026-05-13
+**Last updated:** 2026-05-14
 **Process:** Every fix must have a failing test written first (TDD). Tests must run offline (mock DB). Push to `stage` — never `master` directly.
 
 ---
@@ -16,7 +16,7 @@
 
 ## 🔴 CRITICAL
 
-### CRIT-001 — Target variable ignores costs → model trains on wrong signal
+### ~~CRIT-001~~ ✅ FIXED 2026-05-14 — Target variable ignores costs → model trains on wrong signal
 **File:** `pipeline/confidence_scorer.py` → `build_dataset()`
 **Bug:** `target = (pnl_pts > 0)` labels any positive point gain as WIN, even when it is a loss after iron fly wing costs + transaction costs + 1% SPAN threshold.
 **Impact:** Model learns a corrupt signal. High confidence score ≠ real-world profitability.
@@ -29,7 +29,7 @@
 
 ---
 
-### CRIT-002 — Walk-forward CV splits on expiry_dt → train/test contamination (lookahead bias)
+### ~~CRIT-002~~ ✅ FIXED 2026-05-14 — Walk-forward CV splits on expiry_dt → train/test contamination (lookahead bias)
 **File:** `pipeline/confidence_scorer.py` → `walk_forward_split()`
 **Bug:** Folds split by `expiry_dt`. A trade entered on 2023-12-20 with expiry 2023-12-28 could be in "train" even though its features were extracted after the test fold's start date.
 **Impact:** Model sees future data during training. OOS AUC is optimistic; live performance will be worse.
@@ -38,7 +38,7 @@
 
 ---
 
-### CRIT-003 — options_eod_summary is NIFTY-only; used for all symbols → silent wrong IV rank
+### ~~CRIT-003~~ ✅ FIXED 2026-05-14 — options_eod_summary is NIFTY-only; used for all symbols → silent wrong IV rank
 **File:** `pipeline/confidence_scorer.py` → `load_eod_summary()`
 **File:** `pipeline/options_eod_summary_pipeline.py`
 **Bug:** `market.options_eod_summary` only contains NIFTY rows. When `load_eod_summary("BANKNIFTY")` is called, it returns empty/wrong data. IV rank, IV percentile, PCR (EOD) features are 0 or NaN for BANKNIFTY/FINNIFTY/MIDCPNIFTY.
@@ -48,7 +48,7 @@
 
 ---
 
-### CRIT-004 — INDEX_MAP wrong for FINNIFTY and MIDCPNIFTY → wrong technical signals
+### ~~CRIT-004~~ ✅ FIXED 2026-05-14 — INDEX_MAP wrong for FINNIFTY and MIDCPNIFTY → wrong technical signals
 **File:** `pipeline/confidence_scorer.py` → `INDEX_MAP`
 **Bug:** `INDEX_MAP = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "^NSEI", "MIDCPNIFTY": "^NSEI"}`
 FINNIFTY and MIDCPNIFTY both use `"^NSEI"` (NIFTY 50) for ATR, RSI, supertrend, CPR features.
@@ -107,7 +107,7 @@ FINNIFTY and MIDCPNIFTY both use `"^NSEI"` (NIFTY 50) for ATR, RSI, supertrend, 
 
 ---
 
-### HIGH-004 — MIN_TRAIN=25 too low for XGBoost
+### ~~HIGH-004~~ ✅ FIXED 2026-05-14 — MIN_TRAIN=25 too low for XGBoost
 **File:** `pipeline/confidence_scorer.py`
 **Bug:** `MIN_TRAIN = 25`. XGBoost with 25 training rows will overfit severely.
 **Fix:** `MIN_TRAIN = 60`. With weekly expiries since 2019 → ~300 rows per symbol. 60 minimum gives meaningful first folds.
