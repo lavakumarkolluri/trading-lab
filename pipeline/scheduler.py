@@ -228,6 +228,13 @@ def job_auto_deploy():
         # ── Rebuild pipeline image and self-restart ───────────────────────────
         pipeline_changed = any(f.startswith("pipeline/") for f in changed)
         if pipeline_changed:
+            # Block self-restart during market hours to prevent missing intraday launches.
+            if _is_intraday_market_hours(datetime.utcnow()):
+                log.warning(
+                    "AUTO-DEPLOY: pipeline changed but skipping self-restart "
+                    "— market hours active (03:30-10:00 UTC). Will restart after 10:00 UTC."
+                )
+                return
             log.info("AUTO-DEPLOY: pipeline code changed — rebuilding image...")
             _compose(["build", "scheduler"])   # scheduler = pipeline image
             log.info("AUTO-DEPLOY: rebuild done — exiting for self-restart "
@@ -791,6 +798,24 @@ def job_pre_market_check():
     _run("pre_market_check")
 
 
+def job_intraday_post_check():
+    """Mon–Fri 10:00 UTC (15:30 IST) — alert if intraday_monitor produced no trades today."""
+    if _container_is_running("intraday_monitor"):
+        return  # still running — skip, it will finish on its own
+    try:
+        ch = _ch_client()
+        rows = ch.query(
+            "SELECT count() FROM market.open_positions WHERE toDate(entry_time) = today()"
+        ).result_rows
+        count = rows[0][0] if rows else 0
+        if count == 0:
+            msg = "⚠️ intraday_monitor: no positions recorded today — check scheduler logs for missed window"
+            log.warning(msg)
+            _send_telegram(msg)
+    except Exception as e:
+        log.warning("Intraday post-check failed: %s", e)
+
+
 def job_cleanup_kpi_check():
     """Daily 10:00 UTC — alert if any cleanup task has not run in >10 days."""
     if not _TRACKING_OK:
@@ -811,21 +836,69 @@ def job_cleanup_kpi_check():
             _send_telegram(f"⚠️ Cleanup overdue: {task} last ran {age_days}d ago")
 
 
+def _is_intraday_market_hours(now_utc: datetime) -> bool:
+    """True if now_utc is within the intraday window Mon-Fri 03:30-10:00 UTC."""
+    from datetime import time as _t
+    return now_utc.weekday() < 5 and _t(3, 30) <= now_utc.time() <= _t(10, 0)
+
+
+def _container_is_running(name: str) -> bool:
+    """Returns True if a Docker container with this name is currently running."""
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", "--format={{.State.Status}}", name],
+            capture_output=True, text=True, timeout=10,
+        )
+        return r.stdout.strip() == "running"
+    except Exception:
+        return False
+
+
 def _startup_recovery():
     """
-    On scheduler restart, check if today's critical EOD jobs were missed.
-    Only re-triggers if we're within a 4-hour catch-up window of the expected
-    run time and today is a weekday.
+    On scheduler restart, check if today's critical jobs were missed.
+
+    Intraday recovery: if within 03:40-09:55 UTC Mon-Fri and the intraday
+    containers are not running, launch them immediately.
+
+    EOD recovery: if within 12:30-16:30 UTC and option_chain_historical has
+    no DB run record, re-trigger the EOD chain.
     """
     now_utc = datetime.utcnow()
     if now_utc.weekday() >= 5:  # weekend — no recovery
         return
+
+    # A3: guard against CH_PASSWORD not set (causes Code 194 auth failure)
+    if not os.environ.get("CH_PASSWORD", ""):
+        log.error("STARTUP RECOVERY DISABLED: CH_PASSWORD env var is not set")
+        return
+
+    # ── Intraday recovery: 03:40-09:55 UTC (09:10-15:25 IST) ─────────────────
+    intraday_start = now_utc.replace(hour=3, minute=40, second=0, microsecond=0)
+    intraday_end   = now_utc.replace(hour=9, minute=55, second=0, microsecond=0)
+
+    if _is_intraday_market_hours(now_utc) and intraday_start <= now_utc <= intraday_end:
+        if not _container_is_running("option_chain_intraday"):
+            elapsed = int((now_utc - intraday_start).total_seconds() / 60)
+            log.warning(
+                "STARTUP RECOVERY: option_chain_intraday not running "
+                "(%d min into intraday window) — launching now.", elapsed,
+            )
+            job_option_chain_intraday()
+        if not _container_is_running("intraday_monitor"):
+            elapsed = int((now_utc - intraday_start).total_seconds() / 60)
+            log.warning(
+                "STARTUP RECOVERY: intraday_monitor not running "
+                "(%d min into intraday window) — launching now.", elapsed,
+            )
+            job_intraday_monitor()
+
+    # ── EOD recovery: 12:30-16:30 UTC (18:00-22:00 IST) ─────────────────────
     if not _TRACKING_OK:
-        log.warning("Startup recovery skipped — tracking unavailable")
+        log.warning("EOD startup recovery skipped — tracking unavailable")
         return
 
     today_str = now_utc.strftime("%Y-%m-%d")
-    # EOD chain runs at 12:30 UTC; recovery window is 12:30–16:30 UTC (4h)
     eod_window_start = now_utc.replace(hour=12, minute=30, second=0, microsecond=0)
     eod_window_end   = eod_window_start + timedelta(hours=4)
 
@@ -926,6 +999,7 @@ def main():
     log.info("  Dashboard health    : every 15 min — Telegram alert if container down")
     log.info("  Watchdog health     : every 15 min — Telegram alert if watchdog container down")
     log.info("  Pre-market check    : Mon–Fri 03:00 UTC (08:30 IST) — GO/NO-GO before open")
+    log.info("  Intraday post-check : Mon–Fri 10:00 UTC (15:30 IST) — alert if no trades recorded")
     log.info("  Cleanup KPI check   : daily 10:00 UTC — alert if cleanup overdue >10 days")
     log.info("  Auto-deploy         : every 15 min — git pull + rebuild on change")
 
@@ -1010,8 +1084,12 @@ def main():
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("03:00").do(job_pre_market_check)
 
-    # Cleanup KPI check: daily 10:00 UTC
-    schedule.every().day.at("10:00").do(job_cleanup_kpi_check)
+    # Post-intraday check: 15:30 IST (10:00 UTC) Mon–Fri — alert if no trades recorded
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("10:00").do(job_intraday_post_check)
+
+    # Cleanup KPI check: daily 10:15 UTC (shifted to avoid conflict)
+    schedule.every().day.at("10:15").do(job_cleanup_kpi_check)
 
     # Auto-deploy: pull master every 15 min, rebuild+restart if code changed
     schedule.every(15).minutes.do(job_auto_deploy)
