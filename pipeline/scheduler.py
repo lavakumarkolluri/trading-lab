@@ -350,6 +350,16 @@ def job_signal_agent():
     _run("signal_agent")
 
 
+def job_analysis_agent_daily():
+    log.info("=== Analysis Agent: daily trade summary ===")
+    _run("analysis_agent")
+
+
+def job_analysis_agent_weekly():
+    log.info("=== Analysis Agent: weekly full report ===")
+    _run("analysis_agent", "--weekly")
+
+
 def job_strategy_selector_recommend():
     log.info("=== Strategy selector daily recommendation triggered ===")
     _run("strategy_selector", "--recommend")
@@ -840,6 +850,10 @@ def main():
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("13:10").do(job_signal_agent)
 
+    # Analysis Agent daily: post-market trade summary at 13:15 UTC (18:45 IST)
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("13:15").do(job_analysis_agent_daily)
+
     # Graduation gate: after daily scorer at 13:05 UTC (18:35 IST)
     # Updates analysis.strategy_graduation so dashboard shows current stage
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
@@ -856,6 +870,7 @@ def main():
     schedule.every().sunday.at("07:00").do(job_confidence_scorer)   # 90 min after backtester
     schedule.every().sunday.at("07:30").do(job_graduation_gate)     # after weekly retrain
     schedule.every().sunday.at("08:00").do(job_strategy_selector_backtest)
+    schedule.every().sunday.at("08:30").do(job_analysis_agent_weekly)  # weekly full report
     schedule.every().sunday.at("09:00").do(job_cleanup)  # 09:00 UTC = 14:30 IST
 
     # Daily recommendation: 30 min before market open (10:30 UTC = 16:00 IST)
