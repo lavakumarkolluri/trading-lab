@@ -724,43 +724,81 @@ if page == "System Health":
             st.warning(f"Docker SDK unavailable: {_e}")
             st.caption("Ensure /var/run/docker.sock is mounted and the `docker` package is installed.")
 
-    # ── Cleanup Log tab ───────────────────────────────────────────────────────
+    # ── Cleanup KPIs tab ──────────────────────────────────────────────────────
     with _res_tabs[2]:
-        _cl_df = query("""
-            SELECT task_name, status, items_freed, bytes_freed, detail,
-                   ran_at
+        st.caption("Per-task cleanup health — last 30 days. 🟢 OK · 🟡 Has errors · 🔴 Overdue (>10 days).")
+        _kpi_df = query("""
+            SELECT
+                task_name,
+                count()                          AS runs,
+                countIf(status='ok')             AS success_runs,
+                countIf(status='error')          AS errors,
+                sum(items_freed)                 AS total_items,
+                sum(bytes_freed)                 AS total_bytes,
+                max(ran_at)                      AS last_ran
             FROM system_meta.cleanup_log
-            ORDER BY ran_at DESC
-            LIMIT 50
+            WHERE ran_at >= now() - INTERVAL 30 DAY
+            GROUP BY task_name
+            ORDER BY task_name
         """)
-        if _cl_df.empty:
-            st.info("No cleanup runs recorded yet. Cleanup runs every Sunday 09:00 UTC.")
+        if _kpi_df.empty:
+            st.info("No cleanup runs in the last 30 days. Cleanup runs every Sunday 09:00 UTC.")
         else:
-            _cl_df["bytes_freed"] = _cl_df["bytes_freed"].apply(
-                lambda x: _fmt_bytes(int(x)) if x and int(x) > 0 else "—"
-            )
-            _cl_df["ran_at"] = pd.to_datetime(_cl_df["ran_at"])
-            _cl_df["ran_at"] = _cl_df["ran_at"].apply(
-                lambda d: d.strftime("%Y-%m-%d %H:%M") if pd.notna(d) else "—"
-            )
-            st.dataframe(
-                _cl_df.rename(columns={
-                    "task_name": "Task", "status": "Status",
-                    "items_freed": "Items Freed", "bytes_freed": "Bytes Freed",
-                    "detail": "Detail", "ran_at": "Ran At",
-                }),
-                use_container_width=True, hide_index=True,
-            )
-            # Show docker system df from latest docker_assessment detail
-            _last_docker = _cl_df[_cl_df["Task"] == "docker_assessment"].head(1)
-            if not _last_docker.empty:
-                try:
-                    _d = json.loads(_last_docker.iloc[0]["Detail"])
-                    if _d.get("system_df"):
-                        with st.expander("docker system df (from last assessment)"):
-                            st.code(_d["system_df"])
-                except Exception:
-                    pass
+            _kpi_rows = []
+            for _, r in _kpi_df.iterrows():
+                last_ran = pd.Timestamp(r["last_ran"])
+                if last_ran.tzinfo is None:
+                    last_ran = last_ran.tz_localize("UTC")
+                last_ran_ist = last_ran.astimezone("Asia/Kolkata").strftime("%d %b %H:%M IST")
+                age_days = (datetime.utcnow() - last_ran.tz_localize(None)).days
+                errors = int(r["errors"])
+                if age_days > 10:
+                    badge = "🔴 Overdue"
+                elif errors > 0:
+                    badge = f"🟡 {errors} error(s)"
+                else:
+                    badge = "🟢 OK"
+                total_bytes = int(r["total_bytes"]) if r["total_bytes"] else 0
+                freed_str = _fmt_bytes(total_bytes) if total_bytes > 0 else "—"
+                items = int(r["total_items"]) if r["total_items"] else 0
+                freed_detail = f"{freed_str} / {items:,} items" if items > 0 else freed_str
+                _kpi_rows.append({
+                    "Task":        str(r["task_name"]),
+                    "Runs (30d)":  int(r["runs"]),
+                    "Successes":   int(r["success_runs"]),
+                    "Total Freed": freed_detail,
+                    "Last Run":    last_ran_ist,
+                    "Status":      badge,
+                })
+            st.dataframe(pd.DataFrame(_kpi_rows), use_container_width=True, hide_index=True)
+
+        _hist_df = query("""
+            SELECT task_name, status, items_freed, bytes_freed, ran_at
+            FROM system_meta.cleanup_log
+            ORDER BY ran_at DESC LIMIT 20
+        """)
+        if not _hist_df.empty:
+            with st.expander("Run history (last 20 across all tasks)"):
+                _hist_df["bytes_freed"] = _hist_df["bytes_freed"].apply(
+                    lambda x: _fmt_bytes(int(x)) if x and int(x) > 0 else "—"
+                )
+                _hist_df["ran_at"] = pd.to_datetime(_hist_df["ran_at"]).dt.strftime("%Y-%m-%d %H:%M")
+                # Show docker system df from last docker_assessment
+                _last_docker = _hist_df[_hist_df["task_name"] == "docker_assessment"].head(1)
+                st.dataframe(
+                    _hist_df.rename(columns={
+                        "task_name": "Task", "status": "Status",
+                        "items_freed": "Items", "bytes_freed": "Freed", "ran_at": "Ran At",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+                if not _last_docker.empty:
+                    try:
+                        _d = json.loads(_last_docker.iloc[0]["detail"] if "detail" in _last_docker else "{}")
+                        if _d.get("system_df"):
+                            st.code(_d["system_df"], language=None)
+                    except Exception:
+                        pass
 
     # ── Suggestions tab ───────────────────────────────────────────────────────
     with _res_tabs[3]:
