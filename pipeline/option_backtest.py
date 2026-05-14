@@ -46,7 +46,6 @@ import os
 import sys
 import time
 import zipfile
-import logging
 import argparse
 import threading
 from datetime import date, timedelta, datetime
@@ -54,27 +53,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
-import clickhouse_connect
 from curl_cffi import requests as cffi_requests
 from fo_utils import build_lot_size_cache, get_lot_size
 from minio import Minio
 from minio.error import S3Error
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client, minio_client as get_minio_client
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 # ── Config ──────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
-
-MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 
 LOOKBACK_DAYS  = 730
@@ -102,18 +90,6 @@ BHAVCOPY_URL = (
 # PCR thresholds (same as option_chain_pipeline)
 PCR_BULLISH = 1.3
 PCR_BEARISH = 0.7
-
-
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
-
-
-def get_minio_client() -> Minio:
-    return Minio(MINIO_HOST, access_key=MINIO_USER,
-                 secret_key=MINIO_PASS, secure=False)
 
 
 def setup_minio_bucket(mc: Minio):

@@ -17,6 +17,7 @@ services:
       - .:/home/coder/trading-lab
     environment:
       - PASSWORD=${VSCODE_PASSWORD}
+      - TZ=Asia/Kolkata
     restart: unless-stopped
 
   minio:
@@ -30,6 +31,7 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+      TZ: Asia/Kolkata
     command: server /data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -53,6 +55,7 @@ services:
       # Required: v26 entrypoint disables network access for default user if
       # CLICKHOUSE_PASSWORD is absent — from_env XML alone is not sufficient.
       CLICKHOUSE_PASSWORD: ${CH_PASSWORD}
+      TZ: Asia/Kolkata
     ulimits:
       nofile:
         soft: 262144
@@ -75,6 +78,7 @@ services:
       - ./workspace:/home/jovyan/work
     environment:
       - JUPYTER_TOKEN=${JUPYTER_TOKEN}
+      - TZ=Asia/Kolkata
     restart: unless-stopped
 
   portainer:
@@ -102,6 +106,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -119,6 +124,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -137,6 +143,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -153,6 +160,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -168,6 +176,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -183,6 +192,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -197,6 +207,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -212,6 +223,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -227,6 +239,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -242,6 +255,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -257,6 +271,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -272,6 +287,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -292,6 +308,7 @@ services:
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -310,6 +327,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -327,6 +345,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -345,6 +364,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -364,6 +384,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -384,6 +405,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -404,6 +426,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -424,6 +447,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -441,6 +465,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -459,6 +484,7 @@ services:
       - GAP_LLM_ENABLED=${GAP_LLM_ENABLED:-false}
       - GAP_LLM_MODEL=${GAP_LLM_MODEL:-claude-sonnet-4-6}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -502,6 +528,8 @@ services:
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
       - TZ=Asia/Kolkata
+      - KITE_API_KEY=${KITE_API_KEY:-}
+      - KITE_ACCESS_TOKEN=${KITE_ACCESS_TOKEN:-}
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -526,6 +554,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -543,6 +572,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -558,6 +588,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -573,6 +604,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -589,11 +621,14 @@ services:
       # Mount app.py directly so edits are picked up by Streamlit hot-reload
       # without rebuilding the image.
       - ./dashboard/app.py:/app/app.py:ro
+      # Read-only Docker socket so the Resources page can query image/container/volume sizes.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - CH_HOST=clickhouse
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -610,6 +645,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -627,6 +663,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -645,6 +682,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -652,6 +690,22 @@ services:
         condition: service_healthy
     restart: "no"
     entrypoint: ["python", "confidence_scorer.py"]
+    command: []
+
+  graduation_gate:
+    build: *pipeline-build
+    container_name: graduation_gate
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "graduation_gate.py"]
     command: []
 
   strategy_selector:
@@ -662,6 +716,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -679,6 +734,7 @@ services:
       - CH_PASSWORD=${CH_PASSWORD}
       # In-container path: project is bind-mounted at /trading-lab:ro
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
+      - TZ=Asia/Kolkata
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock  # rw: recompute calls docker compose run
     depends_on:
@@ -699,6 +755,7 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -716,6 +773,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -731,6 +789,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -746,11 +805,28 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
     restart: "no"
     entrypoint: ["python", "weekend_theta_backtest.py"]
+    command: []
+
+  compute_vol_surface:
+    build: *pipeline-build
+    container_name: compute_vol_surface
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "compute_vol_surface.py"]
     command: []
 
   compute_greeks:
@@ -761,6 +837,7 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -778,11 +855,69 @@ services:
       - CH_PASSWORD=${CH_PASSWORD}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TZ=Asia/Kolkata
     depends_on:
       clickhouse:
         condition: service_healthy
     restart: "no"
     entrypoint: ["python", "data_freshness_check.py"]
+    command: []
+
+  analysis_agent:
+    build: *pipeline-build
+    container_name: analysis_agent
+    volumes:
+      - .:/trading-lab
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - REPORT_DIR=/trading-lab/agents/analysis
+      - TZ=Asia/Kolkata
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "analysis_agent.py"]
+    command: []
+
+  signal_agent:
+    build: *pipeline-build
+    container_name: signal_agent
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TZ=Asia/Kolkata
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["python", "signal_agent.py"]
+    command: []
+
+  monitor_agent:
+    build: *pipeline-build
+    container_name: monitor_agent
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TZ=Asia/Kolkata
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    entrypoint: ["python", "monitor_agent.py"]
     command: []
 
   scheduler:
@@ -794,7 +929,7 @@ services:
       - .:/trading-lab
     environment:
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
-      - TZ=UTC
+      - TZ=Asia/Kolkata
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}

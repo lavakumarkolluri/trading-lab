@@ -16,7 +16,6 @@ Run modes:
 
 import io
 import json
-import logging
 import os
 import re
 import argparse
@@ -28,20 +27,12 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from minio import Minio
 
-import clickhouse_connect
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch, minio_client as get_mc
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CH_HOST      = os.getenv("CH_HOST", "clickhouse")
-CH_PORT      = int(os.getenv("CH_PORT", "8123"))
-CH_USER      = os.getenv("CH_USER", "default")
-CH_PASS      = os.getenv("CH_PASSWORD", "")
-MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 
 HEADERS = {
@@ -53,16 +44,6 @@ HEADERS = {
 
 REQUEST_TIMEOUT = 20   # seconds
 
-
-# ── Connections ───────────────────────────────────────────────────────────────
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
-
-def get_mc():
-    return Minio(MINIO_HOST, access_key=MINIO_USER, secret_key=MINIO_PASS, secure=False)
 
 
 # ── Source 1: FOMC dates ──────────────────────────────────────────────────────

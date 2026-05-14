@@ -31,32 +31,18 @@ Docker:
 """
 
 import io
-import os
-import logging
 import argparse
 from datetime import datetime, date, timedelta
 
 import pandas as pd
 import yfinance as yf
-import clickhouse_connect
-from minio import Minio
 from minio.error import S3Error
+from ch_utils import ch_client as get_ch_client, minio_client as get_minio_client
+from logging_utils import get_logger
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # ── Config ──────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
-
-MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 MINIO_KEY    = "vix/vix_nifty.parquet"
 
@@ -67,28 +53,14 @@ NIFTY_SYMBOL  = "^NSEI"
 _VIX_BANDS = [(13.0, "low"), (18.0, "normal"), (25.0, "elevated")]
 
 
-# ── Clients ─────────────────────────────────────────────
-
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
-
-
-def get_minio_client() -> Minio:
-    return Minio(MINIO_HOST, access_key=MINIO_USER,
-                 secret_key=MINIO_PASS, secure=False)
-
-
-def setup_minio_bucket(mc: Minio):
+def setup_minio_bucket(mc):
     if not mc.bucket_exists(MINIO_BUCKET):
         mc.make_bucket(MINIO_BUCKET)
 
 
 # ── MinIO helpers ────────────────────────────────────────
 
-def load_from_minio(mc: Minio) -> pd.DataFrame:
+def load_from_minio(mc) -> pd.DataFrame:
     """Load full VIX history parquet from MinIO. Returns empty DF on miss."""
     try:
         resp = mc.get_object(MINIO_BUCKET, MINIO_KEY)
@@ -103,7 +75,7 @@ def load_from_minio(mc: Minio) -> pd.DataFrame:
         return pd.DataFrame(columns=["date", "vix", "nifty_spot"])
 
 
-def save_to_minio(mc: Minio, df: pd.DataFrame):
+def save_to_minio(mc, df: pd.DataFrame):
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
     buf.seek(0)

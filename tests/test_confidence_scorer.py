@@ -5,8 +5,10 @@ after training so intraday_monitor has fresh scores the next morning.
 """
 import sys
 import os
+from datetime import date
 from unittest.mock import MagicMock, patch, call
 import pytest
+import pandas as pd
 
 import importlib
 cs = importlib.import_module("confidence_scorer")
@@ -115,3 +117,43 @@ def test_all_symbols_have_index_map_entry():
     """Every symbol in SYMBOLS must map to an index ticker in INDEX_MAP."""
     for sym in cs.SYMBOLS:
         assert sym in cs.INDEX_MAP, f"{sym} missing from INDEX_MAP"
+
+
+# ── extract_chain_features duplicate-strike regression ───────────────────────
+
+def _make_chain_df(n_snapshots=3):
+    """Build a chain DataFrame with duplicate strikes (simulating intraday snapshots)."""
+    strikes = [24000, 24100, 24200]
+    expiry  = date(2026, 6, 26)
+    snap_d  = date(2026, 5, 13)
+    rows = []
+    for t in range(n_snapshots):
+        for s in strikes:
+            for ot, ltp in [("CE", 50.0 + t), ("PE", 45.0 + t)]:
+                rows.append({
+                    "snap_date": snap_d, "expiry": expiry, "strike": float(s),
+                    "option_type": ot, "ltp": ltp, "oi": 1000 + t, "volume": 500,
+                })
+    return pd.DataFrame(rows)
+
+
+def test_extract_chain_features_handles_duplicate_strikes():
+    """extract_chain_features must not crash when multiple intraday snapshots
+    create duplicate strike index values — fixed by groupby(level=0).last()."""
+    chain = _make_chain_df(n_snapshots=4)
+    expiry  = date(2026, 6, 26)
+    snap_d  = date(2026, 5, 13)
+    result = cs.extract_chain_features(chain, snap_d, expiry)
+    assert result is not None, "extract_chain_features returned None on valid data"
+    assert "straddle_premium" in result
+    assert result["straddle_premium"] > 0
+
+
+def test_find_atm_strike_handles_duplicate_index():
+    """find_atm_strike must return a scalar float even when the Series index
+    has duplicate values (ce.loc[common] returns DataFrame → fixed by groupby)."""
+    # Duplicate entries for same strike (as happens with multi-expiry / multi-snap data)
+    ce = pd.Series([100.0, 95.0, 100.0, 45.0], index=[24000, 24100, 24000, 24200])
+    pe = pd.Series([45.0, 95.0, 45.0, 100.0],  index=[24000, 24100, 24000, 24200])
+    result = cs.find_atm_strike(ce, pe)
+    assert result == 24100.0, f"Expected ATM=24100, got {result}"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-intraday_monitor.py — Paper trading intraday straddle monitor
+intraday_monitor.py — Intraday straddle monitor (paper + live)
 
 Runs Mon–Fri 09:20–15:25 IST. Every 15 minutes:
   • If no open position: evaluate entry conditions and enter if favorable
@@ -20,12 +20,15 @@ Entry window: 09:30–14:00 IST (not before open settles, not too late)
 Re-entry   : allowed after target/trail exit; 30-min cooling after stop loss
 
 Usage:
-    python intraday_monitor.py          # live paper trading loop
-    python intraday_monitor.py --dry-run  # log signals, no DB writes
+    python intraday_monitor.py           # paper trading loop (default)
+    python intraday_monitor.py --live    # live trading via Kite API
+    python intraday_monitor.py --dry-run # log signals, no DB writes, no orders
+
+Live trading requires env vars:
+    KITE_API_KEY, KITE_ACCESS_TOKEN  (refresh daily via kite_auth.py)
 """
 
 import json
-import logging
 import math
 import os
 import signal
@@ -33,45 +36,40 @@ import time
 import uuid
 import argparse
 import zoneinfo
-from datetime import datetime, time as dtime, date, timedelta
+from datetime import datetime, time as dtime, date, timedelta, timezone
 
-import clickhouse_connect
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as _ch_client
+from kite_orders import KiteOrderManager, build_kite_client
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
-SYMBOLS = ["NIFTY", "BANKNIFTY"]
+SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
 
-DEFAULT_LOT_SIZES = {"NIFTY": 75, "BANKNIFTY": 35}
+DEFAULT_LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60}
 
 TARGET_INR   = 2000.0
 STOPLOSS_INR = 1000.0
 TRAIL_PCT    = 0.75        # trail stop = 75% of peak profit
 
-LOOP_INTERVAL_S  = 15 * 60   # 15 minutes
+LOOP_INTERVAL_S  = 5 * 60    # 5 minutes
 ENTRY_START      = dtime(9, 30)
 ENTRY_CUTOFF     = dtime(14, 0)
 EOD_EXIT         = dtime(15, 20)
 MONITOR_EXIT     = dtime(15, 25)
 STOP_COOLDOWN_M  = 30         # minutes to wait before re-entry after stop hit
 
-MIN_PREMIUM_NIFTY     = 40.0   # don't enter if straddle too cheap
-MIN_PREMIUM_BANKNIFTY = 80.0
+MIN_PREMIUM       = {"NIFTY": 40.0, "BANKNIFTY": 80.0, "FINNIFTY": 50.0}
+MIN_CONFIDENCE    = 50.0   # skip entry if scorecard below this
+
+# Iron fly wing distances (OTM strikes to buy for defined-risk structure)
+WING_PTS = {"NIFTY": 200.0, "BANKNIFTY": 500.0, "FINNIFTY": 200.0}
 
 DELTA_HEDGE_THRESHOLD = 0.15   # hedge when |net_delta| exceeds this
 RISK_FREE_RATE        = 0.065  # India 10-yr approx
-
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
 
 def _assert_env(*names: str):
     missing = [n for n in names if not os.getenv(n)]
@@ -94,9 +92,7 @@ signal.signal(signal.SIGTERM, _sigterm_handler)
 # ── Connections ───────────────────────────────────────────────────────────────
 
 def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
+    return _ch_client()
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
@@ -116,8 +112,10 @@ def ist_naive() -> datetime:
 def load_lot_sizes(ch) -> dict:
     try:
         r = ch.query("""
-            SELECT symbol, lot_size FROM market.fo_lot_sizes FINAL
-            WHERE symbol IN ('NIFTY', 'BANKNIFTY')
+            SELECT symbol, argMax(lot_size, effective_from) AS lot_size
+            FROM market.fo_lot_sizes FINAL
+            WHERE symbol IN ('NIFTY', 'BANKNIFTY', 'FINNIFTY')
+            GROUP BY symbol
         """)
         sizes = {row[0]: int(row[1]) for row in r.result_rows}
         return {**DEFAULT_LOT_SIZES, **sizes}
@@ -300,13 +298,19 @@ def record_hedge(ch, pos: dict, net_delta: float, spot: float, dry_run: bool) ->
               pos["scorecard_conf"], "open",
               int(pos["trailing_active"]), float(pos["peak_pnl_inr"]),
               float(pos["trail_stop_inr"]), now, pos.get("entry_features", "{}"),
-              net_delta, cum_lots]],
+              net_delta, cum_lots, int(pos.get("lots", 1)),
+              float(pos.get("wing_ce_strike", 0) or 0),
+              float(pos.get("wing_pe_strike", 0) or 0),
+              float(pos.get("wing_ce_ltp", 0) or 0),
+              float(pos.get("wing_pe_ltp", 0) or 0),
+              float(pos.get("net_premium", 0) or 0)]],
             column_names=["trade_id", "symbol", "expiry", "entry_time", "strike",
                           "entry_ce_ltp", "entry_pe_ltp", "entry_premium",
                           "lot_size", "target_pts", "stop_pts", "target_inr", "stoploss_inr",
                           "scorecard_conf", "status",
                           "trailing_active", "peak_pnl_inr", "trail_stop_inr", "last_checked",
-                          "entry_features", "net_delta", "hedge_lots_cum"],
+                          "entry_features", "net_delta", "hedge_lots_cum", "lots",
+                          "wing_ce_strike","wing_pe_strike","wing_ce_ltp","wing_pe_ltp","net_premium"],
         )
     return hedge_lots
 
@@ -395,6 +399,64 @@ def get_current_straddle(ch, symbol: str, expiry: date, strike: float) -> float 
         return None
 
 
+def get_wing_ltps(ch, symbol: str, expiry: date,
+                  wing_ce_strike: float, wing_pe_strike: float) -> tuple[float, float]:
+    """Fetch current LTP for OTM wing strikes. Returns (ce_ltp, pe_ltp), both 0 on failure."""
+    try:
+        r = ch.query("""
+            SELECT
+                sumIf(ltp, option_type='CE' AND strike={wce:Float32}) AS wing_ce,
+                sumIf(ltp, option_type='PE' AND strike={wpe:Float32}) AS wing_pe
+            FROM market.options_chain
+            WHERE symbol={sym:String} AND expiry={exp:Date}
+              AND toDate(timestamp)=today()
+              AND timestamp=(
+                  SELECT max(timestamp) FROM market.options_chain
+                  WHERE symbol={sym:String} AND toDate(timestamp)=today()
+              )
+            HAVING wing_ce > 0 OR wing_pe > 0
+        """, parameters={"sym": symbol, "exp": expiry,
+                         "wce": wing_ce_strike, "wpe": wing_pe_strike})
+        if not r.result_rows:
+            return 0.0, 0.0
+        return float(r.result_rows[0][0]), float(r.result_rows[0][1])
+    except Exception as e:
+        log.warning(f"[{symbol}] wing LTP query failed: %s", e)
+        return 0.0, 0.0
+
+
+def get_current_position_value(ch, symbol: str, expiry: date,
+                               strike: float, pos: dict) -> float | None:
+    """
+    Net current value of the iron fly position (straddle ltp - wing ltp).
+    Falls back to straddle-only for legacy positions with no wings (wing_ce_strike=0).
+    """
+    straddle = get_current_straddle(ch, symbol, expiry, strike)
+    if straddle is None:
+        return None
+    wce = float(pos.get("wing_ce_strike", 0))
+    wpe = float(pos.get("wing_pe_strike", 0))
+    if wce == 0 or wpe == 0:
+        return straddle   # legacy naked straddle position
+    wce_ltp, wpe_ltp = get_wing_ltps(ch, symbol, expiry, wce, wpe)
+    return straddle - wce_ltp - wpe_ltp
+
+
+def get_graduation_stage(ch, strategy_id: str = "iron_fly_0dte") -> int:
+    """Return current graduation stage (1-4) from analysis.strategy_graduation.
+    Returns 1 (backtest only — no trading) if the table is missing or the
+    strategy has no row yet.  Stage 2+ allows paper/live trading."""
+    try:
+        r = ch.query(
+            "SELECT stage FROM analysis.strategy_graduation FINAL "
+            "WHERE strategy_id = {sid:String} LIMIT 1",
+            parameters={"sid": strategy_id},
+        )
+        return int(r.result_rows[0][0]) if r.result_rows else 1
+    except Exception:
+        return 1
+
+
 def get_scorecard_confidence(ch, symbol: str) -> float:
     """Get latest confidence score for symbol, must be within last 7 days."""
     try:
@@ -420,7 +482,8 @@ def get_open_position(ch, symbol: str) -> dict | None:
                    entry_ce_ltp, entry_pe_ltp, entry_premium,
                    lot_size, target_pts, stop_pts, target_inr, stoploss_inr,
                    scorecard_conf, trailing_active, peak_pnl_inr, trail_stop_inr,
-                   entry_features
+                   entry_features, lots,
+                   wing_ce_strike, wing_pe_strike, wing_ce_ltp, wing_pe_ltp, net_premium
             FROM trades.open_positions FINAL
             WHERE symbol = {sym:String} AND status = 'open'
             ORDER BY entry_time DESC
@@ -433,7 +496,8 @@ def get_open_position(ch, symbol: str) -> dict | None:
                 "entry_ce_ltp","entry_pe_ltp","entry_premium",
                 "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                 "scorecard_conf","trailing_active","peak_pnl_inr","trail_stop_inr",
-                "entry_features"]
+                "entry_features","lots",
+                "wing_ce_strike","wing_pe_strike","wing_ce_ltp","wing_pe_ltp","net_premium"]
         return dict(zip(cols, r.result_rows[0]))
     except Exception as e:
         log.warning(f"[{symbol}] get_open_position failed: {e}")
@@ -455,66 +519,121 @@ def last_stop_time(ch, symbol: str) -> datetime | None:
         return None
 
 
-def record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run=False) -> str:
+def record_entry(ch, symbol, snap, lot_size, scorecard_conf,
+                 dry_run=False, kite_mgr: KiteOrderManager | None = None) -> str:
     trade_id = str(uuid.uuid4())
     target_pts  = TARGET_INR / lot_size
     stop_pts    = STOPLOSS_INR / lot_size
     entry_time  = ist_naive()
 
+    # Iron fly wings: buy OTM CE and PE to cap max loss
+    wing_ce_strike = snap["strike"] + WING_PTS.get(symbol, 200.0)
+    wing_pe_strike = snap["strike"] - WING_PTS.get(symbol, 200.0)
+    wing_ce_ltp, wing_pe_ltp = get_wing_ltps(
+        ch, symbol, snap["expiry"], wing_ce_strike, wing_pe_strike
+    )
+    net_premium = snap["straddle"] - wing_ce_ltp - wing_pe_ltp
+
     features = json.dumps({
-        "strike":        snap["strike"],
-        "ce_ltp":        snap["ce_ltp"],
-        "pe_ltp":        snap["pe_ltp"],
-        "straddle":      snap["straddle"],
-        "ce_iv":         snap["ce_iv"],
-        "pe_iv":         snap["pe_iv"],
-        "expiry":        str(snap["expiry"]),
+        "strike":         snap["strike"],
+        "ce_ltp":         snap["ce_ltp"],
+        "pe_ltp":         snap["pe_ltp"],
+        "straddle":       snap["straddle"],
+        "ce_iv":          snap["ce_iv"],
+        "pe_iv":          snap["pe_iv"],
+        "expiry":         str(snap["expiry"]),
         "scorecard_conf": scorecard_conf,
+        "wing_ce_strike": wing_ce_strike,
+        "wing_pe_strike": wing_pe_strike,
+        "wing_ce_ltp":    wing_ce_ltp,
+        "wing_pe_ltp":    wing_pe_ltp,
+        "net_premium":    net_premium,
     })
 
-    log.info(f"[{symbol}] ENTER trade_id={trade_id[:8]} strike={snap['strike']:.0f} "
-             f"premium={snap['straddle']:.1f} target={target_pts:.1f}pts "
-             f"stop={stop_pts:.1f}pts conf={scorecard_conf:.0f}")
+    log.info(f"[{symbol}] ENTER IRON FLY trade_id={trade_id[:8]} strike={snap['strike']:.0f} "
+             f"straddle={snap['straddle']:.1f} wings±{WING_PTS.get(symbol,200):.0f}pts "
+             f"wing_cost={wing_ce_ltp+wing_pe_ltp:.1f} net_premium={net_premium:.1f} "
+             f"target={target_pts:.1f}pts stop={stop_pts:.1f}pts conf={scorecard_conf:.0f}")
+
+    # Live order placement — size lots from available capital
+    ce_order_id = pe_order_id = ""
+    lots = 1
+    if kite_mgr is not None and not dry_run:
+        lots = kite_mgr.compute_lots(symbol, snap["expiry"], snap["strike"], lot_size)
+        ce_order_id, pe_order_id = kite_mgr.place_straddle_entry(
+            symbol, snap["expiry"], snap["strike"], lot_size, lots=lots
+        )
+        # TODO: also BUY wing_ce and wing_pe via kite for live iron fly
+
+    target_inr   = TARGET_INR   * lots
+    stoploss_inr = STOPLOSS_INR * lots
 
     if not dry_run:
         ch.insert(
             "trades.open_positions",
             [[trade_id, symbol, snap["expiry"], entry_time,
               snap["strike"], snap["ce_ltp"], snap["pe_ltp"], snap["straddle"],
-              lot_size, target_pts, stop_pts, TARGET_INR, STOPLOSS_INR,
+              lot_size, target_pts, stop_pts, target_inr, stoploss_inr,
               scorecard_conf, "open",
-              0, 0.0, 0.0, entry_time, features, 0.0, 0.0]],
+              0, 0.0, 0.0, entry_time, features, 0.0, 0.0,
+              ce_order_id, pe_order_id, lots,
+              wing_ce_strike, wing_pe_strike, wing_ce_ltp, wing_pe_ltp, net_premium]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
-                          "entry_features","net_delta","hedge_lots_cum"],
+                          "entry_features","net_delta","hedge_lots_cum",
+                          "kite_ce_order_id","kite_pe_order_id","lots",
+                          "wing_ce_strike","wing_pe_strike","wing_ce_ltp","wing_pe_ltp","net_premium"],
         )
     return trade_id
 
 
-def record_exit(ch, pos, current_straddle, exit_reason, dry_run=False):
-    pnl_pts = pos["entry_premium"] - current_straddle
-    pnl_inr = pnl_pts * pos["lot_size"]
+def record_exit(ch, pos, current_straddle, exit_reason,
+                dry_run=False, kite_mgr: KiteOrderManager | None = None):
+    lots = int(pos.get("lots", 1))
+    # For iron fly: current_straddle is the net position value (straddle - wings)
+    # For legacy naked: it's just the raw straddle
+    is_iron_fly = float(pos.get("wing_ce_strike", 0) or 0) > 0
+    entry_value = float(pos["net_premium"]) if is_iron_fly else float(pos["entry_premium"])
+    pnl_pts = entry_value - current_straddle
+    pnl_inr = pnl_pts * pos["lot_size"] * lots
     exit_time = ist_naive()
 
     log.info(f"[{pos['symbol']}] EXIT {exit_reason.upper()} trade_id={str(pos['trade_id'])[:8]} "
-             f"entry={pos['entry_premium']:.1f} exit={current_straddle:.1f} "
-             f"pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f}")
+             f"entry={'net_prem' if is_iron_fly else 'straddle'}={entry_value:.1f} "
+             f"exit={current_straddle:.1f} pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f} ({lots} lots)")
+
+    # Live exit orders
+    exit_ce_order_id = exit_pe_order_id = ""
+    if kite_mgr is not None and not dry_run:
+        exit_ce_order_id, exit_pe_order_id = kite_mgr.place_straddle_exit(
+            pos["symbol"], pos["expiry"], float(pos["strike"]),
+            pos["lot_size"], lots=lots
+        )
+        # TODO: also SELL wing_ce and wing_pe via kite for live iron fly
 
     if not dry_run:
         ch.insert(
             "trades.trade_outcomes",
             [[pos["trade_id"], pos["symbol"], pos["expiry"],
               pos["entry_time"], exit_time,
-              pos["strike"], pos["entry_premium"], current_straddle,
+              pos["strike"], entry_value, current_straddle,
               pnl_pts, pnl_inr, pos["lot_size"], exit_reason,
-              pos["scorecard_conf"], pos.get("entry_features", "{}")]],
-            column_names=["trade_id","symbol","expiry","entry_time","exit_time",
-                          "strike","entry_premium","exit_premium",
+              pos["scorecard_conf"], pos.get("entry_features", "{}"),
+              exit_ce_order_id, exit_pe_order_id, lots,
+              float(pos.get("wing_ce_strike", 0) or 0),
+              float(pos.get("wing_pe_strike", 0) or 0),
+              float(pos.get("wing_ce_ltp", 0) or 0),
+              float(pos.get("wing_pe_ltp", 0) or 0),
+              float(pos.get("net_premium", 0) or 0)]],
+            column_names=["trade_id", "symbol", "expiry", "entry_time", "exit_time",
+                          "strike", "entry_premium", "exit_premium",
                           "pnl_pts","pnl_inr","lot_size","exit_reason",
-                          "scorecard_conf","entry_features"],
+                          "scorecard_conf","entry_features",
+                          "kite_ce_order_id","kite_pe_order_id","lots",
+                          "wing_ce_strike","wing_pe_strike","wing_ce_ltp","wing_pe_ltp","net_premium"],
         )
         # Close position by inserting updated row with status=closed
         ch.insert(
@@ -526,13 +645,20 @@ def record_exit(ch, pos, current_straddle, exit_reason, dry_run=False):
               pos["scorecard_conf"], "closed",
               int(pos["trailing_active"]), float(pos["peak_pnl_inr"]),
               float(pos["trail_stop_inr"]), exit_time, pos.get("entry_features", "{}"),
-              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0))]],
+              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0)),
+              lots,
+              float(pos.get("wing_ce_strike", 0) or 0),
+              float(pos.get("wing_pe_strike", 0) or 0),
+              float(pos.get("wing_ce_ltp", 0) or 0),
+              float(pos.get("wing_pe_ltp", 0) or 0),
+              float(pos.get("net_premium", 0) or 0)]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
-                          "entry_features","net_delta","hedge_lots_cum"],
+                          "entry_features","net_delta","hedge_lots_cum","lots",
+                          "wing_ce_strike","wing_pe_strike","wing_ce_ltp","wing_pe_ltp","net_premium"],
         )
 
 
@@ -554,40 +680,51 @@ def update_trail(ch, pos, pnl_inr, dry_run=False):
               pos["target_inr"], pos["stoploss_inr"],
               pos["scorecard_conf"], "open",
               1, peak, trail, now, pos.get("entry_features", "{}"),
-              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0))]],
+              float(pos.get("net_delta", 0.0)), float(pos.get("hedge_lots_cum", 0.0)),
+              int(pos.get("lots", 1)),
+              float(pos.get("wing_ce_strike", 0) or 0),
+              float(pos.get("wing_pe_strike", 0) or 0),
+              float(pos.get("wing_ce_ltp", 0) or 0),
+              float(pos.get("wing_pe_ltp", 0) or 0),
+              float(pos.get("net_premium", 0) or 0)]],
             column_names=["trade_id","symbol","expiry","entry_time","strike",
                           "entry_ce_ltp","entry_pe_ltp","entry_premium",
                           "lot_size","target_pts","stop_pts","target_inr","stoploss_inr",
                           "scorecard_conf","status",
                           "trailing_active","peak_pnl_inr","trail_stop_inr","last_checked",
-                          "entry_features","net_delta","hedge_lots_cum"],
+                          "entry_features","net_delta","hedge_lots_cum","lots",
+                          "wing_ce_strike","wing_pe_strike","wing_ce_ltp","wing_pe_ltp","net_premium"],
         )
     return peak, trail
 
 
 # ── Per-symbol tick ───────────────────────────────────────────────────────────
 
-def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
+def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
+         kite_mgr: KiteOrderManager | None = None):
     """One monitoring cycle for a symbol."""
     t = ist_time()
     lot_size = lot_sizes.get(symbol, DEFAULT_LOT_SIZES.get(symbol, 75))
-    min_premium = MIN_PREMIUM_NIFTY if symbol == "NIFTY" else MIN_PREMIUM_BANKNIFTY
+    min_premium = MIN_PREMIUM.get(symbol, 40.0)
 
     pos = get_open_position(ch, symbol)
 
     # ── In-trade: check stop / trail / EOD ───────────────────────────────────
     if pos:
-        current = get_current_straddle(ch, symbol, pos["expiry"], pos["strike"])
+        current = get_current_position_value(ch, symbol, pos["expiry"], pos["strike"], pos)
         if current is None:
-            log.warning(f"[{symbol}] could not fetch current straddle — skipping tick")
+            log.warning(f"[{symbol}] could not fetch current position value — skipping tick")
             return
 
-        pnl_pts = pos["entry_premium"] - current
-        pnl_inr = pnl_pts * pos["lot_size"]
+        lots = int(pos.get("lots", 1))
+        is_iron_fly = float(pos.get("wing_ce_strike", 0) or 0) > 0
+        entry_value = float(pos["net_premium"]) if is_iron_fly else float(pos["entry_premium"])
+        pnl_pts = entry_value - current
+        pnl_inr = pnl_pts * pos["lot_size"] * lots
 
-        log.info(f"[{symbol}] IN-TRADE strike={pos['strike']:.0f} "
-                 f"entry={pos['entry_premium']:.1f} now={current:.1f} "
-                 f"pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f} "
+        log.info(f"[{symbol}] IN-TRADE {'IRON FLY' if is_iron_fly else 'NAKED'} "
+                 f"strike={pos['strike']:.0f} entry={entry_value:.1f} now={current:.1f} "
+                 f"pnl={pnl_pts:.1f}pts ₹{pnl_inr:.0f} ({lots} lots) "
                  f"trailing={'yes' if pos['trailing_active'] else 'no'}")
 
         # Delta hedge check — prefer NSE-provided delta, fall back to BS computation
@@ -600,23 +737,23 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
 
         # EOD exit
         if t >= EOD_EXIT:
-            record_exit(ch, pos, current, "eod", dry_run)
+            record_exit(ch, pos, current, "eod", dry_run, kite_mgr)
             return
 
-        # Hard stop loss
-        if pnl_inr <= -STOPLOSS_INR:
-            record_exit(ch, pos, current, "stop", dry_run)
+        # Hard stop loss — use position's stored stoploss_inr (scaled by lots at entry)
+        if pnl_inr <= -float(pos["stoploss_inr"]):
+            record_exit(ch, pos, current, "stop", dry_run, kite_mgr)
             return
 
         # Trailing logic
         if pos["trailing_active"]:
             peak, trail = update_trail(ch, pos, pnl_inr, dry_run)
             if pnl_inr <= trail:
-                record_exit(ch, pos, current, "trail", dry_run)
+                record_exit(ch, pos, current, "trail", dry_run, kite_mgr)
             return
 
         # Target hit — activate trailing instead of exiting
-        if pnl_inr >= TARGET_INR:
+        if pnl_inr >= float(pos["target_inr"]):
             log.info(f"[{symbol}] TARGET ₹{TARGET_INR:.0f} hit — activating trailing stop")
             update_trail(ch, pos, pnl_inr, dry_run)
             return
@@ -669,8 +806,11 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool):
         return
 
     scorecard_conf = get_scorecard_confidence(ch, symbol)
+    if scorecard_conf < MIN_CONFIDENCE:
+        log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} < {MIN_CONFIDENCE:.0f} — skip (low confidence)")
+        return
     log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} — ENTERING")
-    record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run)
+    record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run, kite_mgr)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -679,10 +819,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true",
                         help="Evaluate and log signals but do not write to DB")
+    parser.add_argument("--live", action="store_true",
+                        help="Place real orders via Kite API (requires KITE_API_KEY + KITE_ACCESS_TOKEN)")
     args = parser.parse_args()
 
     _assert_env("CH_PASSWORD")
-    log.info("=== Intraday Straddle Monitor (paper trading) ===")
+
+    # Build Kite order manager (None in paper mode)
+    kite_mgr = None
+    if args.live:
+        kite_client = build_kite_client()
+        if kite_client is None:
+            log.error("--live requires KITE_API_KEY and KITE_ACCESS_TOKEN env vars. Exiting.")
+            raise SystemExit(1)
+        kite_mgr = KiteOrderManager(kite_client)
+        kite_mgr.load_instruments()
+        log.info("=== Intraday Straddle Monitor (LIVE — real orders via Kite) ===")
+    else:
+        log.info("=== Intraday Straddle Monitor (paper trading) ===")
+
     log.info(f"Symbols        : {SYMBOLS}")
     log.info(f"Target         : ₹{TARGET_INR:.0f} → trailing at {TRAIL_PCT:.0%} of peak")
     log.info(f"Stop loss      : ₹{STOPLOSS_INR:.0f}")
@@ -695,6 +850,18 @@ def main():
     lot_sizes = load_lot_sizes(ch)
     log.info(f"Lot sizes      : {lot_sizes}")
 
+    graduation_stage = get_graduation_stage(ch, "iron_fly_0dte")
+    log.info(f"Graduation stage: {graduation_stage}")
+    if graduation_stage == 1:
+        log.warning(
+            "iron_fly_0dte is Stage 1 (BACKTEST only) — "
+            "backtest gates not passed, refusing to trade. "
+            "Run graduation_gate.py to recheck after more backtest data."
+        )
+        raise SystemExit(0)
+    if graduation_stage >= 3 and not args.live:
+        log.info("Stage 3/4 detected — consider running with --live for real orders")
+
     while ist_time() <= MONITOR_EXIT and not _SHUTDOWN:
         t = ist_time()
         if t < ENTRY_START:
@@ -706,7 +873,7 @@ def main():
         log.info(f"--- Tick at {ist_now().strftime('%H:%M:%S')} IST ---")
         for symbol in SYMBOLS:
             try:
-                tick(ch, symbol, lot_sizes, args.dry_run)
+                tick(ch, symbol, lot_sizes, args.dry_run, kite_mgr)
             except Exception as e:
                 log.error(f"[{symbol}] tick failed: {e}", exc_info=True)
         # Heartbeat for Docker healthcheck

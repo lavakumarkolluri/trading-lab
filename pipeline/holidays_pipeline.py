@@ -23,37 +23,19 @@ Usage:
 
 import os
 import sys
-import logging
 import argparse
 from datetime import datetime, date, timedelta
 from datetime import timezone
 
 import requests
 import pandas as pd
-import clickhouse_connect
 
-# ── Logging ────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
-
-# ── Config ─────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+from ch_utils import ch_client as get_ch_client
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 NSE_HOLIDAY_API = "https://www.nseindia.com/api/holiday-master?type=trading"
 
-
-# ── ClickHouse client ──────────────────────────────────
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
 
 
 # ══════════════════════════════════════════════════════

@@ -23,34 +23,22 @@ Docker:
   docker compose run --rm pipeline python compute_historical_iv.py
 """
 
-import os
 import math
-import logging
 import argparse
 from datetime import date, datetime
 
 import pandas as pd
 import numpy as np
-import clickhouse_connect
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch
+from logging_utils import get_logger
 
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 RISK_FREE_RATE = 0.065   # India repo rate ~6.5%
 MIN_PRICE      = 0.05    # ignore options below this price (stale/illiquid)
 MAX_IV         = 2.0     # cap IV at 200% to filter bad data
 IV_WINDOW      = 252     # trading days for iv_rank / iv_percentile
-
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
 
 
 # ── Black-Scholes ─────────────────────────────────────────

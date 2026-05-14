@@ -32,33 +32,21 @@ import zipfile
 from datetime import datetime, date, timedelta
 
 import pandas as pd
-import clickhouse_connect
 from curl_cffi import requests as cffi_requests
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 from minio import Minio
 from minio.error import S3Error
 
 from fo_utils import build_lot_size_cache
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client, minio_client as get_mc
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 # ── Config ───────────────────────────────────────────────
-CH_HOST  = os.getenv("CH_HOST", "clickhouse")
-CH_PORT  = int(os.getenv("CH_PORT", "8123"))
-CH_USER  = os.getenv("CH_USER", "default")
-CH_PASS  = os.getenv("CH_PASSWORD", "")
-
-MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 MINIO_PREFIX = "bhavcopy/fo/"
 
-LOOKBACK_DAYS = 730    # default 2 years
+DEFAULT_FROM_DATE = date(2019, 1, 1)   # full history from Jan 2019
 REQUEST_DELAY = 1.5    # seconds between downloads
 HTTP_TIMEOUT  = 30
 
@@ -81,17 +69,6 @@ EOD_MINUTE = 30
 
 
 # ── Client ────────────────────────────────────────────────
-
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
-
-
-def get_mc() -> Minio:
-    return Minio(MINIO_HOST, access_key=MINIO_USER, secret_key=MINIO_PASS, secure=False)
-
 
 def save_to_minio(mc: Minio, zip_bytes: bytes, trade_date: date):
     key = f"{MINIO_PREFIX}{trade_date.strftime('%Y%m%d')}.zip"
@@ -313,18 +290,23 @@ def show_status(ch):
 
 # ── Reprocess ─────────────────────────────────────────────
 
-def reprocess_from_minio(ch, mc: Minio):
+def reprocess_from_minio(ch, mc: Minio, fix_oi: bool = False):
     """
     Re-parse all bhavcopy zips already in MinIO using the current TARGET_SYMBOLS.
     Used to backfill new symbols (e.g. FINNIFTY, MIDCPNIFTY) without re-downloading.
     Insert is idempotent via ReplacingMergeTree.
+
+    fix_oi=True: override version with int(time.time()) so bhavcopy rows win over
+    any prior compute_greeks re-inserts (which used version = eod_ts + 1).
+    Run compute_greeks --workers N afterwards to recompute IVs with real OI.
     """
     objs = sorted(
         mc.list_objects(MINIO_BUCKET, prefix=MINIO_PREFIX, recursive=True),
         key=lambda o: o.object_name
     )
+    mode = "fix-oi (high version)" if fix_oi else "normal"
     log.info(f"Reprocessing {len(objs)} bhavcopy files from MinIO "
-             f"with symbols: {TARGET_SYMBOLS}")
+             f"with symbols: {TARGET_SYMBOLS}  mode={mode}")
 
     lot_size_known = build_lot_size_cache(ch)
     loaded = skipped = 0
@@ -341,6 +323,11 @@ def reprocess_from_minio(ch, mc: Minio):
         resp.close()
 
         rows, lot_sizes = parse_bhavcopy(zip_bytes, trade_date)
+
+        if fix_oi and rows:
+            high_version = int(time.time())
+            for r in rows:
+                r["version"] = high_version
 
         if lot_sizes:
             upsert_lot_sizes(ch, lot_sizes, trade_date, lot_size_known)
@@ -369,7 +356,7 @@ def main():
     )
     parser.add_argument("--from", dest="from_date", type=str, default=None,
                         metavar="YYYY-MM-DD",
-                        help=f"Start date (default: today minus {LOOKBACK_DAYS} days)")
+                        help=f"Start date (default: {DEFAULT_FROM_DATE})")
     parser.add_argument("--to", dest="to_date", type=str, default=None,
                         metavar="YYYY-MM-DD",
                         help="End date (default: yesterday)")
@@ -377,6 +364,9 @@ def main():
                         help="Show current DB stats and exit")
     parser.add_argument("--reprocess", action="store_true",
                         help="Re-parse all MinIO bhavcopy zips (backfills new symbols)")
+    parser.add_argument("--fix-oi", dest="fix_oi", action="store_true",
+                        help="Re-parse MinIO zips with version=now() to restore real OI "
+                             "overwritten by compute_greeks; run compute_greeks after")
     args = parser.parse_args()
 
     ch = get_ch_client()
@@ -391,12 +381,17 @@ def main():
         reprocess_from_minio(ch, mc)
         return
 
+    if args.fix_oi:
+        log.info("=== Fix-OI mode — re-inserting bhavcopy with high version ===")
+        reprocess_from_minio(ch, mc, fix_oi=True)
+        return
+
     today = date.today()
     # Include today when running after market close (bhavcopy published by ~17:00 IST = 11:30 UTC).
     # If NSE hasn't published yet, download_bhavcopy returns None → "no file" skip, which is safe.
     to_date   = date.fromisoformat(args.to_date) if args.to_date else today
     from_date = (date.fromisoformat(args.from_date) if args.from_date
-                 else today - timedelta(days=LOOKBACK_DAYS))
+                 else DEFAULT_FROM_DATE)
 
     log.info("=== Option Chain Historical Backfill ===")
     log.info(f"Date range : {from_date} → {to_date}")

@@ -18,24 +18,18 @@ Usage:
 """
 
 import argparse
-import logging
 import math
-import os
 from datetime import date, timedelta
 
-import clickhouse_connect
 import numpy as np
 import pandas as pd
 from scipy import stats
 from price_action import compute_price_action, PA_DEFAULTS
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch
+from logging_utils import get_logger
 
-CH_HOST     = os.getenv("CH_HOST", "clickhouse")
-CH_PORT     = int(os.getenv("CH_PORT", "8123"))
-CH_USER     = os.getenv("CH_USER", "default")
-CH_PASSWORD = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 STRIKE_STEPS = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
 DEFAULT_STRIKE_STEP  = 50
@@ -61,11 +55,6 @@ def bs_straddle(spot: float, strike: float, T_years: float, iv: float) -> float:
     return call + put
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASSWORD
-    )
 
 def load_expiries(ch, symbol: str) -> list[date]:
     rows = ch.query(
@@ -166,6 +155,25 @@ def load_eod_context(ch, symbol: str, snap_date: date, expiry: date) -> dict:
         "oi_pe": oi_pe,
         "liquidity_ok": liq_ok,
     }
+
+def load_vol_surface_context(ch, symbol: str, d: date) -> dict:
+    """Load term_slope and skew from vol_term_structure for a given date."""
+    result = ch.query(
+        "SELECT term_slope, skew_2pct, skew_3pct, atm_iv_30d "
+        "FROM market.vol_term_structure FINAL "
+        "WHERE symbol={sym:String} AND date={d:Date}",
+        parameters={"sym": symbol, "d": d}
+    )
+    if not result.result_rows:
+        return {"term_slope": 0.0, "skew_2pct": 0.0, "skew_3pct": 0.0, "atm_iv_30d": 0.0}
+    r = result.result_rows[0]
+    return {
+        "term_slope": float(r[0] or 0),
+        "skew_2pct":  float(r[1] or 0),
+        "skew_3pct":  float(r[2] or 0),
+        "atm_iv_30d": float(r[3] or 0),
+    }
+
 
 def load_fii_net(ch, as_of: date) -> float:
     """3-day FII net flow (crores). Falls back to participant OI proxy."""
@@ -364,7 +372,8 @@ def simulate_expiry(ch, symbol: str, expiry: date, step: int) -> dict | None:
                                 spot_t1, step)
 
     # ── Context features ──────────────────────────────────────────────────────
-    fii_net = load_fii_net(ch, t1)
+    fii_net  = load_fii_net(ch, t1)
+    vol_ctx  = load_vol_surface_context(ch, symbol, t1)
 
     return {
         "expiry_date":            expiry,
@@ -401,6 +410,11 @@ def simulate_expiry(ch, symbol: str, expiry: date, step: int) -> dict | None:
         "atm_iv":                 round(iv_t1, 2),
         "pcr":                    round(ctx_t1.get("pcr", 0), 4),
         "fii_net_3d":             round(fii_net, 2),
+        # Vol surface
+        "term_slope":             round(vol_ctx["term_slope"], 6),
+        "skew_2pct":              round(vol_ctx["skew_2pct"],  6),
+        "skew_3pct":              round(vol_ctx["skew_3pct"],  6),
+        "atm_iv_30d":             round(vol_ctx["atm_iv_30d"], 4),
         # Liquidity
         "oi_ce":                  round(oi_ce, 0),
         "oi_pe":                  round(oi_pe, 0),
@@ -535,6 +549,7 @@ def print_report(df: pd.DataFrame):
     # ── 6. Feature correlation ────────────────────────────────────────────────
     print("\n── 6. FEATURE CORRELATION WITH 1DTE WIN ──────────────────────")
     features = ["iv_rank", "atm_iv", "pcr", "fii_net_3d", "implied_move_pct", "iv_percentile",
+                "term_slope", "skew_2pct", "skew_3pct", "atm_iv_30d",
                 "prev_range_pct", "range_vs_atr", "ma20_dist_pct", "week_range_pct", "consec_inside_days"]
     print(f"  {'Feature':26s}  {'Pearson r':>10s}  {'p-value':>10s}  {'Signal':>8s}")
     for feat in features:
@@ -583,6 +598,51 @@ def print_report(df: pd.DataFrame):
             wr = sub["win_1dte"].mean() * 100
             ap = sub["profit_1dte_pts"].mean()
             print(f"  {label}: N={len(sub)}, Win={wr:.1f}%, AvgProfit={ap:+.1f}pts")
+
+    # ── 6c. Vol surface conditional edge ─────────────────────────────────────
+    vol_rows = df[df["term_slope"] != 0]
+    if len(vol_rows) >= 10:
+        print(f"\n── 6c. VOL SURFACE CONDITIONAL EDGE ({len(vol_rows)} expiries with surface data) ──")
+
+        # Term slope buckets: negative = backwardation (fear), positive = contango (normal)
+        vol_rows = vol_rows.copy()
+        vol_rows["ts_bucket"] = vol_rows["term_slope"].apply(
+            lambda v: _bucket(v, [-0.02, 0, 0.02, 0.04],
+                              ["<-2% (Backw.)", "-2–0%", "0–2% (Cont.)", "2–4%", ">4%"])
+        )
+        print(f"\n  By Term Slope (30d-7d ATM IV):")
+        print(f"  {'Bucket':20s}  {'N':>4s}  {'Win%':>6s}  {'AvgProfit':>10s}  {'Expectancy':>10s}")
+        for bucket in ["<-2% (Backw.)", "-2–0%", "0–2% (Cont.)", "2–4%", ">4%"]:
+            sub = vol_rows[vol_rows["ts_bucket"] == bucket]
+            if len(sub) < 3:
+                continue
+            wr  = sub["win_1dte"].mean() * 100
+            ap  = sub["profit_1dte_pts"].mean()
+            aw  = sub.loc[sub["win_1dte"]==1, "profit_1dte_pts"].mean()
+            al  = sub.loc[sub["win_1dte"]==0, "profit_1dte_pts"].mean()
+            exp = wr/100*(aw or 0) + (1-wr/100)*(al or 0)
+            print(f"  {bucket:20s}  {len(sub):>4d}  {wr:>5.1f}%  {ap:>+10.1f}  {exp:>+10.1f}")
+
+        # Put skew buckets
+        skew_rows = vol_rows[vol_rows["skew_2pct"] != 0]
+        if len(skew_rows) >= 10:
+            skew_rows = skew_rows.copy()
+            skew_rows["skew_bucket"] = skew_rows["skew_2pct"].apply(
+                lambda v: _bucket(v, [0, 0.01, 0.02, 0.04],
+                                  ["<0 (CE bid)", "0–1%", "1–2%", "2–4%", ">4% (Put bid)"])
+            )
+            print(f"\n  By 2% Put Skew (PE_IV - CE_IV at ±2%):")
+            print(f"  {'Bucket':20s}  {'N':>4s}  {'Win%':>6s}  {'AvgProfit':>10s}  {'Expectancy':>10s}")
+            for bucket in ["<0 (CE bid)", "0–1%", "1–2%", "2–4%", ">4% (Put bid)"]:
+                sub = skew_rows[skew_rows["skew_bucket"] == bucket]
+                if len(sub) < 3:
+                    continue
+                wr  = sub["win_1dte"].mean() * 100
+                ap  = sub["profit_1dte_pts"].mean()
+                aw  = sub.loc[sub["win_1dte"]==1, "profit_1dte_pts"].mean()
+                al  = sub.loc[sub["win_1dte"]==0, "profit_1dte_pts"].mean()
+                exp = wr/100*(aw or 0) + (1-wr/100)*(al or 0)
+                print(f"  {bucket:20s}  {len(sub):>4d}  {wr:>5.1f}%  {ap:>+10.1f}  {exp:>+10.1f}")
 
     # ── 7. Best trading conditions (combined filter) ───────────────────────────
     print("\n── 7. BEST TRADING CONDITIONS (combined) ─────────────────────")
@@ -637,6 +697,10 @@ def ensure_table(ch):
             atm_iv               Float64,
             pcr                  Float64,
             fii_net_3d           Float64,
+            term_slope           Float64 DEFAULT 0,
+            skew_2pct            Float64 DEFAULT 0,
+            skew_3pct            Float64 DEFAULT 0,
+            atm_iv_30d           Float64 DEFAULT 0,
             oi_ce                Float64 DEFAULT 0,
             oi_pe                Float64 DEFAULT 0,
             liquidity_ok         Int8    DEFAULT 0,

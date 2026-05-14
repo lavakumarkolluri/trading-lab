@@ -6,28 +6,16 @@ All ClickHouse query helpers for MF aggregation pipeline.
 Each function is stateless — pass a client, get data back.
 """
 
-import os
-import logging
 from datetime import timedelta
 
 import pandas as pd
-import clickhouse_connect
 
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client
+from logging_utils import get_logger
 
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 INSERT_CHUNK_SIZE = 50_000
-
-
-def get_ch_client() -> clickhouse_connect.driver.Client:
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
 
 
 def fetch_all_scheme_codes(ch) -> list[int]:

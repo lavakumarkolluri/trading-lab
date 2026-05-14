@@ -26,44 +26,25 @@ Docker:
 import io
 import os
 import time
-import logging
 import argparse
 from datetime import datetime, date
 
 import pandas as pd
 import yfinance as yf
-import clickhouse_connect
 from minio import Minio
 from minio.error import S3Error
 
 from symbols import MARKETS
+from ch_utils import ch_client as get_ch, minio_client as get_mc
+from logging_utils import get_logger
+log = get_logger(__name__)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
-
-MINIO_HOST   = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER   = os.getenv("MINIO_USER", "admin")
-MINIO_PASS   = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 
 RATE_LIMIT_S = 0.3  # seconds between yfinance calls to avoid rate limiting
 
 NSE_SYMBOLS = MARKETS["indian"]
 
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
-
-
-def get_mc():
-    return Minio(MINIO_HOST, access_key=MINIO_USER, secret_key=MINIO_PASS, secure=False)
 
 
 def setup_bucket(mc: Minio):

@@ -55,27 +55,15 @@ Usage:
   python star_rater.py --verbose    # show detailed score breakdown
 """
 
-import os
 import math
-import logging
 import argparse
 from datetime import datetime, date, timedelta
 
 import pandas as pd
-import clickhouse_connect
+from ch_utils import ch_client as get_ch_client
+from logging_utils import get_logger
 
-# ── Logging ────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
-
-# ── Config ─────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 MIN_SAMPLE_SIZE = 10     # below this → 1 star, needs_more_data = 1
 RECENCY_WINDOW  = 90     # days to look back for recency score
@@ -85,14 +73,6 @@ W_WIN_RATE    = 0.35
 W_SAMPLE      = 0.20
 W_RECENCY     = 0.20
 W_RISK_ADJ    = 0.25
-
-
-# ── ClickHouse client ──────────────────────────────────
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
 
 
 # ══════════════════════════════════════════════════════

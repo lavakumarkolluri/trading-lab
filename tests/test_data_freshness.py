@@ -109,6 +109,22 @@ def test_check_options_chain_stale_returns_issue():
     assert issues[0]["fix"] == "option_chain_historical"
 
 
+# ── empty-table safety (CRIT-005) ────────────────────────────────────────────
+
+def test_check_mf_nav_empty_table_returns_empty():
+    """result_rows=[] must not crash with IndexError."""
+    ch = _mock_ch({"mf_nav": []})
+    issues = m._check_mf_nav(ch)
+    assert issues == []
+
+
+def test_check_vix_empty_table_returns_empty():
+    """result_rows=[] must not crash with IndexError."""
+    ch = _mock_ch({"nifty_live": []})
+    issues = m._check_vix(ch)
+    assert issues == []
+
+
 # ── _check_per_symbol_staleness ───────────────────────────────────────────────
 
 def test_check_per_symbol_staleness_returns_report_only_issues():
@@ -205,11 +221,12 @@ def test_data_freshness_service_in_compose():
 
 
 def test_data_freshness_in_dockerfile():
-    """Dockerfile must COPY data_freshness_check.py."""
+    """Dockerfile must copy data_freshness_check.py (explicit or via wildcard)."""
     df_path = os.path.join(os.path.dirname(__file__), "..", "pipeline", "Dockerfile")
     with open(df_path) as f:
         content = f.read()
-    assert "data_freshness_check.py" in content, "data_freshness_check.py not copied in Dockerfile"
+    copied = "data_freshness_check.py" in content or "COPY *.py" in content
+    assert copied, "data_freshness_check.py not copied in Dockerfile"
 
 
 def test_data_freshness_scheduled_in_scheduler():

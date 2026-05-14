@@ -23,32 +23,16 @@ Usage:
   python cleanup_schemes.py --execute # actually deletes
 """
 
-import os
 import sys
 import argparse
-import logging
 from datetime import datetime, date, timedelta
-import clickhouse_connect
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch_client
+from logging_utils import get_logger
 
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 INACTIVITY_DAYS = 10  # remove if last NAV older than this
-
-
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
 
 
 def is_relevant_scheme(name: str) -> bool:

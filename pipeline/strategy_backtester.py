@@ -26,39 +26,22 @@ Usage:
 """
 
 import os
-import logging
 import argparse
 from datetime import date, datetime
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-import clickhouse_connect
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
-
-GIT_SHA = os.getenv("GIT_SHA", "unknown")
+from ch_utils import ch_client, GIT_SHA
+from logging_utils import get_logger
+from pipeline_utils import record_run as _record_run_helper
+log = get_logger(__name__, fmt="%(asctime)s %(levelname)s %(message)s")
 
 
 def _record_run(ch, status: str, started_at: datetime, error_msg: str = ""):
-    try:
-        ch.command(
-            """INSERT INTO system_meta.pipeline_runs
-               (service, started_at, finished_at, status, git_sha, error_msg)
-               VALUES ({svc:String},{start:DateTime},{end:DateTime},{st:String},{sha:String},{err:String})""",
-            parameters={"svc": "strategy_backtester", "start": started_at,
-                        "end": datetime.utcnow(), "st": status,
-                        "sha": GIT_SHA, "err": error_msg},
-        )
-    except Exception as e:
-        log.warning("pipeline_runs write failed: %s", e)
+    _record_run_helper(ch, "strategy_backtester", status, started_at, error_msg)
 
-
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
 
 SYMBOLS     = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 SHORT_N_MAX = 4   # max steps from ATM for short leg
@@ -68,9 +51,7 @@ WING_M_MAX  = 4   # max wing width in steps
 # ── DB ────────────────────────────────────────────────────────────────────────
 
 def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
+    return ch_client()
 
 
 # ── Data Loading ──────────────────────────────────────────────────────────────

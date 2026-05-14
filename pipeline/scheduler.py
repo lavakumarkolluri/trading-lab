@@ -24,20 +24,19 @@ Docker:
 """
 
 import os
-import logging
 import subprocess
+import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import schedule
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 import sys
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 _COMPOSE_FILE = os.getenv("COMPOSE_FILE", "docker-compose.yml")
 _PROJECT_DIR  = os.path.dirname(_COMPOSE_FILE) if "/" in _COMPOSE_FILE else "."
@@ -56,14 +55,8 @@ _COMPOSE_BASE = [
     "--project-directory", _PROJECT_DIR,
 ]
 
-try:
-    from pipeline_utils import GIT_SHA
-    from ch_utils import ch_client as _ch_client
-    _TRACKING_OK = True
-except ImportError:
-    GIT_SHA = "unknown"
-    _TRACKING_OK = False
-    log.warning("pipeline_utils/ch_utils not importable — pipeline_runs tracking disabled")
+from ch_utils import ch_client as _ch_client, GIT_SHA
+_TRACKING_OK = True
 
 
 def _record_run(service: str, started_at: datetime, status: str,
@@ -197,6 +190,16 @@ def job_auto_deploy():
         if "docker-compose.yml" in changed:
             log.info("AUTO-DEPLOY: docker-compose.yml changed — applying with up -d...")
             _compose(["up", "-d", "--remove-orphans"])
+
+        # ── Run tests on any code change ─────────────────────────────────────
+        code_changed = any(
+            f.startswith("pipeline/") or f.startswith("tests/")
+            or f.startswith("dashboard/") or f.startswith("clickhouse/")
+            for f in changed
+        )
+        if code_changed:
+            log.info("AUTO-DEPLOY: code changed — running test suite...")
+            _run_tests_and_record()
 
         # ── Rebuild pipeline image and self-restart ───────────────────────────
         pipeline_changed = any(f.startswith("pipeline/") for f in changed)
@@ -337,6 +340,26 @@ def job_confidence_scorer():
     _run("confidence_scorer", "--compare")
 
 
+def job_confidence_scorer_daily():
+    log.info("=== Confidence scorer daily score-only triggered ===")
+    _run("confidence_scorer", "--score-only")
+
+
+def job_signal_agent():
+    log.info("=== Signal Agent: explaining today's confidence scores ===")
+    _run("signal_agent")
+
+
+def job_analysis_agent_daily():
+    log.info("=== Analysis Agent: daily trade summary ===")
+    _run("analysis_agent")
+
+
+def job_analysis_agent_weekly():
+    log.info("=== Analysis Agent: weekly full report ===")
+    _run("analysis_agent", "--weekly")
+
+
 def job_strategy_selector_recommend():
     log.info("=== Strategy selector daily recommendation triggered ===")
     _run("strategy_selector", "--recommend")
@@ -350,6 +373,83 @@ def job_strategy_selector_backtest():
 def job_strategy_selector_fill_outcomes():
     log.info("=== Strategy selector outcome fill-back triggered ===")
     _run("strategy_selector", "--fill-outcomes")
+
+
+def _run_tests_and_record():
+    """
+    Run offline test suite and write results to system_meta.ci_results.
+    Called after every successful auto-deploy that changes code.
+    Tests run against the mounted source tree at /trading-lab/tests/.
+    """
+    if not _TRACKING_OK:
+        log.warning("TEST-RUN: tracking unavailable, skipping CI record")
+        return
+    import re as _re
+    test_dir = "/trading-lab/tests"
+    t0 = datetime.utcnow()
+    try:
+        result = subprocess.run(
+            ["python", "-m", "pytest", test_dir, "--tb=line", "-q", "--no-header"],
+            capture_output=True, text=True, timeout=180,
+        )
+        output = result.stdout + result.stderr
+        # Parse "X passed, Y failed" from pytest summary line
+        m_pass = _re.search(r"(\d+) passed", output)
+        m_fail = _re.search(r"(\d+) failed", output)
+        n_pass = int(m_pass.group(1)) if m_pass else 0
+        n_fail = int(m_fail.group(1)) if m_fail else 0
+        # Collect failed test names from output
+        failed_lines = [l for l in output.splitlines() if "FAILED" in l]
+        failed_names = "\n".join(failed_lines[:30])
+        status = "pass" if n_fail == 0 and n_pass > 0 else "fail"
+        if result.returncode not in (0, 1):
+            status = "error"
+    except Exception as e:
+        n_pass, n_fail, failed_names, status = 0, 0, str(e)[:200], "error"
+    duration = (datetime.utcnow() - t0).total_seconds()
+
+    # Collect git info from the mounted repo
+    try:
+        branch = _git(["rev-parse", "--abbrev-ref", "HEAD"],
+                      ).stdout.strip() or "unknown"
+        sha    = _git(["rev-parse", "HEAD"]).stdout.strip()[:12] or "unknown"
+        msg    = _git(["log", "-1", "--format=%s"]).stdout.strip()[:120] or ""
+        author = _git(["log", "-1", "--format=%an"]).stdout.strip()[:60] or ""
+        cts    = _git(["log", "-1", "--format=%ci"]).stdout.strip()[:19] or "1970-01-01 00:00:00"
+    except Exception:
+        branch, sha, msg, author, cts = "unknown", "unknown", "", "", "1970-01-01 00:00:00"
+
+    try:
+        ch = _ch_client()
+        run_at = datetime.utcnow()
+        row = [branch, sha, msg, author, cts,
+               n_pass, n_fail, n_pass + n_fail,
+               duration, failed_names, status, run_at]
+        col_names = [
+            "branch", "commit_sha", "commit_msg", "commit_author", "commit_ts",
+            "tests_passed", "tests_failed", "tests_total", "duration_s",
+            "failed_tests", "status", "run_at",
+        ]
+        # ci_results: latest per branch (ReplacingMergeTree keyed by branch)
+        ch.insert(
+            "system_meta.ci_results",
+            [row + [int(t0.timestamp())]],
+            column_names=col_names + ["version"],
+        )
+        # deploy_log: append-only history — dashboard reads last 7 for propagation table
+        ch.insert("system_meta.deploy_log", [row], column_names=col_names)
+        log.info(
+            "TEST-RUN: branch=%s sha=%s %s/%s tests %s (%.1fs)",
+            branch, sha, n_pass, n_pass + n_fail, status.upper(), duration,
+        )
+    except Exception as e:
+        log.error("TEST-RUN: failed to write ci_results/deploy_log: %s", e)
+
+
+def job_graduation_gate():
+    """Daily strategy graduation check — updates analysis.strategy_graduation."""
+    log.info("=== Graduation gate check triggered ===")
+    _run("graduation_gate")
 
 
 def job_events_pipeline():
@@ -371,17 +471,46 @@ def job_vix_pipeline():
     _run("vix_pipeline")
 
 
+def _log_cleanup(task: str, status: str, items: int = 0, freed: int = 0, detail: str = ""):
+    """Write one row to system_meta.cleanup_log."""
+    if not _TRACKING_OK:
+        return
+    try:
+        import json as _json
+        ch = _ch_client()
+        ch.command(
+            "INSERT INTO system_meta.cleanup_log "
+            "(task_name, status, items_freed, bytes_freed, detail) "
+            "VALUES ({t:String},{s:String},{i:Int64},{f:Int64},{d:String})",
+            parameters={"t": task, "s": status, "i": items, "f": freed, "d": detail},
+        )
+    except Exception as e:
+        log.warning("cleanup_log write failed for %s: %s", task, e)
+
+
 def job_cleanup():
-    """Weekly disk cleanup: MinIO intraday snapshots >30 days, workspace logs >7 days."""
+    """Weekly maintenance: MinIO snapshots, workspace logs, Docker assessment, CH system tables."""
     log.info("=== Weekly cleanup triggered ===")
     try:
         _cleanup_minio_intraday()
     except Exception as e:
         log.error("MinIO cleanup failed: %s", e)
+        _log_cleanup("minio_intraday", "error", detail=str(e))
     try:
         _cleanup_logs()
     except Exception as e:
         log.error("Log cleanup failed: %s", e)
+        _log_cleanup("workspace_logs", "error", detail=str(e))
+    try:
+        _assess_docker_resources()
+    except Exception as e:
+        log.error("Docker assessment failed: %s", e)
+        _log_cleanup("docker_assessment", "error", detail=str(e))
+    try:
+        _assess_clickhouse_system_tables()
+    except Exception as e:
+        log.error("ClickHouse system table assessment failed: %s", e)
+        _log_cleanup("clickhouse_system_tables", "error", detail=str(e))
 
 
 def _cleanup_minio_intraday():
@@ -391,6 +520,7 @@ def _cleanup_minio_intraday():
     minio_pass = os.getenv("MINIO_PASSWORD", "")
     if not minio_pass:
         log.warning("MINIO_PASSWORD not set — skipping MinIO cleanup")
+        _log_cleanup("minio_intraday", "skipped", detail="MINIO_PASSWORD not set")
         return
 
     try:
@@ -400,16 +530,22 @@ def _cleanup_minio_intraday():
         cutoff = datetime.utcnow() - timedelta(days=30)
         bucket = "trading-data"
         if not mc.bucket_exists(bucket):
+            _log_cleanup("minio_intraday", "skipped", detail="bucket not found")
             return
         objects = mc.list_objects(bucket, prefix="option_chain/intraday/", recursive=True)
         deleted = 0
+        bytes_freed = 0
         for obj in objects:
             if obj.last_modified and obj.last_modified.replace(tzinfo=None) < cutoff:
+                bytes_freed += obj.size or 0
                 mc.remove_object(bucket, obj.object_name)
                 deleted += 1
         log.info("MinIO cleanup: deleted %d intraday objects older than 30 days", deleted)
+        _log_cleanup("minio_intraday", "ok", items=deleted, freed=bytes_freed,
+                     detail=f"removed {deleted} objects >30d old")
     except ImportError:
         log.warning("minio package not available — skipping MinIO cleanup")
+        _log_cleanup("minio_intraday", "skipped", detail="minio package not installed")
 
 
 def _cleanup_logs():
@@ -417,25 +553,136 @@ def _cleanup_logs():
     import glob as _glob
     log_dir = os.getenv("LOG_DIR", "/trading-lab/workspace/logs")
     cutoff = datetime.utcnow() - timedelta(days=7)
+    truncated = 0
+    freed = 0
     for path in _glob.glob(f"{log_dir}/*.log"):
         try:
             mtime = datetime.utcfromtimestamp(os.path.getmtime(path))
-            size_mb = os.path.getsize(path) / (1024 * 1024)
+            size_b = os.path.getsize(path)
+            size_mb = size_b / (1024 * 1024)
             if mtime < cutoff or size_mb > 50:
                 open(path, "w").close()  # truncate
                 log.info("Truncated log: %s (was %.1f MB)", path, size_mb)
+                truncated += 1
+                freed += size_b
         except Exception as e:
             log.warning("Could not truncate %s: %s", path, e)
+    _log_cleanup("workspace_logs", "ok", items=truncated, freed=freed,
+                 detail=f"truncated {truncated} log files")
+
+
+def _assess_docker_resources():
+    """Assess Docker disk usage (images, containers, volumes, build cache) and log summary."""
+    import json as _json
+
+    def _docker(*args, timeout=15):
+        r = subprocess.run(["docker"] + list(args), capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+
+    # Dangling images
+    dangling_ids = [l for l in _docker("images", "-f", "dangling=true", "-q").splitlines() if l]
+    n_dangling = len(dangling_ids)
+
+    # All images
+    all_ids = [l for l in _docker("images", "-q").splitlines() if l]
+    n_images = len(all_ids)
+
+    # Stopped containers (exited / created / dead)
+    stopped_ids = [l for l in _docker(
+        "ps", "-a", "-f", "status=exited", "-f", "status=created", "-f", "status=dead", "-q"
+    ).splitlines() if l]
+    n_stopped = len(stopped_ids)
+
+    # All containers
+    all_ct = [l for l in _docker("ps", "-a", "-q").splitlines() if l]
+    n_containers = len(all_ct)
+
+    # Volumes (all, then dangling)
+    all_vols   = [l for l in _docker("volume", "ls", "-q").splitlines() if l]
+    dang_vols  = [l for l in _docker("volume", "ls", "-f", "dangling=true", "-q").splitlines() if l]
+    n_vols     = len(all_vols)
+    n_dang_vol = len(dang_vols)
+
+    # docker system df text → parse sizes
+    df_txt = _docker("system", "df")
+    # Approximate reclaimable bytes from text: look for lines with sizes
+    reclaimable_gb = 0.0
+    for line in df_txt.splitlines():
+        parts = line.split()
+        if len(parts) >= 5:
+            reclaim_field = parts[-1].strip("(%)")
+            try:
+                val_str = parts[-2] if "GB" in parts[-1] or "MB" in parts[-1] else parts[-1]
+                if "GB" in val_str:
+                    reclaimable_gb += float(val_str.replace("GB", ""))
+                elif "MB" in val_str:
+                    reclaimable_gb += float(val_str.replace("MB", "")) / 1024
+            except ValueError:
+                pass
+
+    detail = _json.dumps({
+        "images_total": n_images,
+        "images_dangling": n_dangling,
+        "containers_total": n_containers,
+        "containers_stopped": n_stopped,
+        "volumes_total": n_vols,
+        "volumes_dangling": n_dang_vol,
+        "reclaimable_gb_approx": round(reclaimable_gb, 2),
+        "system_df": df_txt[:1500],
+    })
+    reclaimable_bytes = int(reclaimable_gb * 1024**3)
+    log.info("Docker assessment: %d images (%d dangling), %d containers (%d stopped), "
+             "%d volumes (%d dangling)", n_images, n_dangling, n_containers, n_stopped,
+             n_vols, n_dang_vol)
+    _log_cleanup("docker_assessment", "ok",
+                 items=n_dangling + n_stopped + n_dang_vol,
+                 freed=reclaimable_bytes, detail=detail)
+
+
+def _assess_clickhouse_system_tables():
+    """Check ClickHouse system table sizes and log the result."""
+    import json as _json
+    if not _TRACKING_OK:
+        return
+    try:
+        ch = _ch_client()
+        rows = ch.query(
+            "SELECT table, sum(bytes_on_disk) AS bytes "
+            "FROM system.parts WHERE database='system' GROUP BY table ORDER BY bytes DESC"
+        ).result_rows
+        tbl_sizes = {r[0]: r[1] for r in rows}
+        total_bytes = sum(tbl_sizes.values())
+        detail = _json.dumps({
+            "tables": {k: f"{v/1e6:.1f}MB" for k, v in tbl_sizes.items()},
+            "total_mb": round(total_bytes / 1e6, 1),
+        })
+        log.info("ClickHouse system tables: %.1f MB total", total_bytes / 1e6)
+        _log_cleanup("clickhouse_system_tables", "ok",
+                     freed=0, detail=detail)
+    except Exception as e:
+        _log_cleanup("clickhouse_system_tables", "error", detail=str(e))
+
+
+def _run_background(service: str, *args: str):
+    """Start a long-running intraday service in a daemon thread.
+
+    _run() calls subprocess.run() (blocking). Intraday services run for 6+ hours,
+    which would freeze the scheduler loop if called directly. Running in a daemon
+    thread keeps schedule.run_pending() firing every 30 s.
+    """
+    t = threading.Thread(target=_run, args=(service,) + args, daemon=True, name=service)
+    t.start()
+    log.info("Started %s in background thread %s", service, t.name)
 
 
 def job_option_chain_intraday():
     log.info("=== Option chain intraday scraper triggered ===")
-    _run("option_chain_intraday")
+    _run_background("option_chain_intraday")
 
 
 def job_intraday_monitor():
     log.info("=== Intraday straddle monitor triggered ===")
-    _run("intraday_monitor")
+    _run_background("intraday_monitor")
 
 
 def job_option_chain_eod():
@@ -555,6 +802,8 @@ def main():
     log.info("  Intraday monitor    : Mon–Fri 03:50 UTC (09:20 IST) paper straddle")
     log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
     log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV+VIX")
+    log.info("  Confidence scorer   : Mon–Fri 13:00 UTC (18:30 IST) --score-only (daily refresh)")
+    log.info("  Graduation gate     : Mon–Fri 13:05 UTC (18:35 IST) strategy stage check")
     log.info("  Weekly  refresh     : Sun     00:30 UTC (06:00 IST)")
     log.info("  Gap     analyzer    : Sun     01:00 UTC (06:30 IST)")
     log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
@@ -591,6 +840,25 @@ def main():
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("12:30").do(job_option_chain_eod)
 
+    # Daily confidence scoring (score-only): after EOD pipeline at 13:00 UTC (18:30 IST)
+    # Uses existing model; ensures intraday_monitor has fresh scores each morning
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("13:00").do(job_confidence_scorer_daily)
+
+    # Signal Agent: explain today's confidence scores at 13:10 UTC (18:40 IST)
+    # Runs 10 min after scorer so scores are written before report is generated
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("13:10").do(job_signal_agent)
+
+    # Analysis Agent daily: post-market trade summary at 13:15 UTC (18:45 IST)
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("13:15").do(job_analysis_agent_daily)
+
+    # Graduation gate: after daily scorer at 13:05 UTC (18:35 IST)
+    # Updates analysis.strategy_graduation so dashboard shows current stage
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("13:05").do(job_graduation_gate)
+
     schedule.every().sunday.at("00:00").do(job_events_pipeline)
     schedule.every().sunday.at("00:30").do(job_weekly)
     schedule.every().sunday.at("01:00").do(job_gap_analyzer)
@@ -600,7 +868,9 @@ def main():
     schedule.every().sunday.at("05:00").do(job_lot_size_pipeline)
     schedule.every().sunday.at("05:30").do(job_strategy_backtester)
     schedule.every().sunday.at("07:00").do(job_confidence_scorer)   # 90 min after backtester
+    schedule.every().sunday.at("07:30").do(job_graduation_gate)     # after weekly retrain
     schedule.every().sunday.at("08:00").do(job_strategy_selector_backtest)
+    schedule.every().sunday.at("08:30").do(job_analysis_agent_weekly)  # weekly full report
     schedule.every().sunday.at("09:00").do(job_cleanup)  # 09:00 UTC = 14:30 IST
 
     # Daily recommendation: 30 min before market open (10:30 UTC = 16:00 IST)

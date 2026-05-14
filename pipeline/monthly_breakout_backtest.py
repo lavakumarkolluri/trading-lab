@@ -15,32 +15,20 @@ Usage:
   python monthly_breakout_backtest.py --dry-run  # print summary, no DB write
 """
 
-import os
-import logging
 import argparse
 from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
-import clickhouse_connect
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+from ch_utils import ch_client as get_ch
+from logging_utils import get_logger
 
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 MARKET        = "indian"
 TARGET_MULT   = 2.0    # 2x = 100% profit
 LOOKBACK_MONTHS = 3    # prior months for breakout check
-
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
 
 
 def fetch_daily(ch) -> pd.DataFrame:

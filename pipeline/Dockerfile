@@ -28,57 +28,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Application code ─────────────────────────────────────────────────────────
-COPY ch_utils.py .
-COPY pipeline_utils.py .
-COPY recompute.py .
-COPY main.py .
-COPY symbols.py .
-COPY mf_pipeline.py .
-COPY mf_aggregation.py .
-COPY mf_db.py .
-COPY mf_compute_technical.py .
-COPY mf_compute_returns.py .
-COPY mf_compute_risk.py .
-COPY cleanup_schemes.py .
-COPY event_detector.py .
-COPY pattern_feature_extractor.py .
-COPY pattern_builder.py .
-COPY backtest_engine.py .
-COPY star_rater.py .
-COPY prediction_engine.py .
-COPY validation_engine.py .
-COPY meta_pipeline.py .
-COPY holidays_pipeline.py .
-COPY fii_dii_pipeline.py .
-COPY participant_oi_pipeline.py .
-COPY gap_analyzer.py .
-COPY scheduler.py .
-COPY vix_pipeline.py .
-COPY option_chain_pipeline.py .
-COPY option_backtest.py .
-COPY option_chain_intraday.py .
-COPY option_chain_historical.py .
-# Research/analysis scripts — run locally, not part of pipeline image
-# COPY walk_forward_validation.py .
-# COPY momentum_factor_test.py .
-# COPY breakout_backtest.py .
-COPY options_eod_summary_pipeline.py .
-COPY compute_historical_iv.py .
-COPY compute_oi_features.py .
-COPY nifty_straddle_backtest.py .
-COPY fo_utils.py .
-COPY lot_size_pipeline.py .
-COPY fundamental_pipeline.py .
-COPY confidence_scorer.py .
-COPY strategy_backtester.py .
-COPY strategy_selector.py .
-COPY events_pipeline.py .
-COPY intraday_monitor.py .
-COPY data_freshness_check.py .
-COPY monthly_breakout_backtest.py .
-COPY edge_analysis.py .
-COPY weekend_theta_backtest.py .
-COPY price_action.py .
-COPY compute_greeks.py .
+# Copy all pipeline .py files at once — no per-file list to maintain.
+# Research-only scripts (walk_forward_validation, momentum_factor_test,
+# breakout_backtest) are harmlessly included; they just aren't used in prod.
+COPY *.py .
 
 CMD ["python", "main.py"]

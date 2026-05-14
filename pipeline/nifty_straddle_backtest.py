@@ -26,35 +26,22 @@ Docker:
   docker compose run --rm pipeline python nifty_straddle_backtest.py
 """
 
-import os
 import uuid
 import argparse
-import logging
 from datetime import date, datetime
 
 import pandas as pd
 import numpy as np
-import clickhouse_connect
 
 from fo_utils import build_lot_size_cache, get_lot_size
+from ch_utils import ch_client as get_ch
+from logging_utils import get_logger
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-CH_HOST   = os.getenv("CH_HOST", "clickhouse")
-CH_PORT   = int(os.getenv("CH_PORT", "8123"))
-CH_USER   = os.getenv("CH_USER", "default")
-CH_PASS   = os.getenv("CH_PASSWORD", "")
+log = get_logger(__name__)
 
 COST_PER_TRADE = 160      # ₹160 round trip (all 4 legs)
 TARGET_RATIO   = 0.50     # exit when straddle decays to 50% of entry
 STOP_RATIO     = 2.00     # stop when straddle reaches 200% of entry
-
-
-def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
 
 
 def load_spot_map(ch) -> dict:

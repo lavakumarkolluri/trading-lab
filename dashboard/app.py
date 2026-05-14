@@ -1,14 +1,17 @@
 """
-Trading Lab — Live Dashboard
-Reads from ClickHouse. Auto-refreshes every 60s.
+Trading Lab — Dashboard
+4-page design: System Health | Model | Trade Log | Market Data
 """
 
+import json
 import os
-import time
-import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
+from datetime import date, datetime, timedelta, timezone
+
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
 import clickhouse_connect
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -17,9 +20,12 @@ CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
 
-STARTING_CAPITAL = 100_000   # ₹1L
-DAILY_STOP_PCT   = 0.02      # 2%
-CAPITAL_FLOOR    = 5_000     # ₹5,000
+MIN_CONFIDENCE = 50.0
+
+# Features that must be non-zero for a reliable model score
+CRITICAL_FEATURES = ["vix", "iv_rank", "pcr_oi", "straddle_pct", "atr_percentile", "rsi14"]
+
+SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 
 st.set_page_config(
     page_title="Trading Lab",
@@ -36,9 +42,8 @@ def get_ch():
     )
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def query(sql: str) -> pd.DataFrame:
-    """Default cache: 5 min. Use query_weekly() for data that only changes on Sundays."""
     try:
         return get_ch().query_df(sql)
     except Exception as e:
@@ -46,9 +51,9 @@ def query(sql: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300)
-def query_weekly(sql: str) -> pd.DataFrame:
-    """5-min cache (same as query — renamed kept for call-site clarity)."""
+@st.cache_data(ttl=30)
+def query_live(sql: str) -> pd.DataFrame:
+    """30-second cache for live trade data (positions, today's P&L, mark prices)."""
     try:
         return get_ch().query_df(sql)
     except Exception as e:
@@ -65,240 +70,836 @@ def fmt_inr(val: float) -> str:
     return f"₹{val:.0f}"
 
 
-def color(val: float) -> str:
-    return "normal" if val >= 0 else "inverse"
+def traffic_light(ok: bool, warn: bool = False) -> str:
+    """Return 🟢/🟡/🔴 based on status."""
+    if ok:
+        return "🟢"
+    if warn:
+        return "🟡"
+    return "🔴"
 
+
+def missing_features(features_json: str) -> list[str]:
+    """Return list of CRITICAL_FEATURES that are zero or missing from the JSON blob."""
+    if not features_json:
+        return CRITICAL_FEATURES[:]
+    try:
+        feats = json.loads(features_json)
+    except Exception:
+        return CRITICAL_FEATURES[:]
+    return [f for f in CRITICAL_FEATURES if not feats.get(f, 0)]
+
+
+def span_estimate_pts(features_json: str, spot: float, lot_size: int) -> float:
+    """Rough SPAN estimate = ATM straddle premium × lot_size × 2 × 0.30."""
+    try:
+        feats = json.loads(features_json) if features_json else {}
+        straddle_pct = float(feats.get("straddle_pct", 0))
+        if straddle_pct > 0 and spot > 0:
+            atm_premium = straddle_pct * spot / 100
+            return atm_premium * lot_size * 2 * 0.30
+    except Exception:
+        pass
+    return 0.0
+
+
+LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120}
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _age_str(dt) -> str:
+    """Human-readable age of a UTC datetime: 'just now', '5m ago', '3h ago', '2d ago'."""
+    if dt is None:
+        return "—"
+    try:
+        if pd.isna(dt):
+            return "—"
+    except Exception:
+        pass
+    try:
+        if not isinstance(dt, datetime):
+            dt = pd.Timestamp(dt).to_pydatetime()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt
+        secs = int(delta.total_seconds())
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        return f"{secs // 86400}d ago"
+    except Exception:
+        return "—"
+
+
+def _to_ist_str(dt) -> str:
+    """Format a UTC datetime as IST HH:MM string."""
+    if dt is None:
+        return "—"
+    try:
+        if pd.isna(dt):
+            return "—"
+    except Exception:
+        pass
+    try:
+        if not isinstance(dt, datetime):
+            dt = pd.Timestamp(dt).to_pydatetime()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IST).strftime("%H:%M IST")
+    except Exception:
+        return "—"
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("📈 Trading Lab")
-if st.sidebar.button("🔄 Refresh Data"):
+if st.sidebar.button("🔄 Refresh"):
     st.cache_data.clear()
     st.rerun()
-page = st.sidebar.radio("Navigate", [
-    "Overview",
-    "Today's Signals",
-    "Confidence Scores",
-    "Strategy Backtests",
+
+page = st.sidebar.radio("", [
+    "System Health",
+    "Model",
     "Trade Log",
-    "Market Pulse",
-    "Live Trading",
-    "Paper Trades",
-    "Breakout Backtest",
-    "Data Freshness",
-    "Fundamentals",
-    "Edge Analysis",
-    "Weekend Theta",
+    "Market Data",
+    "MF Advisor",
 ])
-st.sidebar.markdown("---")
-st.sidebar.caption(f"Auto-refresh: 60s | Capital: {fmt_inr(STARTING_CAPITAL)}")
-st.sidebar.caption(f"Daily stop: {DAILY_STOP_PCT*100:.0f}% | Floor: {fmt_inr(CAPITAL_FLOOR)}")
-
-if st.sidebar.button("Refresh Now"):
-    st.cache_data.clear()
-    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 1 — OVERVIEW
+# PAGE 1 — SYSTEM HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
-if page == "Overview":
-    st.title("Overview")
-    st.warning(
-        "⚠️ **Existing backtests are preliminary — uncapped strategies.**  "
-        "The nifty_straddle and option_backtest scripts use naked straddles with no spread "
-        "protection, so worst-case losses are unlimited and can appear large (e.g. ₹81k). "
-        "The new Iron Condor / spread strategy (Step 4) will have defined-risk structure "
-        "where max loss per trade is capped by wing width. Capital floor (₹5k) is a "
-        "live-trading halt rule — it does not cap individual trade losses in historical backtests.",
-        icon="⚠️"
-    )
+if page == "System Health":
 
-    trades = query("""
-        SELECT strategy, entry_month, exit_month, net_ret, is_open
-        FROM analysis.strategy_trades FINAL
-        ORDER BY entry_month
+    # Auto-refresh every 60 min (browser-level reload)
+    st.markdown('<meta http-equiv="refresh" content="3600">', unsafe_allow_html=True)
+
+    # Track when the current session first loaded this page
+    if "health_loaded_at" not in st.session_state:
+        st.session_state.health_loaded_at = datetime.now(timezone.utc)
+    loaded_at_utc = st.session_state.health_loaded_at
+    loaded_age    = _age_str(loaded_at_utc)
+
+    now_ist = datetime.now(IST)
+    today   = now_ist.date()
+
+    # ── Page header bar ───────────────────────────────────────────────────────
+    hdr_left, hdr_right = st.columns([7, 3])
+    with hdr_left:
+        st.title("🟢 System Health")
+        st.caption(
+            f"{now_ist.strftime('%A, %d %B %Y · %H:%M IST')}  ·  "
+            f"Page loaded {loaded_age}  ·  data cache refreshes every 60 min"
+        )
+    with hdr_right:
+        st.markdown("")  # vertical padding
+        if st.button("🔄 Refresh now", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state.health_loaded_at = datetime.now(timezone.utc)
+            st.rerun()
+
+    st.divider()
+
+    # ── Current branch (latest CI result) ─────────────────────────────────────
+    st.subheader("Branch Status")
+
+    ci_df = query("""
+        SELECT branch, commit_sha, commit_msg, commit_author,
+               tests_passed, tests_failed, tests_total, duration_s,
+               failed_tests, status, run_at
+        FROM system_meta.ci_results FINAL
+        ORDER BY run_at DESC
+        LIMIT 1
     """)
 
-    runs = query("""
-        SELECT strategy, period, n_trades, win_rate, avg_net_ret,
-               sharpe, start_date, end_date
-        FROM analysis.strategy_runs FINAL
-        WHERE period = 'full'
-        ORDER BY strategy
-    """)
-
-    if trades.empty:
-        st.info("No backtest trades in DB yet. Run a backtest first.")
+    if ci_df.empty:
+        st.info("No CI results yet — scheduler records tests after each auto-deploy.")
     else:
-        # ── KPI row ──────────────────────────────────────────────────────────
-        trades["pnl_inr"] = trades["net_ret"] * STARTING_CAPITAL
-        total_pnl  = trades["pnl_inr"].sum()
-        n_trades   = len(trades)
-        win_rate   = (trades["net_ret"] > 0).mean() * 100
-        avg_trade  = trades["pnl_inr"].mean()
-        best_trade = trades["pnl_inr"].max()
-        worst      = trades["pnl_inr"].min()
+        ci      = ci_df.iloc[0]
+        n_pass  = int(ci["tests_passed"])
+        n_fail  = int(ci["tests_failed"])
+        n_total = int(ci["tests_total"])
+        all_ok  = n_fail == 0 and n_pass > 0
+        ci_icon = "🟢" if all_ok else "🔴"
+        run_at_dt = pd.Timestamp(ci["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total P&L", fmt_inr(total_pnl), delta=f"{total_pnl/STARTING_CAPITAL*100:.1f}%")
-        c2.metric("Trades", n_trades)
-        c3.metric("Win Rate", f"{win_rate:.1f}%")
-        c4.metric("Best Trade", fmt_inr(best_trade))
-        c5.metric("Worst Trade", fmt_inr(worst))
+        c1.metric("Branch",  str(ci["branch"]))
+        c2.metric("Commit",  str(ci["commit_sha"])[:10])
+        c3.metric("Message", str(ci["commit_msg"])[:35] + ("…" if len(str(ci["commit_msg"])) > 35 else ""))
+        c4.metric(f"{ci_icon} Tests", f"{n_pass}/{n_total}",
+                  delta=f"{n_fail} failed" if n_fail else "all pass",
+                  delta_color="inverse" if n_fail else "normal")
+        c5.metric("Last Run", _age_str(run_at_dt),
+                  delta=f"{float(ci['duration_s']):.0f}s")
 
-        # ── Cumulative P&L ───────────────────────────────────────────────────
-        st.subheader("Cumulative P&L")
-        trades["entry_month"] = pd.to_datetime(trades["entry_month"])
-        trades_sorted = trades.sort_values("entry_month")
-        trades_sorted["cumulative"] = trades_sorted["pnl_inr"].cumsum() + STARTING_CAPITAL
+        if n_fail > 0:
+            with st.expander(f"🔴 {n_fail} failing tests — expand for names"):
+                st.code(str(ci["failed_tests"]))
 
-        fig = go.Figure()
-        for strat, grp in trades_sorted.groupby("strategy"):
-            grp = grp.sort_values("entry_month")
-            grp["cum"] = grp["pnl_inr"].cumsum() + STARTING_CAPITAL
-            fig.add_trace(go.Scatter(
-                x=grp["entry_month"], y=grp["cum"],
-                mode="lines", name=strat, hovertemplate="₹%{y:,.0f}<extra></extra>"
-            ))
-        fig.add_hline(y=STARTING_CAPITAL, line_dash="dash", line_color="gray",
-                      annotation_text="Starting ₹1L")
-        fig.add_hline(y=CAPITAL_FLOOR, line_dash="dot", line_color="red",
-                      annotation_text="Floor")
-        fig.update_layout(height=350, yaxis_tickformat="₹,.0f",
-                          legend=dict(orientation="h", yanchor="bottom", y=1))
-        st.plotly_chart(fig, use_container_width=True)
+    st.divider()
 
-        # ── Strategy summary table ───────────────────────────────────────────
-        st.subheader("Strategy Summary")
-        if not runs.empty:
-            runs["Win Rate"] = (runs["win_rate"] * 100).round(1).astype(str) + "%"
-            runs["Avg P&L"]  = (runs["avg_net_ret"] * STARTING_CAPITAL).round(0).apply(fmt_inr)
-            runs["Sharpe"]   = runs["sharpe"].round(2)
-            runs["Period"]   = runs["start_date"].astype(str) + " → " + runs["end_date"].astype(str)
-            st.dataframe(
-                runs[["strategy", "n_trades", "Win Rate", "Avg P&L", "Sharpe", "Period"]],
-                use_container_width=True, hide_index=True
-            )
+    # ── Last 7 deployments (stage → prod propagation history) ─────────────────
+    st.subheader("Last 7 Deployments  (stage → prod)")
+    st.caption(
+        "Every auto-deploy that detects a code change runs the test suite and records here. "
+        "Stage auto-merges to prod when all tests pass."
+    )
 
-    # ── Pipeline Health grid ─────────────────────────────────────────────────
-    st.subheader("Pipeline Health — Last 7 Days")
+    deploy_df = query("""
+        SELECT branch, commit_sha, commit_msg, commit_author,
+               tests_passed, tests_failed, tests_total, duration_s, status, run_at
+        FROM system_meta.deploy_log
+        ORDER BY run_at DESC
+        LIMIT 7
+    """)
 
-    health_df = query("""
-        SELECT
-            service,
-            run_date,
-            status,
-            rows_written,
-            error_msg,
-            git_sha,
-            dateDiff('second', started_at, finished_at) AS duration_s
+    if deploy_df.empty:
+        st.info(
+            "No deployment history yet — records appear here after the scheduler "
+            "runs its next auto-deploy cycle.",
+            icon="ℹ️",
+        )
+    else:
+        deploy_rows = []
+        for _, r in deploy_df.iterrows():
+            n_p = int(r["tests_passed"])
+            n_f = int(r["tests_failed"])
+            n_t = int(r["tests_total"])
+            ok  = n_f == 0 and n_p > 0
+            run_ts = pd.Timestamp(r["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
+            deploy_rows.append({
+                "Date / Time (IST)": run_ts.astimezone(IST).strftime("%d %b %Y  %H:%M"),
+                "Branch":            str(r["branch"]),
+                "Commit":            str(r["commit_sha"])[:10],
+                "Message":           str(r["commit_msg"])[:60],
+                "Author":            str(r["commit_author"])[:20],
+                "Tests":             f"{n_p}/{n_t}",
+                "Status":            "🟢 pass" if ok else "🔴 FAIL",
+                "Dur (s)":           f"{float(r['duration_s']):.0f}",
+            })
+        st.dataframe(pd.DataFrame(deploy_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Pipeline Jobs ─────────────────────────────────────────────────────────
+    st.subheader("Pipeline Jobs — Last 7 Days")
+
+    runs_df = query("""
+        SELECT service, run_date, status, rows_written,
+               dateDiff('second', started_at, finished_at) AS duration_s,
+               error_msg
         FROM system_meta.pipeline_runs FINAL
         WHERE run_date >= today() - 7
         ORDER BY run_date DESC, service
     """)
 
-    if health_df.empty:
-        st.info("No pipeline run records yet. Runs are logged to system_meta.pipeline_runs.")
+    # Only services that actually write to pipeline_runs (others tracked via data freshness)
+    KEY_JOBS = ["strategy_backtester", "confidence_scorer"]
+    STATUS_ICON = {"success": "🟢", "failed": "🔴", "running": "🟡", "skipped": "⬜"}
+
+    if runs_df.empty:
+        st.info("No pipeline run records yet — jobs populate this after first run.")
     else:
-        health_df["run_date"] = pd.to_datetime(health_df["run_date"]).dt.date
-
-        # Build pivot: rows = service, columns = date
-        services = sorted(health_df["service"].unique())
-        dates    = sorted(health_df["run_date"].unique(), reverse=True)[:7]
-
-        STATUS_COLOUR = {
-            "success": "🟢",
-            "failed":  "🔴",
-            "running": "🟡",
-            "skipped": "⬜",
-        }
+        runs_df["run_date"] = pd.to_datetime(runs_df["run_date"]).dt.date
+        dates = sorted(runs_df["run_date"].unique(), reverse=True)[:7]
 
         grid_rows = []
-        detail_rows = []
-        for svc in services:
-            row = {"Service": svc}
-            for d in dates:
-                cell = health_df[(health_df["service"] == svc) & (health_df["run_date"] == d)]
-                if cell.empty:
-                    row[str(d)] = "⚫"
-                else:
-                    # pick last status for the day
-                    rec = cell.sort_values("run_date").iloc[-1]
-                    icon = STATUS_COLOUR.get(rec["status"], "❓")
-                    row[str(d)] = icon
-                    if rec["status"] == "failed":
-                        detail_rows.append({
-                            "service":    svc,
-                            "date":       str(d),
-                            "error_msg":  rec["error_msg"] or "—",
-                            "duration_s": int(rec["duration_s"]),
-                            "git_sha":    rec["git_sha"],
-                            "rows":       int(rec["rows_written"]),
-                        })
+        for svc in KEY_JOBS:
+            svc_rows = runs_df[runs_df["service"] == svc]
+            if svc_rows.empty:
+                last_run, last_status, recent_err = "—", "⚫", ""
+            else:
+                latest     = svc_rows.sort_values("run_date", ascending=False).iloc[0]
+                last_run   = str(latest["run_date"])
+                last_status = STATUS_ICON.get(str(latest["status"]), "❓")
+                recent_err  = str(latest["error_msg"] or "")[:80]
+
+            row = {"Job": svc, "Last Run": last_run, "Status": last_status}
+            for d in dates[:5]:
+                cell = svc_rows[svc_rows["run_date"] == d]
+                row[str(d)] = ("⚫" if cell.empty else
+                               STATUS_ICON.get(str(cell.sort_values("run_date").iloc[-1]["status"]), "❓"))
+            if recent_err:
+                row["Last Error"] = recent_err
             grid_rows.append(row)
 
-        grid = pd.DataFrame(grid_rows).set_index("Service")
-        st.dataframe(grid, use_container_width=True)
+        st.dataframe(pd.DataFrame(grid_rows), use_container_width=True, hide_index=True)
         st.caption("🟢 success  🔴 failed  🟡 running  ⬜ skipped  ⚫ no record")
 
-        # ── Failure drill-down (task 12) ─────────────────────────────────────
-        if detail_rows:
-            st.subheader("Recent Failures")
-            fail_df = pd.DataFrame(detail_rows)
-            fail_df.columns = ["Service", "Date", "Error", "Duration (s)", "Git SHA", "Rows Written"]
-            st.dataframe(fail_df, use_container_width=True, hide_index=True)
+        fails = runs_df[runs_df["status"] == "failed"].sort_values("run_date", ascending=False).head(5)
+        if not fails.empty:
+            with st.expander(f"🔴 {len(fails)} recent failures"):
+                st.dataframe(
+                    fails[["service", "run_date", "error_msg", "duration_s"]],
+                    use_container_width=True, hide_index=True,
+                )
 
+    st.divider()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE — TODAY'S SIGNALS
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "Today's Signals":
-    import json as _json
-    from datetime import date as _date
+    # ── Data Freshness ────────────────────────────────────────────────────────
+    st.subheader("Data Freshness")
+    st.caption("Latest record in each table. Age is relative to now (IST). 🟢 < 1d · 🟡 < 4d · 🔴 older.")
 
-    WEEKDAY_SYMBOL = {0: "MIDCPNIFTY", 1: "FINNIFTY", 2: "BANKNIFTY", 3: "NIFTY"}
-    PCR_BULLISH = 1.2; PCR_BEARISH = 0.8
-    VIX_MIN = 11.0; VIX_MAX = 28.0; VIX_SWEET_LO = 14.0; VIX_SWEET_HI = 22.0
-    IV_SKEW_THRESH = 2.0; TRADE_SCORE_THRESHOLD = 65.0
-
-    def _trade_score(conf, vix, iv_rank, pcr, iv_skew):
-        s_conf = min(conf, 100) / 100 * 40
-        if vix is None:
-            s_vix = 10.0
-        elif VIX_SWEET_LO <= vix <= VIX_SWEET_HI:
-            s_vix = 20.0
-        elif VIX_MIN <= vix <= VIX_MAX:
-            s_vix = 10.0
+    def _freshness_row(label, table, date_sql, ts_sql=None, ok_days=1, warn_days=4):
+        """
+        Build one freshness row. date_sql must return a single scalar date/datetime.
+        ts_sql is optional — returns the most recent timestamp for the 'At (IST)' column.
+        """
+        _no_data = {"Source": label, "Table": table, "Latest Date": "—",
+                    "At (IST)": "—", "Age": "—", "Status": "⚫ no data"}
+        df = query(date_sql)
+        if df.empty:
+            return _no_data
+        raw = df.iloc[0, 0]
+        # ClickHouse NULL → pandas NaT or None; both mean no data
+        if raw is None or (hasattr(raw, '_value') and raw is pd.NaT) or pd.isna(raw):
+            return _no_data
+        if isinstance(raw, (datetime, pd.Timestamp)):
+            ts = pd.Timestamp(raw)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            dt_utc = ts.to_pydatetime()
+            ld     = dt_utc.astimezone(IST).date()
         else:
-            s_vix = 0.0
-        s_ivr = min(iv_rank, 100) / 100 * 20
-        pcr_bull = pcr > PCR_BULLISH; pcr_bear = pcr < PCR_BEARISH
-        skew_bull = iv_skew > IV_SKEW_THRESH; skew_bear = iv_skew < -IV_SKEW_THRESH
-        if (pcr_bull and skew_bull) or (pcr_bear and skew_bear):
-            s_align = 20.0
-        elif pcr_bull or pcr_bear:
-            s_align = 10.0
-        else:
-            s_align = 0.0
-        return s_conf + s_vix + s_ivr + s_align, s_conf, s_vix, s_ivr, s_align
+            dt_utc = None
+            try:
+                ld = raw.date() if hasattr(raw, "date") else date.fromisoformat(str(raw)[:10])
+            except Exception:
+                return {"Source": label, "Table": table, "Latest Date": str(raw),
+                        "At (IST)": "—", "Age": "—", "Status": "❓"}
 
-    today = _date.today()
-    weekday = today.weekday()
-    symbol = WEEKDAY_SYMBOL.get(weekday)
+        # timestamp column
+        at_ist = "—"
+        if ts_sql:
+            ts_df = query(ts_sql)
+            if not ts_df.empty:
+                ts_raw = ts_df.iloc[0, 0]
+                if ts_raw is not None and not pd.isna(ts_raw):
+                    at_ist = _to_ist_str(ts_raw)
+        elif dt_utc:
+            at_ist = _to_ist_str(dt_utc)
 
-    st.title("Today's Signals")
-    if symbol is None:
-        st.info(f"No expiry today (weekday={weekday}). Markets open Mon–Thu for 0DTE signals.")
-        st.stop()
+        age_days = (today - ld).days
+        age_secs = age_days * 86400
+        # Re-compute precise age if we have a UTC datetime
+        if dt_utc:
+            age_secs = int((datetime.now(timezone.utc) - dt_utc).total_seconds())
+            age_days = age_secs // 86400
 
-    st.caption(f"Expiry symbol for today ({today.strftime('%A')}): **{symbol}**")
+        age_label = _age_str(dt_utc) if dt_utc else (f"{age_days}d ago" if age_days else "today")
+        icon  = traffic_light(age_days <= ok_days, age_days <= warn_days)
+        return {
+            "Source":      label,
+            "Table":       table,
+            "Latest Date": str(ld),
+            "At (IST)":    at_ist,
+            "Age":         age_label,
+            "Status":      icon,
+        }
 
-    # ── Fetch all signals ─────────────────────────────────────────────────────
-    conf_df = query(f"""
-        SELECT confidence, next_expiry, features_json
+    freshness_rows = []
+
+    # Options chain — one row per symbol
+    chain_sym_df = query("""
+        SELECT symbol,
+               nullIf(max(timestamp), toDateTime(0))       AS last_ts,
+               nullIf(max(toDate(timestamp)), toDate(0))   AS last_date
+        FROM market.options_chain FINAL
+        GROUP BY symbol ORDER BY symbol
+    """)
+    if chain_sym_df.empty:
+        for sym in SYMBOLS:
+            freshness_rows.append({
+                "Source": f"Options Chain · {sym}", "Table": "market.options_chain",
+                "Latest Date": "—", "At (IST)": "—", "Age": "—", "Status": "⚫ no data",
+            })
+    else:
+        for _, r in chain_sym_df.iterrows():
+            ts_raw = r["last_ts"]
+            dt_utc = None
+            if ts_raw is not None and not pd.isna(ts_raw):
+                ts = pd.Timestamp(ts_raw)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                dt_utc = ts.to_pydatetime()
+            ld_raw = r["last_date"]
+            if ld_raw is None or (not isinstance(ld_raw, date) and pd.isna(ld_raw)):
+                ld, age_days = None, 99
+            else:
+                ld = ld_raw.date() if hasattr(ld_raw, "date") else ld_raw
+                age_days = (today - ld).days if ld else 99
+            freshness_rows.append({
+                "Source":      f"Options Chain · {r['symbol']}",
+                "Table":       "market.options_chain",
+                "Latest Date": str(ld),
+                "At (IST)":    _to_ist_str(dt_utc),
+                "Age":         _age_str(dt_utc),
+                "Status":      traffic_light(age_days <= 1, age_days <= 4),
+            })
+
+    # India VIX / Nifty spot
+    freshness_rows.append(_freshness_row(
+        "India VIX / Nifty Spot", "market.nifty_live",
+        "SELECT nullIf(max(timestamp), toDateTime(0)) FROM market.nifty_live FINAL",
+        ok_days=1, warn_days=3,
+    ))
+
+    # OI features — options_eod_summary is NIFTY-only (no symbol column)
+    freshness_rows.append(_freshness_row(
+        "OI Features (EOD) · NIFTY", "market.options_eod_summary",
+        "SELECT max(date) FROM market.options_eod_summary FINAL",
+        ok_days=1, warn_days=4,
+    ))
+
+    # OHLCV by market
+    ohlcv_df = query("""
+        SELECT market, max(date) AS last_date
+        FROM market.ohlcv_daily FINAL
+        WHERE market IN ('nse_index', 'indian', 'bse')
+        GROUP BY market ORDER BY market
+    """)
+    for _, r in (ohlcv_df.iterrows() if not ohlcv_df.empty else iter([])):
+        ld_raw = r["last_date"]
+        ld = ld_raw.date() if hasattr(ld_raw, "date") else (
+            date.fromisoformat(str(ld_raw)[:10]) if ld_raw else None)
+        age_days = (today - ld).days if ld else 99
+        freshness_rows.append({
+            "Source":      f"OHLCV · {r['market']}",
+            "Table":       "market.ohlcv_daily",
+            "Latest Date": str(ld) if ld else "—",
+            "At (IST)":    "—",
+            "Age":         f"{age_days}d ago" if ld else "—",
+            "Status":      traffic_light(age_days <= 1, age_days <= 3),
+        })
+
+    # Participant OI
+    freshness_rows.append(_freshness_row(
+        "Participant OI", "market.participant_oi",
+        "SELECT max(date) FROM market.participant_oi FINAL",
+        ok_days=1, warn_days=3,
+    ))
+
+    # Confidence scores
+    freshness_rows.append(_freshness_row(
+        "Confidence Scores", "analysis.confidence_scores",
+        "SELECT max(score_date) FROM analysis.confidence_scores FINAL",
+        ok_days=1, warn_days=2,
+    ))
+
+    # Open positions — nullIf guards against epoch (1970) returned from empty table
+    freshness_rows.append(_freshness_row(
+        "Open Positions", "trades.open_positions",
+        "SELECT nullIf(max(entry_time), toDateTime(0)) FROM trades.open_positions FINAL",
+        ok_days=4, warn_days=7,
+    ))
+
+    # Trade outcomes
+    freshness_rows.append(_freshness_row(
+        "Trade Outcomes", "trades.trade_outcomes",
+        "SELECT nullIf(max(exit_time), toDateTime(0)) FROM trades.trade_outcomes FINAL",
+        ok_days=4, warn_days=14,
+    ))
+
+    st.dataframe(pd.DataFrame(freshness_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Confidence Scores ─────────────────────────────────────────────────────
+    st.subheader("Confidence Scores")
+    scores_df = query("""
+        SELECT symbol, score_date, confidence
         FROM analysis.confidence_scores FINAL
-        WHERE score_date >= today() - 7 AND symbol = '{symbol}'
-        ORDER BY score_date DESC, version DESC LIMIT 1
+        WHERE score_date >= today() - 7
+        ORDER BY symbol, score_date DESC
+    """)
+
+    if scores_df.empty:
+        st.error("No confidence scores in the last 7 days. Run: confidence_scorer --score-only")
+    else:
+        scores_df["score_date"] = pd.to_datetime(scores_df["score_date"]).dt.date
+        latest_scores = scores_df.groupby("symbol").first().reset_index()
+
+        cols = st.columns(4)
+        for i, sym in enumerate(SYMBOLS):
+            row = latest_scores[latest_scores["symbol"] == sym]
+            with cols[i]:
+                if row.empty:
+                    st.metric(sym, "—", delta="NO SCORE")
+                    st.write("🔴 Never scored")
+                else:
+                    r = row.iloc[0]
+                    conf     = float(r["confidence"])
+                    age_days = (today - r["score_date"]).days
+                    signal_ok = conf >= MIN_CONFIDENCE
+                    icon     = traffic_light(age_days == 0, age_days <= 1)
+                    st.metric(
+                        label=f"{icon} {sym}",
+                        value=f"{conf:.0f}/100",
+                        delta=f"{'✅ GO' if signal_ok else '❌ NO-GO'} · {age_days}d ago",
+                        delta_color="normal" if signal_ok else "inverse",
+                    )
+
+    st.divider()
+
+    # ── Resources & Cleanup ───────────────────────────────────────────────────
+    st.subheader("🗄️ Resources & Cleanup")
+
+    def _fmt_bytes(n: int) -> str:
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if abs(n) < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} PB"
+
+    _res_tabs = st.tabs(["Host", "Docker", "Cleanup Log", "Suggestions"])
+
+    # ── Host tab ─────────────────────────────────────────────────────────────
+    with _res_tabs[0]:
+        import shutil as _shutil
+
+        # Memory — /proc/meminfo is the host kernel's view even inside a container
+        try:
+            _mem = {}
+            with open("/proc/meminfo") as _mf:
+                for _ml in _mf:
+                    _mp = _ml.split()
+                    if len(_mp) >= 2:
+                        _mem[_mp[0].rstrip(":")] = int(_mp[1]) * 1024
+            _mem_total = _mem.get("MemTotal", 0)
+            _mem_avail = _mem.get("MemAvailable", 0)
+            _mem_used  = _mem_total - _mem_avail
+            _mem_pct   = _mem_used / _mem_total * 100 if _mem_total else 0
+            _hc1, _hc2, _hc3 = st.columns(3)
+            _hc1.metric("RAM Total",     _fmt_bytes(_mem_total))
+            _hc2.metric("RAM Used",      _fmt_bytes(_mem_used),
+                        f"{_mem_pct:.0f}%",
+                        delta_color="inverse" if _mem_pct > 85 else "normal")
+            _hc3.metric("RAM Available", _fmt_bytes(_mem_avail))
+        except Exception as _e:
+            st.caption(f"Memory read error: {_e}")
+
+        st.markdown("**Filesystem usage**")
+        try:
+            import subprocess as _sp
+            _df_out = _sp.run(
+                ["df", "-B1", "--output=target,size,used,avail,pcent"],
+                capture_output=True, text=True, timeout=5
+            ).stdout.splitlines()
+            _disk_rows = []
+            for _dl in _df_out[1:]:
+                _dp = _dl.split()
+                if len(_dp) >= 5:
+                    try:
+                        _disk_rows.append({
+                            "Mount": _dp[0], "Total": _fmt_bytes(int(_dp[1])),
+                            "Used": _fmt_bytes(int(_dp[2])), "Free": _fmt_bytes(int(_dp[3])),
+                            "Used%": _dp[4],
+                        })
+                    except ValueError:
+                        pass
+            if _disk_rows:
+                _dk_df = pd.DataFrame(_disk_rows)
+                st.dataframe(_dk_df, use_container_width=True, hide_index=True)
+        except Exception as _e:
+            st.caption(f"Disk read error: {_e}")
+
+        _cpu_count = os.cpu_count() or "?"
+        try:
+            with open("/proc/loadavg") as _lf:
+                _load = _lf.read().split()[:3]
+                _load_str = "  /  ".join(_load)
+        except Exception:
+            _load_str = "—"
+        st.caption(f"CPU cores: {_cpu_count}   |   Load avg (1/5/15 min): {_load_str}")
+
+    # ── Docker tab ────────────────────────────────────────────────────────────
+    with _res_tabs[1]:
+        try:
+            import docker as _docker_sdk
+            _dc = _docker_sdk.from_env()
+
+            # Images
+            _all_imgs   = _dc.images.list()
+            _dang_imgs  = _dc.images.list(filters={"dangling": True})
+            _img_bytes  = sum(i.attrs.get("Size", 0) for i in _all_imgs)
+            _dang_bytes = sum(i.attrs.get("Size", 0) for i in _dang_imgs)
+
+            # Containers
+            _all_cts   = _dc.containers.list(all=True)
+            _run_cts   = [c for c in _all_cts if c.status == "running"]
+            _stop_cts  = [c for c in _all_cts if c.status in ("exited", "created", "dead")]
+            # Orphaned = stopped for more than 7 days (no FinishedAt or very old)
+            import datetime as _dt_mod
+            _now_utc = _dt_mod.datetime.now(_dt_mod.timezone.utc)
+            _orphans = []
+            for _ct in _stop_cts:
+                _fa = (_ct.attrs.get("State") or {}).get("FinishedAt", "")
+                if _fa and _fa != "0001-01-01T00:00:00Z":
+                    try:
+                        _fin = _dt_mod.datetime.fromisoformat(_fa.replace("Z", "+00:00"))
+                        if (_now_utc - _fin).days >= 7:
+                            _orphans.append(_ct)
+                    except Exception:
+                        pass
+
+            # Volumes
+            _all_vols  = _dc.volumes.list()
+            _dang_vols = _dc.volumes.list(filters={"dangling": True})
+
+            # Build cache via system df
+            try:
+                _sysdf = _dc.df()
+                _cache_bytes = sum(
+                    (c.get("Size", 0) or 0)
+                    for c in (_sysdf.get("BuildCache") or [])
+                )
+            except Exception:
+                _cache_bytes = 0
+
+            # Display
+            _d1, _d2, _d3, _d4 = st.columns(4)
+            _d1.metric("Images",          f"{len(_all_imgs)}",
+                       f"{_fmt_bytes(_img_bytes)} total")
+            _d2.metric("Containers",      f"{len(_all_cts)}",
+                       f"{len(_run_cts)} running  /  {len(_stop_cts)} stopped")
+            _d3.metric("Volumes",         f"{len(_all_vols)}",
+                       f"{len(_dang_vols)} dangling")
+            _d4.metric("Build Cache",     _fmt_bytes(_cache_bytes))
+
+            # Dangling images table
+            if _dang_imgs:
+                st.markdown(f"**Dangling images** ({len(_dang_imgs)}, {_fmt_bytes(_dang_bytes)}) — safe to prune")
+                _di_rows = []
+                for _im in _dang_imgs:
+                    _di_rows.append({
+                        "Image ID": _im.short_id,
+                        "Size": _fmt_bytes(_im.attrs.get("Size", 0)),
+                        "Created": _im.attrs.get("Created", "")[:10],
+                    })
+                st.dataframe(pd.DataFrame(_di_rows), use_container_width=True, hide_index=True)
+
+            # All containers status table
+            st.markdown("**All containers**")
+            _ct_rows = []
+            for _ct in sorted(_all_cts, key=lambda c: c.name):
+                _fa = (_ct.attrs.get("State") or {}).get("FinishedAt", "")
+                _fin_str = _fa[:19].replace("T", " ") if _fa and _fa != "0001-01-01T00:00:00Z" else "—"
+                _sz = (_ct.attrs.get("SizeRootFs") or 0)
+                _ct_rows.append({
+                    "Container": _ct.name,
+                    "Status": _ct.status,
+                    "Image": (_ct.image.tags[0] if _ct.image and _ct.image.tags else _ct.image.short_id if _ct.image else "—"),
+                    "Stopped at": _fin_str,
+                    "Orphan": "⚠️ yes" if _ct in _orphans else "",
+                })
+            st.dataframe(pd.DataFrame(_ct_rows), use_container_width=True, hide_index=True)
+
+            # Dangling volumes
+            if _dang_vols:
+                st.markdown(f"**Dangling volumes** ({len(_dang_vols)}) — not mounted by any container")
+                _dv_rows = [{"Volume": v.name, "Driver": v.attrs.get("Driver", "")} for v in _dang_vols]
+                st.dataframe(pd.DataFrame(_dv_rows), use_container_width=True, hide_index=True)
+
+        except Exception as _e:
+            st.warning(f"Docker SDK unavailable: {_e}")
+            st.caption("Ensure /var/run/docker.sock is mounted and the `docker` package is installed.")
+
+    # ── Cleanup Log tab ───────────────────────────────────────────────────────
+    with _res_tabs[2]:
+        _cl_df = query("""
+            SELECT task_name, status, items_freed, bytes_freed, detail,
+                   ran_at
+            FROM system_meta.cleanup_log
+            ORDER BY ran_at DESC
+            LIMIT 50
+        """)
+        if _cl_df.empty:
+            st.info("No cleanup runs recorded yet. Cleanup runs every Sunday 09:00 UTC.")
+        else:
+            _cl_df["bytes_freed"] = _cl_df["bytes_freed"].apply(
+                lambda x: _fmt_bytes(int(x)) if x and int(x) > 0 else "—"
+            )
+            _cl_df["ran_at"] = pd.to_datetime(_cl_df["ran_at"])
+            _cl_df["ran_at"] = _cl_df["ran_at"].apply(
+                lambda d: d.strftime("%Y-%m-%d %H:%M") if pd.notna(d) else "—"
+            )
+            st.dataframe(
+                _cl_df.rename(columns={
+                    "task_name": "Task", "status": "Status",
+                    "items_freed": "Items Freed", "bytes_freed": "Bytes Freed",
+                    "detail": "Detail", "ran_at": "Ran At",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+            # Show docker system df from latest docker_assessment detail
+            _last_docker = _cl_df[_cl_df["Task"] == "docker_assessment"].head(1)
+            if not _last_docker.empty:
+                try:
+                    _d = json.loads(_last_docker.iloc[0]["Detail"])
+                    if _d.get("system_df"):
+                        with st.expander("docker system df (from last assessment)"):
+                            st.code(_d["system_df"])
+                except Exception:
+                    pass
+
+    # ── Suggestions tab ───────────────────────────────────────────────────────
+    with _res_tabs[3]:
+        st.markdown("**Automated cleanup suggestions** (based on current Docker state)")
+        try:
+            import docker as _docker_sdk2
+            _dc2 = _docker_sdk2.from_env()
+
+            _sugg = []
+
+            _dang2      = _dc2.images.list(filters={"dangling": True})
+            _stop2      = [c for c in _dc2.containers.list(all=True)
+                           if c.status in ("exited", "created", "dead")]
+            _dang_vol2  = _dc2.volumes.list(filters={"dangling": True})
+
+            _dang_sz2  = sum(i.attrs.get("Size", 0) for i in _dang2)
+            if _dang2:
+                _sugg.append({
+                    "Priority": "🟡 Medium", "Issue": f"{len(_dang2)} dangling image(s) ({_fmt_bytes(_dang_sz2)})",
+                    "Command": "docker image prune -f",
+                    "Impact": f"Frees ~{_fmt_bytes(_dang_sz2)}",
+                })
+
+            if _stop2:
+                _sugg.append({
+                    "Priority": "🟢 Low", "Issue": f"{len(_stop2)} stopped container(s)",
+                    "Command": "docker container prune -f",
+                    "Impact": "Frees stopped container layers",
+                })
+
+            if _dang_vol2:
+                _sugg.append({
+                    "Priority": "🟡 Medium", "Issue": f"{len(_dang_vol2)} dangling volume(s)",
+                    "Command": "docker volume prune -f",
+                    "Impact": "Frees anonymous/unused volume data",
+                })
+
+            # Build cache
+            try:
+                _sysdf2 = _dc2.df()
+                _cache2 = sum(
+                    (c.get("Size", 0) or 0) for c in (_sysdf2.get("BuildCache") or [])
+                )
+                if _cache2 > 500 * 1024 * 1024:  # > 500 MB
+                    _sugg.append({
+                        "Priority": "🟡 Medium", "Issue": f"Build cache {_fmt_bytes(_cache2)}",
+                        "Command": "docker builder prune -f",
+                        "Impact": f"Frees ~{_fmt_bytes(_cache2)}",
+                    })
+            except Exception:
+                pass
+
+            # Disk pressure check
+            try:
+                _root_du = _shutil.disk_usage("/")
+                _disk_pct = _root_du.used / _root_du.total * 100
+                if _disk_pct > 85:
+                    _sugg.insert(0, {
+                        "Priority": "🔴 High", "Issue": f"Root filesystem {_disk_pct:.0f}% full",
+                        "Command": "docker system prune -f --volumes",
+                        "Impact": "Full prune: removes stopped containers, dangling images, unused volumes",
+                    })
+                elif _disk_pct > 70:
+                    _sugg.append({
+                        "Priority": "🟡 Medium", "Issue": f"Root filesystem {_disk_pct:.0f}% full (approaching limit)",
+                        "Command": "docker system prune -f",
+                        "Impact": "Removes stopped containers + dangling images",
+                    })
+            except Exception:
+                pass
+
+            # Orphaned containers (project containers not in docker-compose)
+            _compose_names = {
+                "clickhouse", "dashboard", "scheduler", "minio", "portainer",
+                "pipeline", "meta_pipeline", "compute_oi_features",
+                "intraday_monitor", "option_chain_intraday",
+            }
+            _all2 = _dc2.containers.list(all=True)
+            _orphan_cts = [c for c in _all2
+                           if c.status in ("exited", "created", "dead")
+                           and not any(n in c.name for n in _compose_names)]
+            if _orphan_cts:
+                _sugg.append({
+                    "Priority": "🟢 Low",
+                    "Issue": f"{len(_orphan_cts)} orphan container(s) (not part of compose project)",
+                    "Command": "docker container prune -f",
+                    "Impact": "Removes containers with no running compose service",
+                })
+
+            if not _sugg:
+                st.success("✅ No cleanup needed — Docker is in good shape.")
+            else:
+                st.dataframe(pd.DataFrame(_sugg), use_container_width=True, hide_index=True)
+                st.caption(
+                    "Run commands on the **host** (or inside the scheduler container which has "
+                    "Docker socket access). Commands with `-f` skip the confirmation prompt."
+                )
+
+        except Exception as _e:
+            st.warning(f"Docker SDK unavailable: {_e}")
+
+        # ClickHouse system table advice
+        st.markdown("**ClickHouse system tables**")
+        _ch_sys = query("""
+            SELECT table,
+                   formatReadableSize(sum(bytes_on_disk)) AS size_on_disk,
+                   sum(rows) AS rows
+            FROM system.parts
+            WHERE database = 'system'
+            GROUP BY table
+            ORDER BY sum(bytes_on_disk) DESC
+        """)
+        if not _ch_sys.empty:
+            st.dataframe(_ch_sys, use_container_width=True, hide_index=True)
+            _ch_sys["_bytes"] = query("""
+                SELECT table, sum(bytes_on_disk) AS b
+                FROM system.parts WHERE database='system'
+                GROUP BY table ORDER BY b DESC
+            """).set_index("table").get("b", pd.Series(dtype=float))
+            _total_sys_mb = query("""
+                SELECT sum(bytes_on_disk)/1e6 AS mb FROM system.parts WHERE database='system'
+            """)
+            if not _total_sys_mb.empty:
+                _smb = float(_total_sys_mb.iloc[0]["mb"])
+                if _smb > 500:
+                    st.warning(
+                        f"ClickHouse system tables use {_smb:.0f} MB. "
+                        "Logs older than TTL will be purged automatically. "
+                        "Check `clickhouse/config/log-retention.xml` if this keeps growing."
+                    )
+                else:
+                    st.caption(f"System tables total: {_smb:.0f} MB — within normal range.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 — MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Model":
+    st.title("🧠 Model")
+    st.caption(
+        "Per-symbol XGBoost trained on weekly expiry iron fly data. "
+        "Retrained weekly (Sunday). Daily re-score at 18:30 IST. "
+        f"Gate: confidence ≥ {MIN_CONFIDENCE:.0f} to trade."
+    )
+
+    today = date.today()
+
+    # ── Today's signal cards — all 4 symbols ─────────────────────────────────
+    st.subheader("Today's Signal")
+
+    scores_df = query("""
+        SELECT symbol, score_date, next_expiry,
+               confidence, expected_pnl_pct, features_json
+        FROM analysis.confidence_scores FINAL
+        WHERE score_date >= today() - 3
+        ORDER BY symbol, score_date DESC, version DESC
     """)
 
     vix_df = query("""
@@ -306,1902 +907,1890 @@ elif page == "Today's Signals":
         FROM market.nifty_live FINAL
         ORDER BY timestamp DESC LIMIT 1
     """)
+    vix_val = float(vix_df["vix"].iloc[0]) if not vix_df.empty else None
+    spot_val = float(vix_df["nifty_spot"].iloc[0]) if not vix_df.empty else None
 
-    if conf_df.empty:
-        st.warning(f"No confidence score for {symbol} yet. Run `confidence_scorer` first.")
-        st.stop()
-
-    conf_row   = conf_df.iloc[0]
-    confidence = float(conf_row["confidence"])
-    expiry     = str(conf_row["next_expiry"])[:10]  # strip time part — CH Date column needs 'YYYY-MM-DD'
-    feats      = _json.loads(conf_row["features_json"]) if conf_row["features_json"] else {}
-    pcr        = float(feats.get("pcr_oi", 1.0))
-    iv_skew_f  = float(feats.get("iv_skew", 0.0))
-
-    vix_val   = float(vix_df["vix"].iloc[0])     if not vix_df.empty else None
-    nifty_spt = float(vix_df["nifty_spot"].iloc[0]) if not vix_df.empty else None
-    snap_date = vix_df["snap_date"].iloc[0]      if not vix_df.empty else None
-
-    eod_df = query(f"""
-        SELECT iv_rank, max_pain_strike,
-               ifNull(ce_wall_strike, 0) AS ce_wall,
-               ifNull(pe_wall_strike, 0) AS pe_wall,
-               ifNull(iv_skew, 0) AS iv_skew_eod,
-               pcr AS pcr_eod
+    # options_eod_summary is NIFTY-only (CRIT-003) — inject 'NIFTY' so downstream
+    # symbol-filter still works; other symbols return empty sym_eod correctly.
+    eod_df = query("""
+        SELECT 'NIFTY' AS symbol, date, iv_rank, pcr
         FROM market.options_eod_summary FINAL
-        WHERE expiry = '{expiry}'
-        ORDER BY date DESC LIMIT 1
+        WHERE date >= today() - 5
+        ORDER BY date DESC
     """)
 
-    if not eod_df.empty:
-        eod = eod_df.iloc[0]
-        iv_rank   = float(eod["iv_rank"]   or 50.0)
-        max_pain  = float(eod["max_pain_strike"] or 0.0)
-        ce_wall   = float(eod["ce_wall"]   or 0.0)
-        pe_wall   = float(eod["pe_wall"]   or 0.0)
-        iv_skew_eod = float(eod["iv_skew_eod"] or 0.0)
-        pcr_eod   = float(eod["pcr_eod"]   or pcr)
-    else:
-        iv_rank = 50.0; max_pain = 0.0; ce_wall = 0.0; pe_wall = 0.0
-        iv_skew_eod = iv_skew_f; pcr_eod = pcr
+    cols = st.columns(4)
+    for i, sym in enumerate(SYMBOLS):
+        with cols[i]:
+            sym_scores = (scores_df[scores_df["symbol"] == sym]
+                          if not scores_df.empty else pd.DataFrame())
+            sym_eod = (eod_df[eod_df["symbol"] == sym]
+                       if not eod_df.empty else pd.DataFrame())
 
-    # Use best available iv_skew
-    iv_skew = iv_skew_eod if iv_skew_eod != 0.0 else iv_skew_f
-    pcr_use = pcr_eod if pcr_eod != pcr else pcr
+            if sym_scores.empty:
+                st.error(f"**{sym}**\nNo score")
+                continue
 
-    score, s_conf, s_vix, s_ivr, s_align = _trade_score(confidence, vix_val, iv_rank, pcr_use, iv_skew)
-
-    # ── GO / NO-GO banner ─────────────────────────────────────────────────────
-    go_signal = score >= TRADE_SCORE_THRESHOLD
-    vix_ok = vix_val is None or (VIX_MIN <= vix_val <= VIX_MAX)
-
-    if go_signal and vix_ok:
-        st.success(f"## ✅ GO — Trade {symbol} | Score: **{score:.1f} / 100**")
-    elif not vix_ok:
-        st.error(f"## 🚫 NO-GO — VIX {vix_val:.1f} outside safe range [{VIX_MIN}–{VIX_MAX}]")
-    else:
-        st.error(f"## ❌ NO-GO — Score {score:.1f} < {TRADE_SCORE_THRESHOLD} threshold")
-
-    # ── Score gauge ───────────────────────────────────────────────────────────
-    fig_gauge = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=score,
-        domain={"x": [0, 1], "y": [0, 1]},
-        title={"text": "Trade Score / 100"},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": "#2ecc71" if go_signal else "#e74c3c"},
-            "steps": [
-                {"range": [0, 50],   "color": "#fadbd8"},
-                {"range": [50, 65],  "color": "#fdebd0"},
-                {"range": [65, 100], "color": "#d5f5e3"},
-            ],
-            "threshold": {
-                "line": {"color": "black", "width": 3},
-                "thickness": 0.75,
-                "value": TRADE_SCORE_THRESHOLD,
-            },
-        },
-    ))
-    fig_gauge.update_layout(height=260, margin=dict(t=40, b=0, l=20, r=20))
-
-    col_gauge, col_break = st.columns([1, 2])
-    with col_gauge:
-        st.plotly_chart(fig_gauge, use_container_width=True)
-
-    with col_break:
-        st.markdown("**Score Breakdown**")
-        breakdown_data = [
-            {"Component": "Confidence",    "Score": f"{s_conf:.1f}/40",
-             "Value": f"{confidence:.1f}/100",
-             "Status": "🟢" if s_conf >= 28 else "🟡" if s_conf >= 20 else "🔴"},
-            {"Component": "VIX Zone",      "Score": f"{s_vix:.1f}/20",
-             "Value": f"{vix_val:.1f}" if vix_val else "n/a",
-             "Status": "🟢" if s_vix >= 20 else "🟡" if s_vix >= 10 else "🔴"},
-            {"Component": "IV Rank",       "Score": f"{s_ivr:.1f}/20",
-             "Value": f"{iv_rank:.0f}%",
-             "Status": "🟢" if s_ivr >= 15 else "🟡" if s_ivr >= 8 else "🔴"},
-            {"Component": "PCR+Skew Align","Score": f"{s_align:.1f}/20",
-             "Value": f"PCR={pcr_use:.2f} · skew={iv_skew:+.2f}",
-             "Status": "🟢" if s_align >= 20 else "🟡" if s_align >= 10 else "🔴"},
-        ]
-        st.dataframe(pd.DataFrame(breakdown_data), use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-
-    # ── Market snapshot ───────────────────────────────────────────────────────
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Market Snapshot**")
-        pcr_label = "Bullish 🟢" if pcr_use > PCR_BULLISH else "Bearish 🔴" if pcr_use < PCR_BEARISH else "Neutral ⚪"
-        skew_label = "Fear (PE prem) 🔴" if iv_skew > IV_SKEW_THRESH else "Greed (CE prem) 🟢" if iv_skew < -IV_SKEW_THRESH else "Balanced ⚪"
-        vix_label = ("🟢 Sweet spot" if vix_val and VIX_SWEET_LO <= vix_val <= VIX_SWEET_HI
-                     else "🟡 Borderline" if vix_val and VIX_MIN <= vix_val <= VIX_MAX
-                     else "🔴 Outside gate" if vix_val else "—")
-        iv_rank_mult = 0.5 + iv_rank / 100
-        snap_rows = [
-            {"Signal": "Nifty Spot",  "Value": f"{nifty_spt:,.0f}" if nifty_spt else "—", "Context": ""},
-            {"Signal": "VIX",         "Value": f"{vix_val:.2f}" if vix_val else "—",       "Context": vix_label},
-            {"Signal": "PCR (OI)",    "Value": f"{pcr_use:.3f}",                            "Context": pcr_label},
-            {"Signal": "IV Skew",     "Value": f"{iv_skew:+.2f}%",                          "Context": skew_label},
-            {"Signal": "IV Rank",     "Value": f"{iv_rank:.0f}%",                           "Context": f"Lot mult = {iv_rank_mult:.2f}×"},
-            {"Signal": "Max Pain",    "Value": f"{max_pain:,.0f}" if max_pain else "—",     "Context": "Gravitational strike"},
-        ]
-        st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
-
-    with col2:
-        st.markdown("**OI Wall Guard**")
-        # Show where short strikes would land vs walls
-        lot_size_df = query(f"SELECT lot_size FROM market.fo_lot_sizes WHERE symbol='{symbol}' ORDER BY effective_from DESC LIMIT 1")
-        params_df   = query_weekly(f"""
-            SELECT strategy, short_n, wing_m, avg_max_loss
-            FROM analysis.spread_optimal FINAL
-            WHERE symbol='{symbol}' AND n_trades >= 10
-            ORDER BY sharpe_pct DESC LIMIT 3
-        """)
-        if not params_df.empty:
-            # Pick strategy
-            pcr_bull = pcr_use > PCR_BULLISH; pcr_bear = pcr_use < PCR_BEARISH
-            skew_bear_b = iv_skew < -IV_SKEW_THRESH; skew_bull_b = iv_skew > IV_SKEW_THRESH
-            if pcr_bull and not skew_bear_b:   chosen_strat = "bull_put"
-            elif pcr_bear and not skew_bull_b: chosen_strat = "bear_call"
-            else:                              chosen_strat = "iron_condor"
-
-            best = params_df[params_df["strategy"] == chosen_strat]
-            if best.empty:
-                best = params_df.iloc[[0]]
-            p = best.iloc[0]
-            sn = int(p["short_n"]); wm = int(p["wing_m"])
-
-            # Get chain snapshot for step size
-            chain_df = query(f"""
-                SELECT strike FROM market.options_chain
-                WHERE symbol='{symbol}' AND expiry='{expiry}'
-                  AND option_type='CE' AND ltp > 0.05
-                ORDER BY toDate(timestamp) DESC, strike LIMIT 30
-            """)
-            if not chain_df.empty and len(chain_df) >= 2:
-                strikes = sorted(chain_df["strike"].unique())
-                diffs = [strikes[i+1]-strikes[i] for i in range(len(strikes)-1) if strikes[i+1]>strikes[i]]
-                step = float(max(set(diffs), key=diffs.count)) if diffs else 50.0
-            else:
-                step = {"NIFTY":50,"BANKNIFTY":100,"FINNIFTY":50,"MIDCPNIFTY":25}.get(symbol, 50)
-
-            spot = nifty_spt or 0
-            short_ce = spot + sn * step
-            short_pe = spot - sn * step
-
-            wall_rows = []
-            if chosen_strat in ("iron_condor", "bear_call") and ce_wall > 0:
-                ce_ok = short_ce >= ce_wall
-                wall_rows.append({
-                    "Leg": f"Short CE (~{short_ce:,.0f})",
-                    "OI Wall": f"CE wall {ce_wall:,.0f}",
-                    "Pass": "✅ Beyond wall" if ce_ok else "⛔ Inside wall",
-                })
-            if chosen_strat in ("iron_condor", "bull_put") and pe_wall > 0:
-                pe_ok = short_pe <= pe_wall
-                wall_rows.append({
-                    "Leg": f"Short PE (~{short_pe:,.0f})",
-                    "OI Wall": f"PE wall {pe_wall:,.0f}",
-                    "Pass": "✅ Beyond wall" if pe_ok else "⛔ Inside wall",
-                })
-            if wall_rows:
-                st.markdown(f"Strategy: **{chosen_strat.replace('_',' ').title()}** · sn={sn} · wm={wm}")
-                st.dataframe(pd.DataFrame(wall_rows), use_container_width=True, hide_index=True)
-            else:
-                st.info("OI wall data not available yet (run compute_oi_features).")
-        else:
-            st.info("No optimal params yet for this symbol.")
-
-    st.markdown("---")
-    st.caption(f"Data as of: snap_date={snap_date} · expiry={expiry} · "
-               f"confidence from score_date {conf_df['next_expiry'].iloc[0] if not conf_df.empty else '—'}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 2 — CONFIDENCE SCORES
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "Confidence Scores":
-    st.title("Confidence Scores — XGBoost 0DTE Straddle")
-    st.caption(
-        "Per-symbol XGBoost models trained on 24–28 months of weekly expiry data. "
-        "Score = probability (0–100) that selling ATM straddle on next expiry will be profitable. "
-        "Threshold ≥55 to trade. Walk-forward OOS AUC: NIFTY≈0.55, FINNIFTY≈0.62, "
-        "BANKNIFTY≈0.47, MIDCPNIFTY≈0.44. Models are retrained weekly (Sunday)."
-    )
-
-    # ── Today's scores ───────────────────────────────────────────────────────
-    scores = query("""
-        SELECT symbol, next_expiry, round(confidence, 1) AS confidence,
-               round(expected_pnl_pct, 1) AS expected_pnl_pct
-        FROM analysis.confidence_scores FINAL
-        WHERE score_date = today()
-        ORDER BY confidence DESC
-    """)
-
-    if scores.empty:
-        st.info("No confidence scores for today yet. Run: docker compose run --rm confidence_scorer")
-    else:
-        st.subheader("Today's Signal")
-        cols = st.columns(len(scores))
-        for i, (_, row) in enumerate(scores.iterrows()):
+            row = sym_scores.iloc[0]
             conf = float(row["confidence"])
-            color_str = "🟢" if conf >= 70 else "🟡" if conf >= 55 else "🔴"
-            action = "TRADE" if conf >= 65 else "SKIP"
-            cols[i].metric(
-                label=f"{color_str} {row['symbol']}",
+            expiry = str(row["next_expiry"])[:10]
+            exp_pnl_pct = float(row["expected_pnl_pct"])
+            feats_json = row["features_json"] if row["features_json"] else ""
+            miss = missing_features(feats_json)
+
+            signal_ok  = conf >= MIN_CONFIDENCE
+            card_color = "🟢" if signal_ok else "🔴"
+
+            # Graduation model: prominent headline, detail below
+            st.markdown(f"### {card_color} {sym}")
+
+            # Confidence gauge (simple colored metric)
+            conf_level = ("HIGH" if conf >= 70 else "MED" if conf >= MIN_CONFIDENCE else "LOW")
+            st.metric(
+                label="Confidence",
                 value=f"{conf:.0f}/100",
-                delta=f"{action} — Expiry {row['next_expiry']}",
+                delta=f"{'✅ GO' if signal_ok else '❌ NO-GO'} — {conf_level}",
+                delta_color="normal" if signal_ok else "inverse",
             )
 
-        st.dataframe(
-            scores.rename(columns={
-                "symbol": "Symbol", "next_expiry": "Next Expiry",
-                "confidence": "Confidence /100", "expected_pnl_pct": "Expected P&L %"
-            }),
-            use_container_width=True, hide_index=True,
-        )
+            # Expected P&L
+            lot_size = LOT_SIZES.get(sym, 65)
+            span_pts = span_estimate_pts(feats_json, spot_val or 24000, lot_size)
+            threshold_inr = span_pts * 0.01 if span_pts > 0 else None
+            exp_pnl_inr = exp_pnl_pct / 100 * (spot_val or 24000) * lot_size if spot_val else None
+            if exp_pnl_inr is not None and threshold_inr:
+                beat_threshold = exp_pnl_inr >= threshold_inr
+                st.metric(
+                    label="Expected P&L",
+                    value=fmt_inr(exp_pnl_inr),
+                    delta=f"Threshold: {fmt_inr(threshold_inr)} {'✅' if beat_threshold else '⚠️'}",
+                    delta_color="normal" if beat_threshold else "off",
+                )
+            else:
+                st.metric("Expected P&L", f"{exp_pnl_pct:+.1f}%")
 
-    # ── Walk-forward backtest ─────────────────────────────────────────────────
-    st.subheader("Walk-Forward Backtest Results")
-    st.info(
-        "⚠️ **These are raw naked ATM straddle results — used only to train the ML model, not actual trades.**  \n"
-        "The model learns which days are profitable for option selling. "
-        "Large % losses (e.g. -200%) occur when the market moves beyond the collected premium — "
-        "this is why we **never take straddles live**. Actual trades use hedged spreads (IC / bull_put / bear_call) "
-        "with defined max loss. See **Live Trading → Compounding Simulation** for real strategy P&L."
-    )
-    bt = query_weekly("""
-        SELECT symbol, expiry, entry_date, atm_strike, entry_premium,
-               pnl_pts, pnl_pct, target, round(confidence * 100, 1) AS confidence
+            # Key context
+            iv_rank_val = None
+            pcr_val = None
+            if not sym_eod.empty:
+                eod_row = sym_eod.iloc[0]
+                iv_rank_val = float(eod_row.get("iv_rank", 0) or 0)
+                pcr_val = float(eod_row.get("pcr", 0) or 0)
+
+            context_parts = []
+            if vix_val:
+                context_parts.append(f"VIX {vix_val:.1f}")
+            if pcr_val:
+                context_parts.append(f"PCR {pcr_val:.2f}")
+            if iv_rank_val:
+                context_parts.append(f"IVR {iv_rank_val:.0f}%")
+            if context_parts:
+                st.caption(" · ".join(context_parts))
+
+            # Feature health badges — graduation: green summary, expand for detail
+            if miss:
+                badge_txt = f"⚠️ {len(miss)} feature{'s' if len(miss) > 1 else ''} missing"
+                with st.expander(badge_txt, expanded=False):
+                    for f in miss:
+                        st.write(f"🔴 `{f}` = 0 (score may be unreliable)")
+                    remaining = [f for f in CRITICAL_FEATURES if f not in miss]
+                    for f in remaining:
+                        st.write(f"🟢 `{f}`")
+            else:
+                st.success("✅ All features present", icon=None)
+
+            st.caption(f"Expiry: {expiry}")
+
+    st.divider()
+
+    # ── Model quality: walk-forward AUC ──────────────────────────────────────
+    st.subheader("Walk-Forward Backtest")
+    st.caption("Out-of-sample predictions only. Each dot = one expiry where the model had no look-ahead.")
+
+    bt_df = query("""
+        SELECT symbol, expiry, entry_date, pnl_pts, target,
+               round(confidence * 100, 1) AS confidence
         FROM analysis.confidence_backtest FINAL
         ORDER BY symbol, expiry
     """)
 
-    if bt.empty:
-        st.info("No backtest data yet.")
+    if bt_df.empty:
+        st.info("No walk-forward backtest data yet. Run: confidence_scorer --compare")
     else:
-        symbol_filter = st.selectbox("Symbol", ["All"] + sorted(bt["symbol"].unique().tolist()))
-        bt_view = bt if symbol_filter == "All" else bt[bt["symbol"] == symbol_filter]
+        sym_filter = st.selectbox("Symbol", ["All"] + sorted(bt_df["symbol"].unique().tolist()), key="model_sym")
+        bt_view = bt_df if sym_filter == "All" else bt_df[bt_df["symbol"] == sym_filter]
+        bt_view = bt_view.copy()
 
-        # Summary KPIs
+        # KPI row
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("OOS Predictions", len(bt_view))
-        k2.metric("Win Rate (actual)",  f"{bt_view['target'].mean():.1%}")
-        k3.metric("Avg Confidence",  f"{bt_view['confidence'].mean():.1f}/100")
-        k4.metric("Avg P&L (pts)",   f"{bt_view['pnl_pts'].mean():.1f}")
+        k1.metric("OOS Trades", len(bt_view))
+        k2.metric("Actual Win Rate", f"{bt_view['target'].mean():.1%}")
+        k3.metric("Avg Confidence", f"{bt_view['confidence'].mean():.1f}/100")
+        k4.metric("Avg P&L (pts)", f"{bt_view['pnl_pts'].mean():.1f}")
 
-        # Confidence vs outcome scatter
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Confidence vs Actual P&L**")
-            fig = go.Figure()
-            for outcome, label, marker_color in [(1, "Win", "#2ecc71"), (0, "Loss", "#e74c3c")]:
-                grp = bt_view[bt_view["target"] == outcome]
-                fig.add_trace(go.Scatter(
-                    x=grp["confidence"], y=grp["pnl_pts"],
-                    mode="markers", name=label,
-                    marker=dict(color=marker_color, size=7, opacity=0.7),
-                    hovertemplate="%{customdata[0]} | conf=%{x} | pnl=%{y:.0f}pts<extra></extra>",
-                    customdata=grp[["symbol"]].values,
-                ))
-            fig.add_vline(x=65, line_dash="dash", line_color="gray",
-                          annotation_text="Threshold 65")
-            fig.update_layout(height=320, xaxis_title="Confidence Score",
-                              yaxis_title="P&L (points)")
+        tab_scatter, tab_band, tab_curve, tab_calib = st.tabs([
+            "Confidence vs P&L", "Win Rate by Band", "Cumulative P&L", "Calibration"
+        ])
+
+        with tab_scatter:
+            # Graduation: color by win/loss, hover for detail
+            bt_view["outcome"] = bt_view["target"].map({1: "Win", 0: "Loss"})
+            fig = px.scatter(
+                bt_view, x="confidence", y="pnl_pts",
+                color="outcome",
+                color_discrete_map={"Win": "#2ecc71", "Loss": "#e74c3c"},
+                opacity=0.7,
+                labels={"confidence": "Confidence Score", "pnl_pts": "P&L (pts)"},
+                hover_data=["symbol", "expiry"],
+            )
+            fig.add_vline(x=MIN_CONFIDENCE, line_dash="dash", line_color="gray",
+                          annotation_text=f"Gate {MIN_CONFIDENCE:.0f}")
+            fig.update_layout(height=350)
             st.plotly_chart(fig, use_container_width=True)
 
-        with col2:
-            st.markdown("**Win Rate by Confidence Band**")
-            bt_view = bt_view.copy()
+        with tab_band:
             bt_view["band"] = pd.cut(
                 bt_view["confidence"],
                 bins=[0, 50, 60, 70, 80, 100],
                 labels=["<50", "50–60", "60–70", "70–80", ">80"]
             )
-            band_stats = bt_view.groupby("band", observed=True).agg(
-                n=("target", "count"),
-                win_rate=("target", "mean"),
-                avg_pnl=("pnl_pts", "mean")
-            ).reset_index()
-            fig2 = go.Figure()
-            fig2.add_trace(go.Bar(
+            band_stats = (bt_view.groupby("band", observed=True)
+                          .agg(n=("target", "count"), win_rate=("target", "mean"))
+                          .reset_index())
+            band_stats["win_pct"] = (band_stats["win_rate"] * 100).round(1)
+
+            # Graduation: bar color maps win rate to green/yellow/red
+            colors = []
+            for wr in band_stats["win_rate"]:
+                if wr >= 0.65:
+                    colors.append("#2ecc71")
+                elif wr >= 0.50:
+                    colors.append("#f39c12")
+                else:
+                    colors.append("#e74c3c")
+
+            fig2 = go.Figure(go.Bar(
                 x=band_stats["band"].astype(str),
-                y=(band_stats["win_rate"] * 100).round(1),
-                text=(band_stats["win_rate"] * 100).round(1).astype(str) + "%",
+                y=band_stats["win_pct"],
+                text=band_stats["win_pct"].astype(str) + "% (n=" + band_stats["n"].astype(str) + ")",
                 textposition="outside",
-                marker_color=["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71", "#27ae60"],
+                marker_color=colors,
             ))
-            fig2.add_hline(y=50, line_dash="dash", line_color="gray")
-            fig2.update_layout(height=320, yaxis_title="Win Rate %",
-                               xaxis_title="Confidence Band", yaxis_range=[0, 110])
+            fig2.add_hline(y=50, line_dash="dash", line_color="gray",
+                           annotation_text="Random (50%)")
+            fig2.update_layout(height=350, yaxis_title="Win Rate %",
+                               xaxis_title="Confidence Band", yaxis_range=[0, 115])
             st.plotly_chart(fig2, use_container_width=True)
 
-        # P&L over time
-        st.markdown("**Cumulative P&L by Confidence Threshold (≥65 vs all)**")
-        bt_sorted = bt_view.sort_values("expiry")
-        bt_sorted["expiry"] = pd.to_datetime(bt_sorted["expiry"])
-        fig3 = go.Figure()
-        for min_conf, label, clr in [(0, "All trades", "#aaaaaa"), (65, "Conf ≥ 65", "#3498db")]:
-            grp = bt_sorted[bt_sorted["confidence"] >= min_conf].copy()
-            grp["cum_pnl"] = grp["pnl_pts"].cumsum()
-            fig3.add_trace(go.Scatter(
-                x=grp["expiry"], y=grp["cum_pnl"],
-                mode="lines", name=label, line_color=clr,
-            ))
-        fig3.update_layout(height=280, yaxis_title="Cumulative P&L (pts)")
-        st.plotly_chart(fig3, use_container_width=True)
-
-        # Raw table
-        with st.expander("Full backtest table"):
-            st.dataframe(
-                bt_view[["symbol", "expiry", "entry_date", "atm_strike",
-                          "entry_premium", "pnl_pts", "pnl_pct", "target", "confidence"]]
-                .sort_values("expiry", ascending=False),
-                use_container_width=True, hide_index=True,
-            )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 3 — STRATEGY BACKTESTS
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "Strategy Backtests":
-    st.title("Strategy Backtests")
-
-    runs = query("""
-        SELECT strategy, period, n_trades, win_rate, avg_net_ret,
-               median_net_ret, best_trade, worst_trade, sharpe,
-               avg_hold_months, start_date, end_date
-        FROM analysis.strategy_runs FINAL
-        ORDER BY strategy, period
-    """)
-
-    if runs.empty:
-        st.info("No strategy runs found.")
-    else:
-        strategies = runs["strategy"].unique().tolist()
-        selected   = st.selectbox("Strategy", strategies)
-        sub        = runs[runs["strategy"] == selected]
-
-        # ── Train / Test / Full tabs ─────────────────────────────────────────
-        tabs = st.tabs([p.upper() for p in sub["period"].tolist()])
-        for tab, (_, row) in zip(tabs, sub.iterrows()):
-            with tab:
-                c1, c2, c3, c4 = tab.columns(4)
-                c1.metric("Trades",    row["n_trades"])
-                c2.metric("Win Rate",  f"{row['win_rate']*100:.1f}%")
-                c3.metric("Sharpe",    f"{row['sharpe']:.2f}")
-                c4.metric("Avg P&L",   fmt_inr(row["avg_net_ret"] * STARTING_CAPITAL))
-
-                c5, c6, c7 = tab.columns(3)
-                c5.metric("Best",   fmt_inr(row["best_trade"]  * STARTING_CAPITAL))
-                c6.metric("Worst",  fmt_inr(row["worst_trade"] * STARTING_CAPITAL))
-                c7.metric("Period", f"{row['start_date']} → {row['end_date']}")
-
-        # ── Trade distribution ───────────────────────────────────────────────
-        trades = query(f"""
-            SELECT entry_month, net_ret, symbol
-            FROM analysis.strategy_trades FINAL
-            WHERE strategy = '{selected}'
-            ORDER BY entry_month
-        """)
-
-        if not trades.empty:
-            trades["entry_month"] = pd.to_datetime(trades["entry_month"])
-            trades["pnl_inr"]     = trades["net_ret"] * STARTING_CAPITAL
-            trades["color"]       = trades["pnl_inr"].apply(lambda x: "profit" if x >= 0 else "loss")
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.subheader("Monthly P&L")
-                fig = go.Figure(go.Bar(
-                    x=trades["entry_month"], y=trades["pnl_inr"],
-                    marker_color=trades["pnl_inr"].apply(lambda x: "#2ecc71" if x >= 0 else "#e74c3c"),
-                    hovertemplate="₹%{y:,.0f}<extra></extra>"
-                ))
-                fig.update_layout(height=300, showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-
-            with col2:
-                st.subheader("P&L Distribution")
-                fig = px.histogram(trades, x="pnl_inr", nbins=30, color="color",
-                                   color_discrete_map={"profit": "#2ecc71", "loss": "#e74c3c"})
-                fig.update_layout(height=300, showlegend=False, bargap=0.1)
-                st.plotly_chart(fig, use_container_width=True)
-
-            # ── Drawdown ─────────────────────────────────────────────────────
-            st.subheader("Drawdown")
-            trades_s  = trades.sort_values("entry_month")
-            cum       = trades_s["pnl_inr"].cumsum() + STARTING_CAPITAL
-            peak      = cum.cummax()
-            drawdown  = (cum - peak) / peak * 100
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=trades_s["entry_month"], y=drawdown,
-                fill="tozeroy", line_color="#e74c3c",
-                hovertemplate="%{y:.1f}%<extra></extra>"
-            ))
-            fig.add_hline(y=-DAILY_STOP_PCT * 100, line_dash="dash",
-                          line_color="orange", annotation_text="Daily stop 2%")
-            fig.update_layout(height=250, yaxis_title="Drawdown %")
-            st.plotly_chart(fig, use_container_width=True)
-
-
-# ── Spread Strategy Backtests ─────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("Defined-Risk Strategy Backtests (IC / Spreads)")
-    st.caption(
-        "Entry: previous-day EOD prices. Exit: expiry settlement. "
-        "All hedge leg costs deducted from net_credit before any P&L calculation."
-    )
-
-    opt = query_weekly("""
-        SELECT symbol, strategy, short_n, wing_m, n_trades,
-               round(win_rate*100,1) AS win_rate,
-               round(avg_pnl_pts,1) AS avg_pnl_pts,
-               round(avg_pnl_pct,1) AS avg_pnl_pct,
-               round(sharpe_pct,2)  AS sharpe,
-               round(premium_to_risk,1) AS premium_pct
-        FROM analysis.spread_optimal FINAL
-        ORDER BY symbol, strategy, sharpe DESC
-    """)
-
-    spread_trades = query_weekly("""
-        SELECT symbol, strategy, short_n, wing_m, expiry, entry_date,
-               atm_strike, net_credit, max_loss, pnl_pts, pnl_pct, target
-        FROM analysis.spread_backtest FINAL
-        WHERE strategy != 'straddle'
-        ORDER BY symbol, expiry
-    """)
-
-    if opt.empty:
-        st.info("No spread backtest data. Run: docker compose run --rm strategy_backtester")
-    else:
-        sym_sel = st.selectbox("Symbol", sorted(opt["symbol"].unique()), key="spr_sym")
-        opt_sym = opt[opt["symbol"] == sym_sel]
-
-        # Win rate heatmap per strategy × short_n
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("**Win Rate % by Strategy & Short Strike Distance**")
-            pivot = opt_sym[opt_sym.strategy != "straddle"].pivot_table(
-                index="strategy", columns="short_n", values="win_rate", aggfunc="max"
-            )
-            fig = go.Figure(go.Heatmap(
-                z=pivot.values,
-                x=[f"sn={c}" for c in pivot.columns],
-                y=pivot.index,
-                colorscale="RdYlGn",
-                text=[[f"{v:.0f}%" for v in row] for row in pivot.values],
-                texttemplate="%{text}",
-                zmin=40, zmax=100,
-            ))
-            fig.update_layout(height=280)
-            st.plotly_chart(fig, use_container_width=True)
-
-        with col2:
-            st.markdown("**Sharpe Ratio by Strategy & Wing Width**")
-            pivot2 = opt_sym[opt_sym.strategy != "straddle"].pivot_table(
-                index="strategy", columns="wing_m", values="sharpe", aggfunc="max"
-            )
-            fig2 = go.Figure(go.Heatmap(
-                z=pivot2.values,
-                x=[f"wm={c}" for c in pivot2.columns],
-                y=pivot2.index,
-                colorscale="RdYlGn",
-                text=[[f"{v:.2f}" for v in row] for row in pivot2.values],
-                texttemplate="%{text}",
-            ))
-            fig2.update_layout(height=280)
-            st.plotly_chart(fig2, use_container_width=True)
-
-        # Straddle vs IC P&L comparison over time
-        if not spread_trades.empty:
-            st.markdown(f"**Cumulative P&L: All Strategies for {sym_sel}**")
-            st_sym = spread_trades[spread_trades["symbol"] == sym_sel].copy()
-            st_sym["expiry"] = pd.to_datetime(st_sym["expiry"])
-
-            # Best IC params per symbol
-            best_ic = opt_sym[opt_sym.strategy == "iron_condor"].nlargest(1, "sharpe")
-            best_bp = opt_sym[opt_sym.strategy == "bull_put"].nlargest(1, "sharpe")
-            best_bc = opt_sym[opt_sym.strategy == "bear_call"].nlargest(1, "sharpe")
-
+        with tab_curve:
+            bt_sorted = bt_view.sort_values("expiry").copy()
+            bt_sorted["expiry"] = pd.to_datetime(bt_sorted["expiry"])
             fig3 = go.Figure()
-            for (strat, sn, wm), label, clr in [
-                (("iron_condor", int(best_ic["short_n"].iloc[0]), int(best_ic["wing_m"].iloc[0])),
-                 "Best IC", "#3498db"),
-                (("bull_put", int(best_bp["short_n"].iloc[0]), int(best_bp["wing_m"].iloc[0])),
-                 "Best Bull Put", "#2ecc71"),
-                (("bear_call", int(best_bc["short_n"].iloc[0]), int(best_bc["wing_m"].iloc[0])),
-                 "Best Bear Call", "#f39c12"),
+            for min_c, label, clr in [
+                (0, "All trades", "#aaaaaa"),
+                (MIN_CONFIDENCE, f"Conf ≥ {MIN_CONFIDENCE:.0f}", "#3498db"),
             ]:
-                grp = st_sym[
-                    (st_sym.strategy == strat) &
-                    (st_sym.short_n == sn) &
-                    (st_sym.wing_m == wm)
-                ].sort_values("expiry")
-                if not grp.empty:
-                    fig3.add_trace(go.Scatter(
-                        x=grp["expiry"], y=grp["pnl_pts"].cumsum(),
-                        mode="lines", name=f"{label} (sn={sn}, wm={wm})", line_color=clr,
-                    ))
-
-            fig3.update_layout(height=320, yaxis_title="Cumulative P&L (pts)",
-                               legend=dict(orientation="h", yanchor="bottom", y=1))
+                grp = bt_sorted[bt_sorted["confidence"] >= min_c].copy()
+                grp["cum"] = grp["pnl_pts"].cumsum()
+                fig3.add_trace(go.Scatter(
+                    x=grp["expiry"], y=grp["cum"],
+                    mode="lines", name=label, line_color=clr,
+                ))
+            fig3.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig3.update_layout(height=350, yaxis_title="Cumulative P&L (pts)")
             st.plotly_chart(fig3, use_container_width=True)
 
-        # PCR vs strategy win rate breakdown
-        st.markdown("**Win Rate by PCR Band & Strategy** (validates directional bias thresholds)")
-        pcr_perf = query_weekly(f"""
-            SELECT
-                multiIf(s.pcr < 0.8, '<0.8 (Bearish)',
-                         s.pcr < 1.0, '0.8–1.0',
-                         s.pcr < 1.2, '1.0–1.2',
-                         '>=1.2 (Bullish)') AS pcr_band,
-                sb.strategy,
-                round(avg(sb.target) * 100, 1) AS win_rate,
-                count()                         AS n_trades
-            FROM analysis.spread_backtest AS sb FINAL
-            JOIN market.options_eod_summary AS s FINAL ON s.date = sb.entry_date
-            WHERE sb.strategy IN ('iron_condor', 'bull_put', 'bear_call')
-              AND sb.symbol = '{sym_sel}'
-            GROUP BY pcr_band, sb.strategy
-            ORDER BY pcr_band, sb.strategy
-        """)
-        if not pcr_perf.empty:
-            fig_pcr = px.bar(
-                pcr_perf, x="pcr_band", y="win_rate", color="strategy",
-                barmode="group", text="win_rate",
-                labels={"pcr_band": "PCR at Entry", "win_rate": "Win Rate %", "strategy": "Strategy"},
-                color_discrete_map={
-                    "iron_condor": "#3498db", "bull_put": "#2ecc71", "bear_call": "#f39c12"
-                },
+        with tab_calib:
+            # Calibration curve: predicted confidence decile vs actual win rate
+            st.caption("A well-calibrated model's line follows the diagonal. Deviation = over/under-confidence.")
+            bt_view["bucket"] = (bt_view["confidence"] // 10 * 10).clip(0, 90)
+            calib = (bt_view.groupby("bucket")
+                     .agg(n=("target", "count"), actual_wr=("target", "mean"))
+                     .reset_index())
+            calib["predicted_mid"] = calib["bucket"] + 5
+
+            fig4 = go.Figure()
+            # Perfect calibration reference
+            fig4.add_trace(go.Scatter(
+                x=[0, 100], y=[0, 100],
+                mode="lines", name="Perfect calibration",
+                line=dict(color="gray", dash="dash"), opacity=0.5,
+            ))
+            # Actual calibration (size = sample count)
+            fig4.add_trace(go.Scatter(
+                x=calib["predicted_mid"],
+                y=(calib["actual_wr"] * 100).round(1),
+                mode="markers+lines",
+                name="Model",
+                marker=dict(
+                    size=calib["n"].clip(5, 40),
+                    color="#3498db",
+                    line=dict(color="white", width=1),
+                ),
+                text=calib["n"].astype(str) + " trades",
+                hovertemplate="Predicted: %{x}%<br>Actual: %{y}%<br>%{text}<extra></extra>",
+            ))
+            fig4.update_layout(
+                height=350,
+                xaxis_title="Predicted Confidence (%)",
+                yaxis_title="Actual Win Rate (%)",
+                xaxis_range=[0, 100], yaxis_range=[0, 100],
             )
-            fig_pcr.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="50%")
-            fig_pcr.update_traces(textposition="outside")
-            fig_pcr.update_layout(height=320, yaxis_range=[0, 110],
-                                   legend=dict(orientation="h"))
-            st.plotly_chart(fig_pcr, use_container_width=True)
-            st.caption(
-                "If bull_put wins more in PCR ≥1.2 bands and bear_call in PCR <0.8, "
-                "the directional bias in strategy_selector.py is validated. "
-                "If IC consistently outperforms across all bands, use IC only."
-            )
-        else:
-            st.info("Not enough data to show PCR breakdown for this symbol yet.")
+            st.plotly_chart(fig4, use_container_width=True)
+            st.caption("Bubble size = number of trades in that bucket.")
 
-        # Optimal params table
-        st.markdown("**Top 10 Combinations (by Sharpe)**")
-        top = opt_sym[opt_sym.strategy != "straddle"].nlargest(10, "sharpe")[
-            ["strategy", "short_n", "wing_m", "n_trades", "win_rate",
-             "avg_pnl_pts", "avg_pnl_pct", "sharpe", "premium_pct"]
-        ].rename(columns={
-            "strategy": "Strategy", "short_n": "Short N", "wing_m": "Wing M",
-            "n_trades": "Trades", "win_rate": "Win %", "avg_pnl_pts": "Avg P&L pts",
-            "avg_pnl_pct": "Avg P&L %", "sharpe": "Sharpe", "premium_pct": "Prem/Risk %"
-        })
-        st.dataframe(top, use_container_width=True, hide_index=True)
+    st.divider()
 
+    # ── Strategy Graduation Ladder ────────────────────────────────────────────
+    st.subheader("Strategy Graduation Ladder")
+    st.caption(
+        "Each strategy must pass strictly enforced gate thresholds before advancing. "
+        "Stage 1 = backtest only (no trading). Stage 2 = paper. "
+        "Stage 3 = micro-live (10% lot). Stage 4 = full live."
+    )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 4 — TRADE LOG
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "Trade Log":
-    st.title("Trade Log")
+    grad_df = query("""
+        SELECT strategy_id, strategy_name, stage, stage_label, stage_since,
+               bt_oos_trades, bt_win_rate, bt_sharpe, bt_years,
+               bt_gate_trades, bt_gate_win_rate, bt_gate_sharpe, bt_gate_years,
+               paper_trades, paper_win_rate, paper_net_pnl, paper_vs_bt_delta,
+               paper_gate_trades, paper_gate_win_rate, paper_gate_pnl,
+               micro_trades, micro_win_rate, micro_net_pnl,
+               micro_gate_trades, micro_gate_win_rate, micro_gate_pnl
+        FROM analysis.strategy_graduation FINAL
+        ORDER BY stage DESC, strategy_id
+    """)
 
-    tab_opt, tab_pat = st.tabs(["Option Strategies", "Pattern Backtest"])
+    STAGE_LABELS = {1: "BACKTEST", 2: "PAPER", 3: "MICRO_LIVE", 4: "FULL_LIVE"}
+    STAGE_COLOR  = {1: "🔴", 2: "🟡", 3: "🟠", 4: "🟢"}
+    ALL_STAGES   = [
+        ("iron_fly_0dte",   "Iron Fly 0DTE"),
+        ("weekend_theta",   "Weekend Theta Decay"),
+        ("equity_breakout", "Monthly Equity Breakout"),
+    ]
 
-    # ── Tab 1: Option strategy trades (spread_backtest) ───────────────────────
-    with tab_opt:
-        opt_trades = query_weekly("""
-            SELECT
-                sb.symbol, sb.expiry, sb.entry_date, sb.strategy,
-                sb.atm_strike, sb.short_ce_strike, sb.short_pe_strike,
-                sb.long_ce_strike, sb.long_pe_strike,
-                sb.net_credit, sb.max_loss, sb.pnl_pts, sb.pnl_pct, sb.target,
-                round(s.pcr, 2)      AS pcr_at_entry,
-                round(s.iv_skew, 2)  AS iv_skew_at_entry
-            FROM analysis.spread_backtest AS sb FINAL
-            LEFT JOIN market.options_eod_summary AS s FINAL ON s.date = sb.entry_date
-            ORDER BY sb.expiry DESC
-            LIMIT 500
-        """)
-        if opt_trades.empty:
-            st.info("No option strategy trades found. Run strategy_backtester first.")
-        else:
-            opt_trades["P&L (pts)"] = opt_trades["pnl_pts"].round(1)
-            opt_trades["P&L %"]     = opt_trades["pnl_pct"].round(1)
-            opt_trades["Result"]    = opt_trades["target"].apply(lambda x: "Win" if x else "Loss")
-            opt_trades["Max Loss"]  = opt_trades["max_loss"].round(1)
-            opt_trades["Credit"]    = opt_trades["net_credit"].round(1)
+    if grad_df.empty:
+        st.info(
+            "No graduation data yet. Run: "
+            "`docker compose run --rm graduation_gate`",
+            icon="ℹ️"
+        )
+        for sid, sname in ALL_STAGES:
+            st.markdown(f"**{sid}** — ⬜ Stage 1 (BACKTEST) — no data")
+    else:
+        for sid, sname in ALL_STAGES:
+            row = grad_df[grad_df["strategy_id"] == sid]
+            if row.empty:
+                col_hdr, col_bar = st.columns([3, 7])
+                with col_hdr:
+                    st.markdown(f"**{sname}**")
+                with col_bar:
+                    st.markdown("⬜ No data — run `graduation_gate`")
+                continue
 
-            STRATEGY_LABEL = {
-                "bull_put":    "Bull Put Spread",
-                "bear_call":   "Bear Call Spread",
-                "iron_condor": "Iron Condor",
-            }
+            r = row.iloc[0]
+            stage      = int(r["stage"])
+            lbl        = r["stage_label"]
+            icon       = STAGE_COLOR.get(stage, "⬜")
+            since      = str(r["stage_since"])[:10]
 
-            def why_chosen(r):
-                pcr = r.get("pcr_at_entry", None)
-                skew = r.get("iv_skew_at_entry", None)
-                parts = []
-                if r.strategy == "bull_put":
-                    parts.append("Bullish bias")
-                    if pcr and pcr >= 1.2:
-                        parts.append(f"PCR {pcr:.2f} ≥ 1.2 (put-heavy)")
-                elif r.strategy == "bear_call":
-                    parts.append("Bearish bias")
-                    if pcr and pcr <= 0.8:
-                        parts.append(f"PCR {pcr:.2f} ≤ 0.8 (call-heavy)")
-                else:
-                    parts.append("Neutral / range-bound")
-                    if pcr:
-                        parts.append(f"PCR {pcr:.2f}")
-                if skew and abs(skew) > 0.01:
-                    parts.append(f"IV skew {skew:+.2f}")
-                return " · ".join(parts)
+            # Summary row: stage badge + 4-step progress
+            col_hdr, col_prog = st.columns([3, 7])
+            with col_hdr:
+                st.markdown(f"**{sname}**")
+                st.caption(f"{icon} Stage {stage}: {lbl} (since {since})")
+            with col_prog:
+                prog_parts = []
+                for s in range(1, 5):
+                    slbl = STAGE_LABELS[s]
+                    if s < stage:
+                        prog_parts.append(f"✅ {slbl}")
+                    elif s == stage:
+                        prog_parts.append(f"**→ {slbl}**")
+                    else:
+                        prog_parts.append(f"⬜ {slbl}")
+                st.markdown(" · ".join(prog_parts))
 
-            def leg_strikes(r):
-                if r.strategy == "bull_put":
-                    return f"{int(r.short_pe_strike)}PE → {int(r.long_pe_strike)}PE hedge"
-                if r.strategy == "bear_call":
-                    return f"{int(r.short_ce_strike)}CE → {int(r.long_ce_strike)}CE hedge"
-                return (f"{int(r.short_pe_strike)}PE→{int(r.long_pe_strike)}PE  "
-                        f"{int(r.short_ce_strike)}CE→{int(r.long_ce_strike)}CE")
+            with st.expander(f"Gate details — {sname}", expanded=False):
+                gc1, gc2, gc3 = st.columns(3)
 
-            opt_trades["Strategy"]   = opt_trades["strategy"].map(STRATEGY_LABEL)
-            opt_trades["ATM"]        = opt_trades["atm_strike"].astype(int)
-            opt_trades["Legs"]       = opt_trades.apply(leg_strikes, axis=1)
-            opt_trades["Why Chosen"] = opt_trades.apply(why_chosen, axis=1)
+                with gc1:
+                    st.markdown("**Stage 1 → 2 (Backtest gates)**")
+                    g = lambda v: "🟢" if v else "🔴"
+                    st.write(f"{g(r['bt_gate_trades'])} Trades ≥ 50: {int(r['bt_oos_trades'])}")
+                    st.write(f"{g(r['bt_gate_win_rate'])} Win rate ≥ 55%: {float(r['bt_win_rate'])*100:.1f}%")
+                    st.write(f"{g(r['bt_gate_sharpe'])} Sharpe ≥ 0.50: {float(r['bt_sharpe']):.2f}")
+                    st.write(f"{g(r['bt_gate_years'])} Data ≥ 2 yrs: {float(r['bt_years']):.1f} yrs")
+
+                with gc2:
+                    st.markdown("**Stage 2 → 3 (Paper gates)**")
+                    pt = int(r["paper_trades"])
+                    if pt == 0:
+                        st.write("⬜ No paper trades yet")
+                    else:
+                        g = lambda v: "🟢" if v else "🔴"
+                        delta = float(r["paper_vs_bt_delta"]) * 100
+                        st.write(f"{g(r['paper_gate_trades'])} Trades ≥ 30: {pt}")
+                        st.write(f"{g(r['paper_gate_win_rate'])} Drift > -10%: {delta:+.1f}%")
+                        st.write(f"{g(r['paper_gate_pnl'])} Net P&L > 0: ₹{float(r['paper_net_pnl']):,.0f}")
+
+                with gc3:
+                    st.markdown("**Stage 3 → 4 (Micro-live gates)**")
+                    mt = int(r["micro_trades"])
+                    if mt == 0:
+                        st.write("⬜ No micro-live trades yet")
+                    else:
+                        g = lambda v: "🟢" if v else "🔴"
+                        st.write(f"{g(r['micro_gate_trades'])} Trades ≥ 20: {mt}")
+                        st.write(f"{g(r['micro_gate_win_rate'])} Win rate: {float(r['micro_win_rate'])*100:.1f}%")
+                        st.write(f"{g(r['micro_gate_pnl'])} Net P&L > 0: ₹{float(r['micro_net_pnl']):,.0f}")
+
+    st.divider()
+
+    # ── Strategy Backtests — tabbed by type ───────────────────────────────────
+    st.subheader("Strategy Backtests")
+
+    tab_fly, tab_spread, tab_breakout, tab_pattern, tab_edge = st.tabs([
+        "Iron Fly", "IC / Spreads", "Breakout", "Pattern Equity", "Edge Analysis"
+    ])
+
+    with tab_fly:
+        st.info(
+            "Iron fly backtest (short ATM straddle + long OTM wings) — "
+            "this is the live trading strategy. Data sourced from confidence_backtest "
+            "when strategy_backtester is updated to produce iron fly P&L.",
+            icon="ℹ️"
+        )
+        # For now show the walk-forward data which approximates iron fly performance
+        if not bt_df.empty:
+            sym_sel_fly = st.selectbox("Symbol", sorted(bt_df["symbol"].unique()), key="fly_sym")
+            fly_sym = bt_df[bt_df["symbol"] == sym_sel_fly].copy()
+            fly_sym["expiry"] = pd.to_datetime(fly_sym["expiry"])
+            fly_sym = fly_sym.sort_values("expiry")
 
             c1, c2, c3 = st.columns(3)
-            sym_f   = c1.selectbox("Symbol",   ["All"] + sorted(opt_trades["symbol"].unique().tolist()), key="ol_sym")
-            strat_f = c2.selectbox("Strategy", ["All"] + sorted(opt_trades["strategy"].unique().tolist()), key="ol_str")
-            res_f   = c3.selectbox("Result",   ["All", "Win", "Loss"], key="ol_res")
+            c1.metric("Trades", len(fly_sym))
+            c2.metric("Win Rate", f"{fly_sym['target'].mean():.1%}")
+            c3.metric("Avg P&L", f"{fly_sym['pnl_pts'].mean():.1f} pts")
 
-            f = opt_trades.copy()
-            if sym_f   != "All": f = f[f["symbol"]   == sym_f]
-            if strat_f != "All": f = f[f["strategy"] == strat_f]
-            if res_f   != "All": f = f[f["Result"]   == res_f]
+            fig_fly = go.Figure()
+            fly_sym["cum"] = fly_sym["pnl_pts"].cumsum()
+            fig_fly.add_trace(go.Scatter(
+                x=fly_sym["expiry"], y=fly_sym["cum"],
+                mode="lines", fill="tozeroy",
+                line_color="#3498db",
+                fillcolor="rgba(52,152,219,0.1)",
+            ))
+            fig_fly.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig_fly.update_layout(height=300, yaxis_title="Cumulative P&L (pts)")
+            st.plotly_chart(fig_fly, use_container_width=True)
 
-            wins  = (f["target"] == 1).sum()
-            total = len(f)
-            st.caption(
-                f"{total} trades | Win rate: {wins/total*100:.1f}% | "
-                f"Avg credit: {f['net_credit'].mean():.1f} pts | Avg P&L: {f['pnl_pts'].mean():.1f} pts"
-            )
-
-            st.dataframe(
-                f[["symbol", "expiry", "entry_date", "Strategy", "Why Chosen",
-                   "ATM", "Legs", "Credit", "Max Loss", "P&L (pts)", "P&L %", "Result"]].reset_index(drop=True),
-                use_container_width=True, hide_index=True,
-            )
-
-    # ── Tab 2: Pattern backtest trades (strategy_trades) ─────────────────────
-    with tab_pat:
-        st.caption("Equity pattern-based strategy backtest. These are directional stock trades, not option spreads.")
-        trades = query("""
-            SELECT strategy, symbol, entry_month, exit_month,
-                   hold_months, entry_px, exit_px, raw_ret, net_ret, is_open
-            FROM analysis.strategy_trades FINAL
-            ORDER BY entry_month DESC
-            LIMIT 500
+    with tab_spread:
+        st.caption("Iron Condor / Bull Put / Bear Call spread backtests.")
+        opt_df = query("""
+            SELECT symbol, strategy, short_n, wing_m, n_trades,
+                   round(win_rate*100,1) AS win_rate,
+                   round(avg_pnl_pts,1) AS avg_pnl_pts,
+                   round(sharpe_pct,2)  AS sharpe,
+                   round(premium_to_risk,1) AS premium_pct
+            FROM analysis.spread_optimal FINAL
+            ORDER BY symbol, strategy, sharpe DESC
         """)
-        if trades.empty:
-            st.info("No pattern trades found.")
+        if opt_df.empty:
+            st.info("No spread backtest data. Run: docker compose run --rm strategy_backtester")
         else:
-            trades["P&L (₹)"]  = (trades["net_ret"] * STARTING_CAPITAL).round(0)
-            trades["Return %"] = (trades["net_ret"] * 100).round(2)
-            trades["Status"]   = trades["is_open"].apply(lambda x: "Open" if x else "Closed")
+            sym_sel_sp = st.selectbox("Symbol", sorted(opt_df["symbol"].unique()), key="spr_sym")
+            opt_sym = opt_df[opt_df["symbol"] == sym_sel_sp]
 
             col1, col2 = st.columns(2)
-            strategies = ["All"] + trades["strategy"].unique().tolist()
-            sel_strat  = col1.selectbox("Strategy", strategies, key="pt_strat")
-            sel_status = col2.selectbox("Status", ["All", "Open", "Closed"], key="pt_status")
+            with col1:
+                st.markdown("**Win Rate by Strategy & Short Distance**")
+                pivot = opt_sym[opt_sym.strategy != "straddle"].pivot_table(
+                    index="strategy", columns="short_n", values="win_rate", aggfunc="max"
+                )
+                if not pivot.empty:
+                    fig_h = go.Figure(go.Heatmap(
+                        z=pivot.values,
+                        x=[f"sn={c}" for c in pivot.columns],
+                        y=pivot.index,
+                        colorscale="RdYlGn",
+                        text=[[f"{v:.0f}%" for v in row] for row in pivot.values],
+                        texttemplate="%{text}",
+                        zmin=40, zmax=100,
+                    ))
+                    fig_h.update_layout(height=280)
+                    st.plotly_chart(fig_h, use_container_width=True)
 
-            filtered = trades.copy()
-            if sel_strat  != "All": filtered = filtered[filtered["strategy"] == sel_strat]
-            if sel_status != "All": filtered = filtered[filtered["Status"]   == sel_status]
+            with col2:
+                st.markdown("**Top 10 Combinations (by Sharpe)**")
+                top = opt_sym[opt_sym.strategy != "straddle"].nlargest(10, "sharpe")[
+                    ["strategy", "short_n", "wing_m", "n_trades", "win_rate",
+                     "avg_pnl_pts", "sharpe"]
+                ]
+                st.dataframe(top, use_container_width=True, hide_index=True)
 
-            st.dataframe(
-                filtered[["strategy", "symbol", "entry_month", "exit_month",
-                           "Return %", "P&L (₹)", "Status"]].reset_index(drop=True),
-                use_container_width=True, hide_index=True,
-            )
-            wins  = (filtered["net_ret"] > 0).sum()
-            total = len(filtered)
-            st.caption(f"{total} trades | Win rate: {wins/total*100:.1f}% | "
-                       f"Total P&L: {fmt_inr(filtered['P&L (₹)'].sum())}")
+    with tab_breakout:
+        st.caption("Monthly breakout hypothesis: entry on monthly high breakout, exit at 2× or stop.")
+        bo_df = query("""
+            SELECT symbol, entry_date, exit_date, exit_reason,
+                   return_pct, xirr_annualized, holding_days
+            FROM analysis.monthly_breakout_trades FINAL
+            ORDER BY entry_date
+        """)
+        if bo_df.empty:
+            st.info("No breakout backtest data yet.")
+        else:
+            bo_df["entry_date"] = pd.to_datetime(bo_df["entry_date"])
+            n = len(bo_df)
+            n_target = (bo_df["exit_reason"] == "target").sum()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 4 — MARKET PULSE
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "Market Pulse":
-    st.title("Market Pulse")
-
-    vix = query("""
-        SELECT toDate(timestamp) as date,
-               max(vix)         as vix,
-               max(nifty_spot)  as nifty_spot
-        FROM market.nifty_live FINAL
-        WHERE timestamp >= today() - 365
-        GROUP BY date ORDER BY date
-    """)
-
-    pcr = query("""
-        SELECT date, pcr, max_pain_strike AS max_pain
-        FROM market.options_eod_summary FINAL
-        WHERE date >= today() - 90
-        ORDER BY date
-    """)
-
-    if not vix.empty:
-        vix["date"] = pd.to_datetime(vix["date"])
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.subheader("India VIX")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=vix["date"], y=vix["vix"],
-                                     line_color="#f39c12", name="VIX"))
-            fig.add_hrect(y0=0,  y1=13, fillcolor="green",  opacity=0.05, line_width=0)
-            fig.add_hrect(y0=13, y1=18, fillcolor="yellow", opacity=0.05, line_width=0)
-            fig.add_hrect(y0=18, y1=25, fillcolor="orange", opacity=0.05, line_width=0)
-            fig.add_hrect(y0=25, y1=80, fillcolor="red",    opacity=0.05, line_width=0)
-            fig.update_layout(height=300, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-
-            latest_vix = vix["vix"].iloc[-1] if not vix.empty else 0
-            regime = ("Low" if latest_vix < 13 else "Normal" if latest_vix < 18
-                      else "Elevated" if latest_vix < 25 else "Extreme")
-            st.metric("Current VIX", f"{latest_vix:.2f}", delta=regime)
-
-        with col2:
-            st.subheader("Nifty 50")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=vix["date"], y=vix["nifty_spot"],
-                                     line_color="#3498db", name="Nifty"))
-            fig.update_layout(height=300, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-
-            latest_nifty = vix["nifty_spot"].iloc[-1] if not vix.empty else 0
-            prev_nifty   = vix["nifty_spot"].iloc[-2] if len(vix) > 1 else latest_nifty
-            change_pct   = (latest_nifty - prev_nifty) / prev_nifty * 100 if prev_nifty else 0
-            st.metric("Current Nifty", f"{latest_nifty:,.0f}", delta=f"{change_pct:+.2f}%")
-
-    if not pcr.empty:
-        st.subheader("Nifty Put-Call Ratio (last 90 days)")
-        pcr["date"] = pd.to_datetime(pcr["date"])
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=pcr["date"], y=pcr["pcr"],
-                                 line_color="#9b59b6", name="PCR"))
-        fig.add_hline(y=1.3, line_dash="dash", line_color="green",
-                      annotation_text="Bullish >1.3")
-        fig.add_hline(y=0.7, line_dash="dash", line_color="red",
-                      annotation_text="Bearish <0.7")
-        fig.update_layout(height=300, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 5 — LIVE TRADING
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "Live Trading":
-    st.title("Live Trading — Strategy Selector")
-
-    # ── Today's recommendation ────────────────────────────────────────────────
-    st.subheader("Today's Trade Recommendation")
-    rec_df = query("""
-        SELECT rec_date, symbol, expiry, strategy, short_n, wing_m,
-               atm_strike, short_ce_strike, short_pe_strike,
-               long_ce_strike, long_pe_strike,
-               net_credit, max_loss, lots, capital_at_risk,
-               confidence, pcr_bias, iv_skew, outcome
-        FROM analysis.trade_recommendations FINAL
-        ORDER BY rec_date DESC
-        LIMIT 1
-    """)
-    if rec_df.empty:
-        st.info("No recommendation yet for today. Run `strategy_selector --recommend`.")
-    else:
-        r = rec_df.iloc[0]
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Symbol",     r["symbol"])
-        c2.metric("Strategy",   r["strategy"].replace("_", " ").title())
-        c3.metric("Confidence", f"{r['confidence']:.1f}/100")
-        c4.metric("PCR Bias",   f"{r['pcr_bias']:.3f}")
-        c5.metric("IV Skew",    f"{r['iv_skew']:+.2f}%")
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Net Credit",      f"{r['net_credit']:.2f} pts")
-        c2.metric("Max Loss",        f"{r['max_loss']:.2f} pts")
-        c3.metric("Lots",            int(r["lots"]))
-        c4.metric("Capital at Risk", fmt_inr(float(r["capital_at_risk"])))
-
-        with st.expander("Leg Strikes & Signals"):
-            col_l, col_r = st.columns(2)
-            col_l.json({
-                "ATM":      int(r["atm_strike"]),
-                "Short CE": int(r["short_ce_strike"]), "Short PE": int(r["short_pe_strike"]),
-                "Long CE":  int(r["long_ce_strike"]),  "Long PE":  int(r["long_pe_strike"]),
-            })
-            col_r.json({
-                "Confidence": round(float(r["confidence"]), 1),
-                "PCR Bias":   round(float(r["pcr_bias"]), 3),
-                "IV Skew":    round(float(r["iv_skew"]), 2),
-                "Outcome":    r["outcome"],
-            })
-        st.caption("➡️ Full signal breakdown available in **Today's Signals** page")
-
-    # ── Past recommendations ──────────────────────────────────────────────────
-    st.subheader("Recommendation History")
-    hist_df = query("""
-        SELECT rec_date, symbol, strategy, short_n, wing_m,
-               net_credit, max_loss, lots,
-               confidence, outcome, pnl_pts, pnl_amount
-        FROM analysis.trade_recommendations FINAL
-        ORDER BY rec_date DESC
-        LIMIT 30
-    """)
-    if not hist_df.empty:
-        st.dataframe(hist_df, use_container_width=True, hide_index=True)
-
-    # ── Compounding simulation ────────────────────────────────────────────────
-    st.subheader("Compounding Simulation (OOS Backtest)")
-    sim_df = query("""
-        SELECT sim_date, symbol, strategy, confidence, lots,
-               pnl_pts, pnl_amount, capital_before, capital_after, skipped
-        FROM analysis.strategy_simulation FINAL
-        ORDER BY sim_date
-    """)
-    if sim_df.empty:
-        st.info("No simulation data yet. Run `strategy_selector --backtest`.")
-    else:
-        sim_df["sim_date"] = pd.to_datetime(sim_df["sim_date"])
-        sim_start_capital = float(sim_df["capital_before"].iloc[0])
-
-        # Capital curve
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=sim_df["sim_date"], y=sim_df["capital_after"],
-            mode="lines", name="Capital (traded)",
-            line=dict(color="royalblue", width=2),
-        ))
-        fig.add_trace(go.Scatter(
-            x=sim_df["sim_date"],
-            y=[sim_start_capital] * len(sim_df),
-            mode="lines", name="Starting capital",
-            line=dict(color="gray", width=1, dash="dash"),
-        ))
-        fig.update_layout(
-            height=340, title="Capital Curve (Compounding)",
-            yaxis_title="Capital (₹)", xaxis_title="Date",
-            legend=dict(orientation="h"),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Summary stats
-        traded = sim_df[sim_df["skipped"] == 0]
-        if not traded.empty:
-            final_cap = float(sim_df["capital_after"].iloc[-1])
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Final Capital",   fmt_inr(final_cap))
-            c2.metric("Total Return",    f"{(final_cap/sim_start_capital - 1)*100:.1f}%")
-            c3.metric("Trades Taken",    len(traded))
-            c4.metric("Trades Skipped",  int(sim_df["skipped"].sum()))
+            c1.metric("Trades", n)
+            c2.metric("Hit Target (2×)", f"{n_target/n*100:.1f}%")
+            c3.metric("Avg Return", f"{bo_df['return_pct'].mean():.2f}%")
+            c4.metric("Median XIRR", f"{bo_df['xirr_annualized'].median()*100:.1f}%")
 
-        st.dataframe(
-            sim_df[["sim_date", "symbol", "strategy", "confidence",
-                     "lots", "pnl_pts", "pnl_amount", "capital_after", "skipped"]].tail(30),
-            use_container_width=True, hide_index=True,
+            fig_bo = px.histogram(
+                bo_df, x="return_pct", color="exit_reason",
+                color_discrete_map={"target": "#2ecc71", "stop": "#e74c3c"},
+                nbins=30, barmode="overlay", opacity=0.7,
+                labels={"return_pct": "Return %"},
+            )
+            fig_bo.update_layout(height=300)
+            st.plotly_chart(fig_bo, use_container_width=True)
+
+    with tab_pattern:
+        st.caption("Pattern-based equity backtests (directional stock trades, multi-month hold).")
+        runs_df2 = query("""
+            SELECT strategy, period, n_trades, win_rate, avg_net_ret, sharpe, start_date, end_date
+            FROM analysis.strategy_runs FINAL WHERE period = 'full' ORDER BY strategy
+        """)
+        trades_df2 = query("""
+            SELECT strategy, entry_month, net_ret
+            FROM analysis.strategy_trades FINAL ORDER BY entry_month
+        """)
+        if runs_df2.empty:
+            st.info("No pattern strategy runs found.")
+        else:
+            st.dataframe(runs_df2, use_container_width=True, hide_index=True)
+            if not trades_df2.empty:
+                trades_df2["entry_month"] = pd.to_datetime(trades_df2["entry_month"])
+                trades_df2["pnl_inr"] = trades_df2["net_ret"] * 100_000
+                trades_df2_s = trades_df2.sort_values("entry_month")
+                trades_df2_s["cum"] = trades_df2_s["pnl_inr"].cumsum()
+                fig_pt = go.Figure(go.Scatter(
+                    x=trades_df2_s["entry_month"], y=trades_df2_s["cum"],
+                    mode="lines", line_color="#9b59b6",
+                ))
+                fig_pt.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_pt.update_layout(height=280, yaxis_title="Cumulative P&L (₹1L base)")
+                st.plotly_chart(fig_pt, use_container_width=True)
+
+    with tab_edge:
+        st.caption(
+            "VRP (Volatility Risk Premium) edge analysis per symbol — "
+            "implied vs realised move, 0DTE and 1DTE straddle win rates. "
+            "Run: `docker compose run --rm edge_analysis`"
         )
+        edge_df = query("""
+            SELECT symbol, expiry_date, day_of_week,
+                   win_0dte, win_1dte,
+                   profit_0dte_pts, profit_1dte_pts,
+                   vrp, implied_move_pct, realized_move_pct,
+                   iv_rank, atm_iv, pcr
+            FROM analysis.edge_analysis FINAL
+            ORDER BY symbol, expiry_date
+        """)
+        if edge_df.empty:
+            st.info("No edge analysis data. Run: `docker compose run --rm edge_analysis`")
+        else:
+            sym_sel_e = st.selectbox("Symbol", ["All"] + sorted(edge_df["symbol"].unique().tolist()), key="edge_sym")
+            ev = edge_df if sym_sel_e == "All" else edge_df[edge_df["symbol"] == sym_sel_e]
+            ev = ev.copy()
+            ev["expiry_date"] = pd.to_datetime(ev["expiry_date"])
 
-    # ── Risk parameters ───────────────────────────────────────────────────────
-    st.subheader("Risk Parameters (Strategy Selector)")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Starting Capital",  fmt_inr(500_000))
-    c2.metric("Max Risk / Trade",  "2% of capital")
-    c3.metric("Capital Floor",     fmt_inr(50_000))
+            # Summary KPIs
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Expiries", len(ev))
+            e2.metric("0DTE Win Rate", f"{ev['win_0dte'].mean():.1%}")
+            e3.metric("1DTE Win Rate", f"{ev['win_1dte'].mean():.1%}")
+            e4.metric("Avg VRP", f"{ev['vrp'].mean():.2f}")
+
+            # Win rate by symbol (summary table)
+            if sym_sel_e == "All":
+                summary = (ev.groupby("symbol").agg(
+                    n=("win_0dte", "count"),
+                    wr_0dte=("win_0dte", "mean"),
+                    wr_1dte=("win_1dte", "mean"),
+                    avg_vrp=("vrp", "mean"),
+                    avg_profit_0dte=("profit_0dte_pts", "mean"),
+                ).reset_index())
+                summary["wr_0dte"] = (summary["wr_0dte"] * 100).round(1)
+                summary["wr_1dte"] = (summary["wr_1dte"] * 100).round(1)
+                summary.columns = ["Symbol", "N", "0DTE Win%", "1DTE Win%", "Avg VRP", "Avg 0DTE P&L (pts)"]
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+
+            # VRP vs win scatter
+            col_e1, col_e2 = st.columns(2)
+            with col_e1:
+                st.markdown("**VRP vs 0DTE Profit**")
+                fig_e1 = px.scatter(
+                    ev, x="vrp", y="profit_0dte_pts",
+                    color="symbol" if sym_sel_e == "All" else "day_of_week",
+                    opacity=0.6, height=300,
+                    labels={"vrp": "VRP (impl - realised)", "profit_0dte_pts": "0DTE P&L (pts)"},
+                )
+                fig_e1.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_e1.add_vline(x=0, line_dash="dash", line_color="gray")
+                st.plotly_chart(fig_e1, use_container_width=True)
+
+            with col_e2:
+                st.markdown("**IV Rank vs 0DTE Win Rate (by quartile)**")
+                ev["iv_rank_q"] = pd.qcut(ev["iv_rank"], q=4,
+                                           labels=["Q1 (Low)", "Q2", "Q3", "Q4 (High)"],
+                                           duplicates="drop")
+                ivq = (ev.groupby("iv_rank_q", observed=True)
+                         .agg(wr=("win_0dte", "mean"), n=("win_0dte", "count"))
+                         .reset_index())
+                fig_e2 = go.Figure(go.Bar(
+                    x=ivq["iv_rank_q"].astype(str),
+                    y=(ivq["wr"] * 100).round(1),
+                    text=ivq["n"].astype(str) + " trades",
+                    textposition="outside",
+                    marker_color="#3498db",
+                ))
+                fig_e2.add_hline(y=50, line_dash="dash", line_color="gray",
+                                  annotation_text="50%")
+                fig_e2.update_layout(height=300, yaxis_title="Win Rate %", yaxis_range=[0, 110])
+                st.plotly_chart(fig_e2, use_container_width=True)
+
+            # Win rate by day of week
+            dow = (ev.groupby("day_of_week").agg(
+                wr_0dte=("win_0dte", "mean"), n=("win_0dte", "count")
+            ).reset_index())
+            dow["wr_0dte_pct"] = (dow["wr_0dte"] * 100).round(1)
+            fig_e3 = go.Figure(go.Bar(
+                x=dow["day_of_week"],
+                y=dow["wr_0dte_pct"],
+                text=dow["n"].astype(str) + " trades",
+                textposition="outside",
+                marker_color="#2ecc71",
+            ))
+            fig_e3.add_hline(y=50, line_dash="dash", line_color="gray",
+                              annotation_text="50% baseline")
+            fig_e3.update_layout(height=280, title="0DTE Win Rate by Day of Week",
+                                  yaxis_title="Win Rate %", yaxis_range=[0, 110])
+            st.plotly_chart(fig_e3, use_container_width=True)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 8 — PAPER TRADES
+# PAGE 3 — TRADE LOG
 # ══════════════════════════════════════════════════════════════════════════════
-elif page == "Paper Trades":
-    st.title("Paper Trades — Intraday Straddle Monitor")
-    st.caption("Auto paper trading: NIFTY + BANKNIFTY straddle, ₹2000 target (trailing), ₹1000 stop")
+elif page == "Trade Log":
+    st.title("💼 Trade Log")
+    st.caption("Paper trades — iron fly 0DTE. Will expand to live trades.")
 
-    # ── Open positions ────────────────────────────────────────────────────────
+    _BROKERAGE    = 20.0
+    _STT_PCT      = 0.0005
+    _EXCHANGE_PCT = 0.0005
+    _GST          = 0.18
+
+    def est_txn_cost(entry_premium: float, wing_cost: float,
+                     lot_size: int, lots: int, is_iron_fly: bool) -> float:
+        n_orders = 8 if is_iron_fly else 4
+        brok  = n_orders * _BROKERAGE * (1 + _GST)
+        stt   = entry_premium * _STT_PCT * lot_size * lots * 2
+        total_prem = (entry_premium + wing_cost) * lot_size * lots
+        exch  = total_prem * _EXCHANGE_PCT * 2
+        return round(brok + stt + exch)
+
+    _IST = pd.Timedelta(hours=5, minutes=30)
+
+    # ── Open Positions ────────────────────────────────────────────────────────
     st.subheader("Open Positions")
-    open_df = query("""
+    if st.button("🔄 Refresh positions", key="refresh_pos"):
+        query_live.clear()
+    open_df = query_live("""
         SELECT symbol, expiry, entry_time, strike,
                entry_ce_ltp, entry_pe_ltp, entry_premium,
-               lot_size, target_inr, stoploss_inr,
+               lot_size, lots, target_inr, stoploss_inr,
                trailing_active, peak_pnl_inr, trail_stop_inr,
-               scorecard_conf
+               scorecard_conf,
+               wing_ce_strike, wing_pe_strike, wing_ce_ltp, wing_pe_ltp, net_premium
         FROM trades.open_positions FINAL
-        WHERE status = 'open'
         ORDER BY entry_time DESC
     """)
+
     if open_df.empty:
         st.info("No open positions right now.")
     else:
+        rows = []
         for _, r in open_df.iterrows():
             sym    = r["symbol"]
             strike = float(r["strike"])
-            expiry = str(r["expiry"])[:10]  # strip time part
+            expiry = str(r["expiry"])[:10]
+            wce    = float(r.get("wing_ce_strike", 0) or 0)
+            wpe    = float(r.get("wing_pe_strike", 0) or 0)
+            is_fly = wce > 0
 
-            # Live mark-to-market from intraday chain (best-effort, values are internal/trusted)
-            mark_df = query(f"""
+            mark_df = query_live(f"""
                 SELECT sumIf(ltp, option_type='CE') + sumIf(ltp, option_type='PE') AS curr
                 FROM market.options_chain
-                WHERE symbol   = '{sym}'
-                  AND strike   = {strike}
-                  AND expiry   = '{expiry}'
-                  AND toDate(timestamp) = today()
-                  AND timestamp = (
-                      SELECT max(timestamp) FROM market.options_chain
-                      WHERE symbol = '{sym}' AND toDate(timestamp) = today()
-                  )
-                GROUP BY symbol
-                HAVING curr > 0
+                WHERE symbol='{sym}' AND strike={strike} AND expiry='{expiry}'
+                  AND toDate(timestamp)=today()
+                  AND timestamp=(SELECT max(timestamp) FROM market.options_chain
+                                 WHERE symbol='{sym}' AND toDate(timestamp)=today())
+                GROUP BY symbol HAVING curr > 0
             """)
+            curr_straddle = float(mark_df["curr"].iloc[0]) if not mark_df.empty else None
+            curr_net = curr_straddle
+            if is_fly and curr_straddle is not None:
+                wing_df = query_live(f"""
+                    SELECT
+                        sumIf(ltp, option_type='CE' AND strike={wce}) AS wce_ltp,
+                        sumIf(ltp, option_type='PE' AND strike={wpe}) AS wpe_ltp
+                    FROM market.options_chain
+                    WHERE symbol='{sym}' AND expiry='{expiry}'
+                      AND toDate(timestamp)=today()
+                      AND timestamp=(SELECT max(timestamp) FROM market.options_chain
+                                     WHERE symbol='{sym}' AND toDate(timestamp)=today())
+                """)
+                if not wing_df.empty:
+                    curr_net = curr_straddle - float(wing_df["wce_ltp"].iloc[0]) - float(wing_df["wpe_ltp"].iloc[0])
 
-            curr_straddle  = float(mark_df["curr"].iloc[0]) if not mark_df.empty else None
-            entry_premium  = float(r["entry_premium"])
-            lot_size       = int(r["lot_size"])
-            if curr_straddle is not None:
-                unreal_pts = entry_premium - curr_straddle
-                unreal_inr = unreal_pts * lot_size
-            else:
-                unreal_pts = unreal_inr = None
+            entry_value = (float(r["net_premium"])
+                           if is_fly and float(r.get("net_premium", 0) or 0) > 0
+                           else float(r["entry_premium"]))
+            lot_size  = int(r["lot_size"])
+            lots      = int(r.get("lots", 1))
+            unreal_pts = (entry_value - curr_net) if curr_net is not None else None
+            unreal_inr = (unreal_pts * lot_size * lots) if curr_net is not None else None
+            wing_cost  = float(r.get("wing_ce_ltp", 0) or 0) + float(r.get("wing_pe_ltp", 0) or 0)
+            txn_cost   = est_txn_cost(float(r["entry_premium"]), wing_cost, lot_size, lots, is_fly)
+            net_inr    = (unreal_inr - txn_cost) if unreal_inr is not None else None
 
-            with st.container(border=True):
-                c1, c2, c3, c4, c5, c6 = st.columns(6)
-                c1.metric("Symbol",   sym)
-                c2.metric("Strike",   f"{strike:.0f}")
-                c3.metric("Premium",  f"{entry_premium:.1f} pts")
-                c4.metric("Conf",     f"{r['scorecard_conf']:.0f}/100")
-                c5.metric("Trailing", "Yes" if r["trailing_active"] else "No")
-                if unreal_inr is not None:
-                    c6.metric("Unrealized P&L", fmt_inr(unreal_inr),
-                              delta=f"{unreal_pts:+.1f} pts")
-                else:
-                    c6.metric("Unrealized P&L", "—")
+            rows.append({
+                "Symbol":     sym,
+                "ATM":        f"{int(strike)}",
+                "Wing CE":    f"{int(wce)}" if is_fly else "—",
+                "Wing PE":    f"{int(wpe)}" if is_fly else "—",
+                "Expiry":     expiry,
+                "Entry":      (pd.to_datetime(r["entry_time"]) + _IST).strftime("%d-%b %I:%M %p"),
+                "Net Prem":   f"{entry_value:.1f}",
+                "Lots":       lots,
+                "Conf":       f"{r['scorecard_conf']:.0f}",
+                "Target":     fmt_inr(float(r["target_inr"])),
+                "Stop":       fmt_inr(float(r["stoploss_inr"])),
+                "Gross P&L":  (f"{'+' if unreal_inr>=0 else ''}₹{unreal_inr:.0f} ({unreal_pts:+.1f}pts)"
+                               if unreal_inr is not None else "—"),
+                "TxCost":     f"-₹{txn_cost:.0f}",
+                "Net P&L":    (f"{'+' if net_inr>=0 else ''}₹{net_inr:.0f}"
+                               if net_inr is not None else "—"),
+                "Trailing":   "🔒" if r["trailing_active"] else "—",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Expiry",       str(expiry))
-                c2.metric("Entry CE",     f"{r['entry_ce_ltp']:.1f}")
-                c3.metric("Entry PE",     f"{r['entry_pe_ltp']:.1f}")
-                c4.metric("Peak P&L",     fmt_inr(float(r["peak_pnl_inr"])))
-                c5.metric("Trail Floor",  fmt_inr(float(r["trail_stop_inr"])))
-
-    # ── Today's completed trades ───────────────────────────────────────────────
-    st.subheader("Today's Completed Trades")
-    today_df = query("""
+    # ── Today's Completed Trades ──────────────────────────────────────────────
+    st.subheader("Today's Trades")
+    today_df = query_live("""
         SELECT symbol, strike, expiry,
                entry_time, exit_time, exit_reason,
                entry_premium, exit_premium,
-               pnl_pts, pnl_inr, lot_size, scorecard_conf
+               pnl_pts, pnl_inr, lot_size, lots, scorecard_conf,
+               wing_ce_strike, wing_pe_strike, wing_ce_ltp, wing_pe_ltp, net_premium
         FROM trades.trade_outcomes FINAL
         WHERE toDate(entry_time) = today()
         ORDER BY exit_time DESC
     """)
+
     if today_df.empty:
         st.info("No completed trades today.")
     else:
-        total_inr = float(today_df["pnl_inr"].sum())
-        wins  = int((today_df["pnl_inr"] > 0).sum())
-        stops = int((today_df["exit_reason"] == "stop").sum())
-        trails = int((today_df["exit_reason"] == "trail").sum())
+        def _row_txn_cost(row):
+            is_fly = float(row.get("wing_ce_strike", 0) or 0) > 0
+            wc = float(row.get("wing_ce_ltp", 0) or 0) + float(row.get("wing_pe_ltp", 0) or 0)
+            return est_txn_cost(float(row["entry_premium"]), wc,
+                                int(row["lot_size"]), int(row.get("lots", 1)), is_fly)
 
+        today_df["txn_cost"] = today_df.apply(_row_txn_cost, axis=1)
+        today_df["net_pnl"]  = today_df["pnl_inr"] - today_df["txn_cost"]
+
+        total_gross = float(today_df["pnl_inr"].sum())
+        total_cost  = float(today_df["txn_cost"].sum())
+        total_net   = float(today_df["net_pnl"].sum())
+        wins = int((today_df["net_pnl"] > 0).sum())
+
+        # Graduation: headline KPIs prominent
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Today P&L",  fmt_inr(total_inr), delta_color=color(total_inr))
-        c2.metric("Trades",     len(today_df))
-        c3.metric("Wins",       wins)
-        c4.metric("Stops",      stops)
-        c5.metric("Trail Exits", trails)
+        c1.metric("Net P&L", fmt_inr(total_net),
+                  delta=f"{'▲' if total_net>=0 else '▼'} Gross {fmt_inr(total_gross)}",
+                  delta_color="normal" if total_net >= 0 else "inverse")
+        c2.metric("TxCost", f"-₹{total_cost:.0f}")
+        c3.metric("Trades", len(today_df))
+        c4.metric("Wins (net)", wins)
+        c5.metric("Stops", int((today_df["exit_reason"] == "stop").sum()))
 
-        display = today_df[[
-            "symbol", "strike", "entry_time", "exit_time", "exit_reason",
-            "entry_premium", "exit_premium", "pnl_pts", "pnl_inr", "scorecard_conf"
-        ]].copy()
-        display["entry_time"] = pd.to_datetime(display["entry_time"]).dt.strftime("%H:%M")
-        display["exit_time"]  = pd.to_datetime(display["exit_time"]).dt.strftime("%H:%M")
-        display["pnl_inr"]    = display["pnl_inr"].apply(lambda v: f"₹{v:.0f}")
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        rows = []
+        for _, r in today_df.iterrows():
+            is_fly = float(r.get("wing_ce_strike", 0) or 0) > 0
+            wce = int(r.get("wing_ce_strike", 0) or 0)
+            wpe = int(r.get("wing_pe_strike", 0) or 0)
+            net = float(r["pnl_inr"]) - float(r["txn_cost"])
+            rows.append({
+                "Symbol":   r["symbol"],
+                "ATM":      int(r["strike"]),
+                "Wing CE":  wce if is_fly else "—",
+                "Wing PE":  wpe if is_fly else "—",
+                "Entry":    (pd.to_datetime(r["entry_time"])  + _IST).strftime("%d-%b %I:%M %p"),
+                "Exit":     (pd.to_datetime(r["exit_time"])   + _IST).strftime("%I:%M %p"),
+                "Reason":   r["exit_reason"],
+                "Status":   "✅ Win" if net > 0 else "❌ Loss",
+                "Net Entry": f"{float(r.get('net_premium', 0) or r['entry_premium']):.1f}",
+                "Exit Val": f"{float(r['exit_premium']):.1f}",
+                "P&L pts":  f"{float(r['pnl_pts']):+.1f}",
+                "Net P&L":  f"{'+' if net>=0 else ''}₹{net:.0f}",
+                "Conf":     f"{float(r['scorecard_conf']):.0f}",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # ── Historical outcomes ────────────────────────────────────────────────────
+    st.divider()
+
+    # ── Historical Outcomes ───────────────────────────────────────────────────
     st.subheader("Historical Outcomes")
     hist_df = query("""
-        SELECT toDate(entry_time) AS trade_date,
-               symbol, strike, exit_reason,
-               entry_premium, exit_premium,
+        SELECT toDate(entry_time) AS trade_date, symbol, strike,
+               exit_reason, entry_premium, exit_premium,
                pnl_pts, pnl_inr, scorecard_conf
         FROM trades.trade_outcomes FINAL
-        ORDER BY entry_time DESC
-        LIMIT 200
+        ORDER BY entry_time DESC LIMIT 500
     """)
+
     if hist_df.empty:
         st.info("No historical trade data yet.")
     else:
         hist_df["trade_date"] = pd.to_datetime(hist_df["trade_date"])
-
-        # Cumulative P&L curve
         cum = hist_df.sort_values("trade_date").copy()
         cum["cum_pnl"] = cum["pnl_inr"].cumsum()
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=cum["trade_date"], y=cum["cum_pnl"],
-            mode="lines+markers", name="Cumulative P&L",
-            line=dict(color="royalblue", width=2),
-            fill="tozeroy",
-            fillcolor="rgba(65,105,225,0.1)",
-        ))
-        fig.add_hline(y=0, line_dash="dash", line_color="gray")
-        fig.update_layout(
-            height=300, title="Cumulative P&L (₹)",
-            yaxis_title="₹", xaxis_title="Date",
-        )
-        st.plotly_chart(fig, use_container_width=True)
 
-        # Summary by exit reason
-        c1, c2 = st.columns(2)
-        with c1:
+        # Graduation: primary chart first, stats second, raw table behind expander
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Scatter(
+            x=cum["trade_date"], y=cum["cum_pnl"],
+            mode="lines+markers", line_color="#3498db",
+            fill="tozeroy", fillcolor="rgba(52,152,219,0.1)",
+        ))
+        fig_hist.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig_hist.update_layout(height=300, yaxis_title="Cumulative P&L (₹)")
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
             by_reason = hist_df.groupby("exit_reason").agg(
                 trades=("pnl_inr", "count"),
                 total_inr=("pnl_inr", "sum"),
-                avg_inr=("pnl_inr", "mean"),
                 win_rate=("pnl_inr", lambda x: (x > 0).mean() * 100),
             ).reset_index()
             st.markdown("**By Exit Reason**")
             st.dataframe(by_reason, use_container_width=True, hide_index=True)
 
-        with c2:
+        with col2:
             by_sym = hist_df.groupby("symbol").agg(
                 trades=("pnl_inr", "count"),
                 total_inr=("pnl_inr", "sum"),
-                avg_inr=("pnl_inr", "mean"),
                 win_rate=("pnl_inr", lambda x: (x > 0).mean() * 100),
             ).reset_index()
             st.markdown("**By Symbol**")
             st.dataframe(by_sym, use_container_width=True, hide_index=True)
 
-        # Full trade log
-        with st.expander("Full Trade Log"):
+        with st.expander("Full Trade Log (last 500)"):
             st.dataframe(
-                hist_df[["trade_date","symbol","strike","exit_reason",
-                          "entry_premium","exit_premium","pnl_pts","pnl_inr","scorecard_conf"]],
+                hist_df[["trade_date", "symbol", "strike", "exit_reason",
+                          "entry_premium", "exit_premium", "pnl_pts", "pnl_inr", "scorecard_conf"]],
                 use_container_width=True, hide_index=True,
             )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-elif page == "Breakout Backtest":
-    st.title("Monthly Breakout — Hypothesis Backtest")
-    st.caption(
-        "Entry: monthly close > max(high) of prior 3 months · "
-        "Exit: 2× target OR daily close < prior week's low · "
-        "Universe: Indian market (178 stocks, 1996–present)"
-    )
+# PAGE 4 — MARKET DATA
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Market Data":
+    st.title("🔍 Market Data")
 
-    trades = query("""
-        SELECT symbol, entry_date, exit_date, entry_price, exit_price,
-               exit_reason, holding_days, return_pct, xirr_annualized
-        FROM analysis.monthly_breakout_trades FINAL
-        ORDER BY entry_date
+    # ── India VIX ─────────────────────────────────────────────────────────────
+    st.subheader("India VIX — 1 Year")
+    vix_df = query("""
+        SELECT toDate(timestamp) as date,
+               max(vix) as vix,
+               max(nifty_spot) as nifty_spot
+        FROM market.nifty_live FINAL
+        WHERE timestamp >= today() - 365
+        GROUP BY date ORDER BY date
     """)
-
-    if trades.empty:
-        st.warning("No backtest results yet. Run: `docker compose run --rm monthly_breakout_backtest`")
-    else:
-        trades["entry_date"] = pd.to_datetime(trades["entry_date"])
-        trades["exit_date"]  = pd.to_datetime(trades["exit_date"])
-        trades["xirr_pct"]   = trades["xirr_annualized"] * 100
-
-        n          = len(trades)
-        n_target   = (trades["exit_reason"] == "target").sum()
-        n_stop     = (trades["exit_reason"] == "stop").sum()
-        avg_ret    = trades["return_pct"].mean()
-        med_ret    = trades["return_pct"].median()
-        avg_hold   = trades["holding_days"].mean()
-        med_xirr   = trades["xirr_pct"].median()
-
-        # Monthly Sharpe
-        trades["exit_month"] = trades["exit_date"].dt.to_period("M")
-        monthly_ret = trades.groupby("exit_month")["return_pct"].mean()
-        all_months  = pd.period_range(monthly_ret.index.min(), monthly_ret.index.max(), freq="M")
-        monthly_ret = monthly_ret.reindex(all_months, fill_value=0.0)
-        sharpe = (monthly_ret.mean() / monthly_ret.std() * 12 ** 0.5) if monthly_ret.std() > 0 else 0
-
-        # ── KPI row ───────────────────────────────────────────────────────────
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Total trades", f"{n:,}")
-        c2.metric("Win rate (2×)", f"{n_target/n*100:.1f}%")
-        c3.metric("Avg return", f"{avg_ret:.2f}%", delta=f"med {med_ret:.2f}%")
-        c4.metric("Avg hold", f"{avg_hold:.0f}d")
-        c5.metric("Median XIRR", f"{med_xirr:.1f}%")
-        c6.metric("Sharpe", f"{sharpe:.2f}")
-
-        verdict = "POSITIVE" if avg_ret > 0 and sharpe > 0.5 else ("MARGINAL" if avg_ret > 0 else "NEGATIVE")
-        color   = {"POSITIVE": "success", "MARGINAL": "warning", "NEGATIVE": "error"}[verdict]
-        getattr(st, color)(
-            f"Verdict: **{verdict}** — "
-            f"{n_target} trades hit 2× target ({n_target/n*100:.1f}%), "
-            f"{n_stop} stopped out ({n_stop/n*100:.1f}%). "
-            f"Median return {med_ret:.2f}%, Sharpe {sharpe:.2f}."
-        )
-
-        st.markdown("---")
-
-        # ── Return distribution ───────────────────────────────────────────────
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            st.subheader("Return distribution")
-            fig_dist = go.Figure()
-            for reason, color_val in [("target", "#4caf50"), ("stop", "#f44336")]:
-                sub = trades[trades["exit_reason"] == reason]["return_pct"]
-                fig_dist.add_trace(go.Histogram(
-                    x=sub, name=reason.capitalize(),
-                    marker_color=color_val, opacity=0.7,
-                    xbins=dict(size=2),
-                ))
-            fig_dist.update_layout(
-                barmode="overlay",
-                xaxis_title="Return (%)", yaxis_title="Trades",
-                legend=dict(x=0.7, y=0.95),
-                height=350, margin=dict(t=20, b=40),
-                plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
-                font_color="white",
-            )
-            st.plotly_chart(fig_dist, use_container_width=True)
-
-        with col_b:
-            st.subheader("Holding period distribution")
-            fig_hold = go.Figure()
-            for reason, color_val in [("target", "#4caf50"), ("stop", "#f44336")]:
-                sub = trades[trades["exit_reason"] == reason]["holding_days"]
-                fig_hold.add_trace(go.Histogram(
-                    x=sub, name=reason.capitalize(),
-                    marker_color=color_val, opacity=0.7,
-                    xbins=dict(size=10),
-                ))
-            fig_hold.update_layout(
-                barmode="overlay",
-                xaxis_title="Holding days", yaxis_title="Trades",
-                legend=dict(x=0.7, y=0.95),
-                height=350, margin=dict(t=20, b=40),
-                plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
-                font_color="white",
-            )
-            st.plotly_chart(fig_hold, use_container_width=True)
-
-        # ── Cumulative equity curve ───────────────────────────────────────────
-        st.subheader("Cumulative return (equal-weight, ₹1 per trade)")
-        trades_sorted = trades.sort_values("exit_date")
-        trades_sorted["cum_return"] = (1 + trades_sorted["return_pct"] / 100).cumprod()
-
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(
-            x=trades_sorted["exit_date"],
-            y=trades_sorted["cum_return"],
-            mode="lines",
-            line=dict(color="#2196f3", width=1.5),
-            name="Equity curve",
-        ))
-        fig_eq.add_hline(y=1.0, line_dash="dash", line_color="gray", annotation_text="Breakeven")
-        fig_eq.update_layout(
-            xaxis_title="Exit date", yaxis_title="Portfolio value (₹1 start)",
-            height=350, margin=dict(t=20, b=40),
-            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
-            font_color="white",
-        )
-        st.plotly_chart(fig_eq, use_container_width=True)
-
-        # ── Annualised XIRR by year ───────────────────────────────────────────
-        st.subheader("Median XIRR by entry year")
-        trades["entry_year"] = trades["entry_date"].dt.year
-        yearly = trades.groupby("entry_year").agg(
-            trades=("return_pct", "count"),
-            median_xirr=("xirr_pct", "median"),
-            win_rate=("exit_reason", lambda x: (x == "target").mean() * 100),
-        ).reset_index()
-
-        fig_yr = go.Figure()
-        fig_yr.add_trace(go.Bar(
-            x=yearly["entry_year"],
-            y=yearly["median_xirr"],
-            marker_color=yearly["median_xirr"].apply(lambda v: "#4caf50" if v > 0 else "#f44336"),
-            name="Median XIRR %",
-            text=yearly["trades"].apply(lambda v: f"{v}t"),
-            textposition="outside",
-        ))
-        fig_yr.update_layout(
-            xaxis_title="Entry year", yaxis_title="Median XIRR (%)",
-            height=350, margin=dict(t=30, b=40),
-            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
-            font_color="white",
-        )
-        st.plotly_chart(fig_yr, use_container_width=True)
-
-        # ── Top winning and losing stocks ─────────────────────────────────────
-        col_w, col_l = st.columns(2)
-        sym_stats = trades.groupby("symbol").agg(
-            trades=("return_pct", "count"),
-            avg_ret=("return_pct", "mean"),
-            win_rate=("exit_reason", lambda x: (x == "target").mean() * 100),
-        ).reset_index().sort_values("avg_ret", ascending=False)
-
-        with col_w:
-            st.subheader("Top 10 symbols by avg return")
-            st.dataframe(sym_stats.head(10)[["symbol", "trades", "avg_ret", "win_rate"]]
-                         .rename(columns={"avg_ret": "avg_ret_%", "win_rate": "win_%"})
-                         .round(2),
-                         use_container_width=True, hide_index=True)
-        with col_l:
-            st.subheader("Bottom 10 symbols")
-            st.dataframe(sym_stats.tail(10)[["symbol", "trades", "avg_ret", "win_rate"]]
-                         .rename(columns={"avg_ret": "avg_ret_%", "win_rate": "win_%"})
-                         .round(2),
-                         use_container_width=True, hide_index=True)
-
-        with st.expander("All trades"):
-            st.dataframe(
-                trades[["symbol", "entry_date", "exit_date", "holding_days",
-                         "entry_price", "exit_price", "return_pct", "xirr_pct", "exit_reason"]]
-                .sort_values("entry_date", ascending=False)
-                .round(2),
-                use_container_width=True, hide_index=True,
-            )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "Data Freshness":
-    from datetime import date as _date, timedelta as _td
-    st.title("Data Freshness")
-    st.caption("Staleness thresholds: OHLCV 3d · Options chain 4d · VIX 4d · MF NAV 5d · Per-symbol lag 10d vs market max")
-
-    today = _date.today()
-
-    # ── Source-level freshness ────────────────────────────────────────────────
-    st.subheader("Source freshness")
-
-    ohlcv_df = query(
-        "SELECT market, max(date) as last_date FROM market.ohlcv_daily FINAL GROUP BY market ORDER BY market"
-    )
-    mf_df = query("SELECT max(date) as last_date FROM market.mf_nav FINAL")
-    vix_df = query("SELECT max(toDate(timestamp)) as last_date FROM market.nifty_live FINAL")
-    chain_df = query(
-        "SELECT symbol, max(toDate(timestamp)) as last_date "
-        "FROM market.options_chain FINAL WHERE toHour(timestamp) = 15 GROUP BY symbol ORDER BY symbol"
-    )
-
-    THRESHOLDS = {
-        "ohlcv":   3,
-        "mf_nav":  5,
-        "vix":     4,
-        "options": 4,
-    }
-
-    rows = []
-
-    for _, r in ohlcv_df.iterrows():
-        last = r["last_date"]
-        if hasattr(last, "date"):
-            last = last.date()
-        stale = (today - last).days
-        rows.append({
-            "Source": f"ohlcv_daily [{r['market']}]",
-            "Last date": str(last),
-            "Days stale": stale,
-            "Threshold": THRESHOLDS["ohlcv"],
-            "Status": "OK" if stale <= THRESHOLDS["ohlcv"] else "STALE",
-        })
-
-    if not mf_df.empty:
-        last = mf_df.iloc[0]["last_date"]
-        if hasattr(last, "date"):
-            last = last.date()
-        stale = (today - last).days
-        rows.append({
-            "Source": "mf_nav",
-            "Last date": str(last),
-            "Days stale": stale,
-            "Threshold": THRESHOLDS["mf_nav"],
-            "Status": "OK" if stale <= THRESHOLDS["mf_nav"] else "STALE",
-        })
 
     if not vix_df.empty:
-        last = vix_df.iloc[0]["last_date"]
-        if hasattr(last, "date"):
-            last = last.date()
-        stale = (today - last).days
-        rows.append({
-            "Source": "nifty_live (VIX)",
-            "Last date": str(last),
-            "Days stale": stale,
-            "Threshold": THRESHOLDS["vix"],
-            "Status": "OK" if stale <= THRESHOLDS["vix"] else "STALE",
-        })
+        vix_df["date"] = pd.to_datetime(vix_df["date"])
+        latest_vix = float(vix_df["vix"].iloc[-1])
+        regime = ("Low (<13)" if latest_vix < 13
+                  else "Normal (13–18)" if latest_vix < 18
+                  else "Elevated (18–25)" if latest_vix < 25
+                  else "Extreme (>25)")
+        # Graduation: traffic-light color for current VIX
+        vix_icon = traffic_light(latest_vix < 18, latest_vix < 25)
 
-    for _, r in chain_df.iterrows():
-        last = r["last_date"]
-        if hasattr(last, "date"):
-            last = last.date()
-        stale = (today - last).days
-        rows.append({
-            "Source": f"options_chain [{r['symbol']}]",
-            "Last date": str(last),
-            "Days stale": stale,
-            "Threshold": THRESHOLDS["options"],
-            "Status": "OK" if stale <= THRESHOLDS["options"] else "STALE",
-        })
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            fig_vix = go.Figure()
+            fig_vix.add_trace(go.Scatter(
+                x=vix_df["date"], y=vix_df["vix"],
+                line_color="#f39c12", name="VIX",
+            ))
+            fig_vix.add_hrect(y0=0,  y1=13, fillcolor="green",  opacity=0.05, line_width=0)
+            fig_vix.add_hrect(y0=13, y1=18, fillcolor="yellow", opacity=0.05, line_width=0)
+            fig_vix.add_hrect(y0=18, y1=25, fillcolor="orange", opacity=0.05, line_width=0)
+            fig_vix.add_hrect(y0=25, y1=80, fillcolor="red",    opacity=0.05, line_width=0)
+            fig_vix.update_layout(height=280, showlegend=False)
+            st.plotly_chart(fig_vix, use_container_width=True)
+        with col2:
+            st.metric(f"{vix_icon} Current VIX", f"{latest_vix:.2f}", delta=regime)
+            latest_nifty = float(vix_df["nifty_spot"].iloc[-1])
+            prev_nifty = float(vix_df["nifty_spot"].iloc[-2]) if len(vix_df) > 1 else latest_nifty
+            chg = (latest_nifty - prev_nifty) / prev_nifty * 100 if prev_nifty else 0
+            chg_icon = traffic_light(abs(chg) < 1, abs(chg) < 2)
+            st.metric(f"{chg_icon} Nifty Spot", f"{latest_nifty:,.0f}", delta=f"{chg:+.2f}%",
+                      delta_color="normal" if chg >= 0 else "inverse")
 
-    src_df = pd.DataFrame(rows)
+    st.divider()
 
-    def _color_status(val):
-        return "background-color: #1a3a1a; color: #4caf50" if val == "OK" else "background-color: #3a1a1a; color: #f44336"
-
-    def _color_stale(val):
-        if val <= 1:
-            return "color: #4caf50"
-        if val <= 4:
-            return "color: #ff9800"
-        return "color: #f44336"
-
-    styled = (
-        src_df.style
-        .applymap(_color_status, subset=["Status"])
-        .applymap(_color_stale, subset=["Days stale"])
-    )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    n_stale = (src_df["Status"] == "STALE").sum()
-    if n_stale == 0:
-        st.success("All sources are fresh")
-    else:
-        st.error(f"{n_stale} source(s) are stale — auto-fix runs daily at 19:00 IST")
-
-    # ── Per-symbol lag table ──────────────────────────────────────────────────
-    st.subheader("Symbols lagging >10 days behind market max")
-    sym_df = query("""
-        SELECT market, symbol, last_date, market_max,
-               toInt32(dateDiff('day', last_date, market_max)) as days_behind
-        FROM (
-          SELECT market, symbol, max(date) as last_date
-          FROM market.ohlcv_daily FINAL GROUP BY market, symbol
-        ) t
-        JOIN (
-          SELECT market, max(date) as market_max
-          FROM market.ohlcv_daily FINAL GROUP BY market
-        ) m USING (market)
-        WHERE dateDiff('day', last_date, market_max) > 10
-        ORDER BY market, days_behind DESC
-        LIMIT 200
+    # ── Put-Call Ratio ────────────────────────────────────────────────────────
+    st.subheader("PCR & Max Pain (last 90 days)")
+    pcr_df = query("""
+        SELECT date, pcr, max_pain_strike AS max_pain
+        FROM market.options_eod_summary FINAL
+        WHERE date >= today() - 90
+        ORDER BY date
     """)
-    if sym_df.empty:
-        st.success("No symbols lagging behind their market")
+    if not pcr_df.empty:
+        pcr_df["date"] = pd.to_datetime(pcr_df["date"])
+        fig_pcr = go.Figure()
+        fig_pcr.add_trace(go.Scatter(x=pcr_df["date"], y=pcr_df["pcr"],
+                                     line_color="#9b59b6", name="PCR"))
+        fig_pcr.add_hline(y=1.3, line_dash="dash", line_color="#2ecc71",
+                          annotation_text="Bullish >1.3")
+        fig_pcr.add_hline(y=0.7, line_dash="dash", line_color="#e74c3c",
+                          annotation_text="Bearish <0.7")
+        fig_pcr.update_layout(height=260, showlegend=False)
+        st.plotly_chart(fig_pcr, use_container_width=True)
     else:
-        st.warning(f"{len(sym_df)} symbol(s) lagging — may need manual investigation")
-        st.dataframe(sym_df, use_container_width=True, hide_index=True)
+        st.info("PCR data not available. Run compute_oi_features.")
 
-    # ── Pipeline run history ──────────────────────────────────────────────────
-    st.subheader("Recent pipeline runs (last 7 days)")
-    runs_df = query("""
-        SELECT service, run_date, status, duration_s, error_msg
-        FROM system_meta.pipeline_runs FINAL
-        WHERE run_date >= today() - 7
-        ORDER BY run_date DESC, service
+    st.divider()
+
+    # ── OI Walls ──────────────────────────────────────────────────────────────
+    # options_eod_summary is NIFTY-only (CRIT-003) — no symbol column
+    st.subheader("OI Walls — Current Expiry (NIFTY)")
+    st.caption("⚠️ CRIT-003: options_eod_summary is NIFTY-only. BANKNIFTY/FINNIFTY/MIDCPNIFTY data not available here.")
+    wall_df = query("""
+        SELECT date, expiry, iv_rank, max_pain_strike,
+               ce_wall_strike, pe_wall_strike, pcr, iv_skew
+        FROM market.options_eod_summary FINAL
+        ORDER BY date DESC LIMIT 1
     """)
-    if runs_df.empty:
-        st.info("No pipeline run records found")
-    else:
-        def _run_color(val):
-            if val == "success":
-                return "background-color: #1a3a1a; color: #4caf50"
-            if val == "partial_failure":
-                return "background-color: #3a2a0a; color: #ff9800"
-            return "background-color: #3a1a1a; color: #f44336"
-        st.dataframe(
-            runs_df.style.applymap(_run_color, subset=["status"]),
-            use_container_width=True, hide_index=True,
-        )
-
-
-elif page == "Fundamentals":
-    st.title("Fundamentals")
-    st.caption("Quality screen: PE > 0, ROE > 5%, positive margins = quality stock. Data from market.fundamental_snapshot.")
-
-    fund_df = query(
-        "SELECT symbol, pe_ratio, pb_ratio, roe, roa, profit_margins, "
-        "       gross_margins, operating_margins, free_cashflow, total_debt, "
-        "       market_cap, eps_ttm, date "
-        "FROM market.fundamental_snapshot FINAL "
-        "ORDER BY market_cap DESC"
-    )
-
-    if fund_df.empty:
-        st.warning("No fundamental data found. Run fundamental_pipeline first.")
-    else:
-        # ── Quality score ─────────────────────────────────────────────────────
-        fund_df["quality"] = (
-            (fund_df["pe_ratio"] > 0).astype(int) +
-            (fund_df["roe"] > 0.05).astype(int) +
-            (fund_df["profit_margins"] > 0).astype(int) +
-            (fund_df["free_cashflow"] > 0).astype(int)
-        )
-
-        # ── KPIs ─────────────────────────────────────────────────────────────
+    if not wall_df.empty:
+        wr = wall_df.iloc[0]
         c1, c2, c3, c4 = st.columns(4)
-        quality_pass = (fund_df["quality"] >= 3).sum()
-        c1.metric("Total stocks", len(fund_df))
-        c2.metric("Quality ≥3/4", int(quality_pass))
-        c3.metric("Profitable (PE>0)", int((fund_df["pe_ratio"] > 0).sum()))
-        c4.metric("Positive FCF", int((fund_df["free_cashflow"] > 0).sum()))
+        c1.metric("IV Rank", f"{wr['iv_rank']:.0f}%")
+        c2.metric("Max Pain", f"{int(wr['max_pain_strike']):,}" if wr['max_pain_strike'] else "—")
+        c3.metric("CE Wall", f"{int(wr['ce_wall_strike']):,}" if wr.get('ce_wall_strike') else "—")
+        c4.metric("PE Wall", f"{int(wr['pe_wall_strike']):,}" if wr.get('pe_wall_strike') else "—")
+        st.caption(f"As of {wr['date']} · Expiry {str(wr['expiry'])[:10]} · PCR {float(wr['pcr']):.2f}")
+    else:
+        st.info("No OI wall data. Run compute_oi_features.")
 
-        st.markdown("---")
+    st.divider()
 
-        # ── Filters ───────────────────────────────────────────────────────────
-        col_f1, col_f2 = st.columns(2)
-        min_quality = col_f1.slider("Min quality score (0–4)", 0, 4, 0)
-        search = col_f2.text_input("Search symbol", "")
+    # ── MF NAV Explorer ───────────────────────────────────────────────────────
+    st.subheader("Mutual Fund NAV Explorer")
 
-        display = fund_df[fund_df["quality"] >= min_quality].copy()
-        if search:
-            display = display[display["symbol"].str.contains(search.upper(), na=False)]
+    # Load full scheme list once (cached 1 hr)
+    schemes_df = query("""
+        SELECT scheme_code, scheme_name, fund_house, scheme_type, scheme_category
+        FROM market.mf_schemes
+        WHERE is_active = 1
+        ORDER BY scheme_name
+    """)
 
-        # ── Format for display ────────────────────────────────────────────────
-        def _pct(v):
-            return f"{v*100:.1f}%" if v and abs(v) < 100 else ("—" if not v else f"{v:.1f}x")
+    if schemes_df.empty:
+        st.info("No MF scheme metadata. Ensure mf_schemes table is populated.")
+    else:
+        schemes_df["scheme_code"] = schemes_df["scheme_code"].astype(int)
 
-        display_cols = display[["symbol", "pe_ratio", "pb_ratio", "roe", "profit_margins",
-                                 "free_cashflow", "market_cap", "quality", "date"]].copy()
-        display_cols.columns = ["Symbol", "PE", "PB", "ROE", "Net Margin",
-                                  "FCF (₹)", "Mkt Cap (₹)", "Quality", "As of"]
-        display_cols["ROE"] = display_cols["ROE"].apply(lambda v: f"{v*100:.1f}%")
-        display_cols["Net Margin"] = display_cols["Net Margin"].apply(lambda v: f"{v*100:.1f}%")
-        display_cols["FCF (₹)"] = display_cols["FCF (₹)"].apply(
-            lambda v: f"{'▲' if v > 0 else '▼'} {abs(v)/1e7:.0f}Cr" if v else "—"
+        # ── Derive plan-type tags from name ──────────────────────────────────
+        sn = schemes_df["scheme_name"].str.upper()
+        schemes_df["_is_growth"]  = sn.str.contains("GROWTH",  na=False)
+        schemes_df["_is_idcw"]    = sn.str.contains(r"IDCW|DIVIDEND", na=False, regex=True)
+        schemes_df["_is_direct"]  = sn.str.contains("DIRECT",  na=False)
+        schemes_df["_is_regular"] = ~schemes_df["_is_direct"]  # anything not Direct = Regular
+
+        # ── Filter row 1: Type / Category ────────────────────────────────────
+        fcol1, fcol2 = st.columns([2, 4])
+        with fcol1:
+            scheme_type_sel = st.selectbox(
+                "Scheme Type",
+                ["All"] + sorted(schemes_df["scheme_type"].dropna().unique().tolist()),
+                index=["All", "Equity", "Debt", "Index/ETF", "Hybrid",
+                       "FoF", "Commodity", "Other"].index("Equity")
+                       if "Equity" in schemes_df["scheme_type"].values else 0,
+                key="mf_type",
+            )
+        type_mask = (
+            schemes_df["scheme_type"] == scheme_type_sel
+            if scheme_type_sel != "All"
+            else pd.Series(True, index=schemes_df.index)
         )
-        display_cols["Mkt Cap (₹)"] = display_cols["Mkt Cap (₹)"].apply(
-            lambda v: f"{v/1e9:.0f}B" if v else "—"
+        avail_cats = (
+            ["All"] + sorted(schemes_df.loc[type_mask, "scheme_category"]
+                             .dropna().unique().tolist())
         )
-        display_cols["PE"] = display_cols["PE"].apply(
-            lambda v: f"{v:.1f}" if v > 0 else "—"
+        with fcol2:
+            cat_sel = st.multiselect(
+                "Category",
+                options=avail_cats[1:],          # exclude "All" — empty = all
+                default=[],
+                placeholder="All categories (leave empty for all)",
+                key="mf_cat",
+            )
+
+        # ── Filter row 2: Plan / Direct ───────────────────────────────────────
+        fcol3, fcol4 = st.columns(2)
+        with fcol3:
+            plan_sel = st.radio(
+                "Plan Type",
+                ["Growth", "IDCW / Dividend", "Both"],
+                horizontal=True,
+                key="mf_plan",
+            )
+        with fcol4:
+            dist_sel = st.radio(
+                "Distribution Channel",
+                ["Direct", "Regular", "Both"],
+                horizontal=True,
+                key="mf_dist",
+            )
+
+        # ── Apply filters ─────────────────────────────────────────────────────
+        mask = type_mask.copy()
+        if cat_sel:
+            mask &= schemes_df["scheme_category"].isin(cat_sel)
+        if plan_sel == "Growth":
+            mask &= schemes_df["_is_growth"]
+        elif plan_sel == "IDCW / Dividend":
+            mask &= schemes_df["_is_idcw"]
+        if dist_sel == "Direct":
+            mask &= schemes_df["_is_direct"]
+        elif dist_sel == "Regular":
+            mask &= schemes_df["_is_regular"]
+
+        filtered = schemes_df[mask].copy()
+        st.caption(f"{len(filtered):,} funds match filters")
+
+        if filtered.empty:
+            st.warning("No funds match the selected filters.")
+        else:
+            # ── Fund picker ───────────────────────────────────────────────────
+            fund_options = dict(zip(
+                filtered["scheme_name"],
+                filtered["scheme_code"],
+            ))
+            selected_names = st.multiselect(
+                "Select funds to chart (max 15)",
+                options=list(fund_options.keys()),
+                default=[],
+                max_selections=15,
+                placeholder="Pick one or more funds…",
+                key="mf_funds",
+            )
+            selected_codes = [fund_options[n] for n in selected_names]
+
+            # ── Date range ────────────────────────────────────────────────────
+            dc1, dc2, dc3 = st.columns([2, 2, 2])
+            with dc1:
+                from_date = st.date_input(
+                    "From date",
+                    value=date(2015, 1, 1),
+                    min_value=date(2006, 4, 1),
+                    max_value=date.today(),
+                    key="mf_from",
+                )
+            with dc2:
+                index_to_100 = st.checkbox(
+                    "Index all to 100 (compare growth)",
+                    value=True,
+                    key="mf_idx",
+                )
+            with dc3:
+                show_perf = st.checkbox(
+                    "Show performance table",
+                    value=True,
+                    key="mf_perf",
+                )
+
+            if not selected_codes:
+                st.info("Select at least one fund above to see the NAV chart.")
+            else:
+                codes_sql = ", ".join(str(c) for c in selected_codes)
+                # Join mf_nav with mf_schemes for the name
+                nav_df = query(f"""
+                    SELECT n.date, n.scheme_code, n.nav, s.scheme_name
+                    FROM market.mf_nav n FINAL
+                    JOIN (
+                        SELECT scheme_code, scheme_name
+                        FROM market.mf_schemes
+                        WHERE scheme_code IN ({codes_sql})
+                    ) s ON n.scheme_code = s.scheme_code
+                    WHERE n.scheme_code IN ({codes_sql})
+                      AND n.date >= '{from_date}'
+                    ORDER BY n.date
+                """)
+
+                if nav_df.empty:
+                    st.warning("No NAV data found for selected funds from the chosen date.")
+                else:
+                    nav_df["date"] = pd.to_datetime(nav_df["date"])
+
+                    # Shorten display names: strip "- Direct Plan - Growth" suffixes
+                    def _short(name):
+                        for cut in [" - Direct Plan", " Direct Plan",
+                                    " - Regular Plan", " Regular Plan",
+                                    " - Growth", "-Growth", " Growth",
+                                    " - IDCW", "-IDCW", " IDCW",
+                                    " Option", " Fund"]:
+                            name = name.replace(cut, "")
+                        return name.strip(" -")
+
+                    nav_df["label"] = nav_df["scheme_name"].apply(_short)
+
+                    # ── Chart ─────────────────────────────────────────────────
+                    if index_to_100:
+                        # Divide each fund's NAV by its first value × 100
+                        first_navs = (nav_df.sort_values("date")
+                                      .groupby("scheme_code")["nav"].first())
+                        nav_df = nav_df.join(
+                            first_navs.rename("first_nav"), on="scheme_code"
+                        )
+                        nav_df["plot_val"] = nav_df["nav"] / nav_df["first_nav"] * 100
+                        y_label = "Indexed NAV (base=100)"
+                    else:
+                        nav_df["plot_val"] = nav_df["nav"]
+                        y_label = "NAV (₹)"
+
+                    fig_mf = px.line(
+                        nav_df, x="date", y="plot_val",
+                        color="label",
+                        labels={"date": "", "plot_val": y_label, "label": "Fund"},
+                        height=480,
+                    )
+                    fig_mf.update_traces(line_width=1.8)
+                    fig_mf.update_layout(
+                        legend=dict(orientation="h", yanchor="top",
+                                    y=-0.15, xanchor="left", x=0),
+                        hovermode="x unified",
+                        margin=dict(b=120),
+                    )
+                    if index_to_100:
+                        fig_mf.add_hline(y=100, line_dash="dot",
+                                         line_color="gray", opacity=0.5)
+                    st.plotly_chart(fig_mf, use_container_width=True)
+
+                    # ── Performance table ──────────────────────────────────────
+                    if show_perf:
+                        perf_df = query(f"""
+                            SELECT e.scheme_code, s.scheme_name,
+                                   round(e.return_1m,  1) AS ret_1m,
+                                   round(e.return_3m,  1) AS ret_3m,
+                                   round(e.return_6m,  1) AS ret_6m,
+                                   round(e.return_1y,  1) AS ret_1y,
+                                   round(e.return_3y,  1) AS ret_3y,
+                                   round(e.return_5y,  1) AS ret_5y,
+                                   round(e.cagr_3y,    1) AS cagr_3y,
+                                   round(e.cagr_5y,    1) AS cagr_5y,
+                                   round(e.sharpe_1y,  2) AS sharpe_1y,
+                                   round(e.max_drawdown_pct, 1) AS max_dd_pct,
+                                   round(e.volatility_1y, 1) AS vol_1y
+                            FROM market.mf_nav_enriched e FINAL
+                            JOIN (
+                                SELECT scheme_code, scheme_name
+                                FROM market.mf_schemes
+                                WHERE scheme_code IN ({codes_sql})
+                            ) s ON e.scheme_code = s.scheme_code
+                            WHERE e.scheme_code IN ({codes_sql})
+                            ORDER BY e.date DESC
+                            LIMIT 1 BY e.scheme_code
+                        """)
+
+                        if not perf_df.empty:
+                            perf_df["scheme_name"] = perf_df["scheme_name"].apply(_short)
+                            perf_df = perf_df.rename(columns={
+                                "scheme_name": "Fund",
+                                "ret_1m": "1M%", "ret_3m": "3M%",
+                                "ret_6m": "6M%", "ret_1y": "1Y%",
+                                "ret_3y": "3Y%", "ret_5y": "5Y%",
+                                "cagr_3y": "CAGR 3Y", "cagr_5y": "CAGR 5Y",
+                                "sharpe_1y": "Sharpe", "max_dd_pct": "MaxDD%",
+                                "vol_1y": "Vol%",
+                            }).drop(columns=["scheme_code"])
+                            st.dataframe(
+                                perf_df, use_container_width=True, hide_index=True
+                            )
+
+    st.divider()
+
+    # ── Fundamentals (compact) ────────────────────────────────────────────────
+    with st.expander("📦 Fundamentals"):
+        fund_df = query("""
+            SELECT symbol, period, revenue, net_income, eps,
+                   free_cashflow, ebitda
+            FROM market.fundamental_quarterly FINAL
+            ORDER BY period DESC LIMIT 20
+        """)
+        if not fund_df.empty:
+            st.dataframe(fund_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No fundamentals data.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MF ADVISOR PAGE
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "MF Advisor":
+    try:
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.primitives import hashes
+        import base64
+        import hashlib
+    except ImportError:
+        st.error("cryptography package missing — rebuild the dashboard image.")
+        st.stop()
+
+    # ── Encryption helpers ────────────────────────────────────────────────────
+    def _pid(pp: str) -> str:
+        return hashlib.sha256(pp.encode()).hexdigest()
+
+    def _fernet(pp: str, salt_hex: str) -> Fernet:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(), length=32,
+            salt=bytes.fromhex(salt_hex), iterations=480_000,
+        )
+        return Fernet(base64.urlsafe_b64encode(kdf.derive(pp.encode())))
+
+    def _save_profile(pp: str, profile: dict) -> None:
+        salt = os.urandom(16).hex()
+        cipher = _fernet(pp, salt).encrypt(json.dumps(profile).encode()).decode()
+        get_ch().insert(
+            "system_meta.investor_profiles",
+            [[_pid(pp), salt, cipher]],
+            column_names=["profile_id", "profile_salt", "profile_data"],
         )
 
-        def _color_quality(val):
-            if val == 4: return "background-color: #1a7a3a; color: white"
-            if val == 3: return "background-color: #4a9a5a; color: white"
-            if val == 2: return "background-color: #7a7a2a; color: white"
-            return "background-color: #7a2a2a; color: white"
+    def _load_profile(pp: str) -> dict | None:
+        pid = _pid(pp)
+        try:
+            df = get_ch().query_df(
+                "SELECT profile_salt, profile_data "
+                "FROM system_meta.investor_profiles FINAL "
+                f"WHERE profile_id = '{pid}' LIMIT 1"
+            )
+        except Exception:
+            return None
+        if df.empty:
+            return None
+        try:
+            return json.loads(
+                _fernet(pp, df.iloc[0]["profile_salt"]).decrypt(
+                    df.iloc[0]["profile_data"].encode()
+                )
+            )
+        except Exception:
+            return None
 
+    # ── Page header ───────────────────────────────────────────────────────────
+    st.header("MF Advisor")
+
+    # ── Passphrase ────────────────────────────────────────────────────────────
+    with st.expander("🔐 Load / Save Profile",
+                     expanded="mf_profile" not in st.session_state):
+        pp_input = st.text_input("Passphrase", type="password", key="mf_pp")
+        pp_c1, pp_c2 = st.columns(2)
+        if pp_c1.button("Load Profile"):
+            if pp_input:
+                _loaded = _load_profile(pp_input)
+                if _loaded:
+                    st.session_state.mf_profile = _loaded
+                    st.success("Profile loaded.")
+                    st.rerun()
+                else:
+                    st.error("No profile found or wrong passphrase.")
+            else:
+                st.warning("Enter a passphrase first.")
+        if pp_c2.button("Save Profile"):
+            if pp_input:
+                if "mf_profile" in st.session_state:
+                    _save_profile(pp_input, st.session_state.mf_profile)
+                    st.success("Profile saved.")
+                else:
+                    st.warning("Fill the profile form first.")
+            else:
+                st.warning("Enter a passphrase first.")
+
+    # ── Questionnaire ─────────────────────────────────────────────────────────
+    st.subheader("Investor Profile")
+    prof = st.session_state.get("mf_profile", {})
+
+    with st.form("mf_profile_form"):
+        st.markdown("**Personal Context**")
+        pc1, pc2, pc3 = st.columns(3)
+        p_name       = pc1.text_input("Name / alias (optional)", value=prof.get("name", ""))
+        p_age        = pc2.number_input("Age", min_value=18, max_value=80,
+                                        value=int(prof.get("age", 35)))
+        p_dependents = pc3.number_input("Number of dependents (spouse, kids, parents)",
+                                        min_value=0, max_value=15,
+                                        value=int(prof.get("dependents", 0)))
+
+        st.markdown("**Monthly Cash Flows (₹)** — helps us suggest a realistic SIP")
+        cf1, cf2, cf3 = st.columns(3)
+        p_income = cf1.number_input("Take-home income",
+                                    min_value=0, value=int(prof.get("monthly_income", 0)),
+                                    step=10_000, help="Monthly in-hand salary / business income")
+        p_nec    = cf2.number_input("Monthly necessities",
+                                    min_value=0, value=int(prof.get("monthly_necessities", 0)),
+                                    step=5_000,
+                                    help="Non-negotiable fixed costs: rent, groceries, utilities, insurance premiums")
+        p_fam    = cf3.number_input("Family commitments",
+                                    min_value=0, value=int(prof.get("monthly_family", 0)),
+                                    step=5_000,
+                                    help="School/college fees, elderly parent support, home loan EMI, other EMIs")
+        _avail   = max(0, p_income - p_nec - p_fam)
+        st.caption(
+            f"Surplus after necessities + family commitments: **₹{_avail:,.0f}/month** "
+            f"(thumb rule: invest 50–70% of surplus)"
+        )
+
+        st.markdown("**Investment Profile**")
+        ip1, ip2 = st.columns(2)
+        _HOR_OPTS  = ["< 1 year", "1–3 years", "3–7 years", "7+ years"]
+        _RISK_OPTS = ["Conservative", "Moderate", "Aggressive", "Very Aggressive"]
+        p_horizon = ip1.radio(
+            "Investment horizon", _HOR_OPTS,
+            index=_HOR_OPTS.index(prof["horizon_label"])
+                  if prof.get("horizon_label") in _HOR_OPTS else 3,
+        )
+        p_risk = ip2.radio(
+            "Risk tolerance", _RISK_OPTS,
+            index=_RISK_OPTS.index(prof["risk"])
+                  if prof.get("risk") in _RISK_OPTS else 2,
+        )
+
+        _GOAL_OPTS = [
+            "Wealth Creation", "Retirement",
+            "Children's Education / Marriage", "Home Purchase",
+            "Tax Saving (ELSS)", "Regular Income (IDCW)",
+        ]
+        p_goals = st.multiselect(
+            "Financial goals (select all that apply)", _GOAL_OPTS,
+            default=[g for g in prof.get("goals", ["Wealth Creation"]) if g in _GOAL_OPTS],
+        )
+
+        p_emergency = st.checkbox(
+            "I already have 6+ months of expenses saved as an emergency fund",
+            value=bool(prof.get("emergency_ok", False)),
+        )
+        if not p_emergency:
+            st.info(
+                "Tip: park 3–6 months of (necessities + family commitments) in a Liquid fund "
+                "before starting aggressive SIPs. It protects you from redeeming equity at the wrong time."
+            )
+
+        st.markdown("**SIP & Tax**")
+        st1, st2, st3 = st.columns(3)
+        _sip_default = int(prof.get("sip_inr", max(500, int(_avail * 0.6))))
+        p_sip  = st1.number_input("Monthly SIP (₹)", min_value=500,
+                                   value=_sip_default, step=500)
+        _TAX   = [0, 10, 20, 30]
+        _td    = int(prof.get("tax_bracket", 30))
+        p_tax  = st2.selectbox("Income tax bracket (%)", _TAX,
+                               index=_TAX.index(_td) if _td in _TAX else 3)
+        _PLAN  = ["Direct", "Regular", "Both"]
+        p_plan = st3.radio(
+            "Fund plan preference", _PLAN,
+            index=_PLAN.index(prof["plan_type"]) if prof.get("plan_type") in _PLAN else 0,
+            help="Direct plans have lower expense ratios — recommended if you don't use a distributor.",
+        )
+
+        st.markdown("**Existing Holdings — categories to avoid duplicating**")
+        _CAT_OPTS = [
+            "Large Cap", "Mid Cap", "Small Cap", "Flexi Cap", "Multi Cap",
+            "Large & Mid Cap", "ELSS", "Balanced Advantage",
+            "International / Global", "Liquid", "Ultra Short Duration",
+            "Short Duration", "Thematic",
+        ]
+        p_exclude = st.multiselect(
+            "Already heavily invested in", _CAT_OPTS,
+            default=[c for c in prof.get("exclude_categories", []) if c in _CAT_OPTS],
+        )
+
+        p_submitted = st.form_submit_button(
+            "Update Profile & Get Recommendations", use_container_width=True
+        )
+
+    if p_submitted:
+        _HOR_MAP = {"< 1 year": 0.5, "1–3 years": 2.0, "3–7 years": 5.0, "7+ years": 10.0}
+        st.session_state.mf_profile = {
+            "name": p_name, "age": int(p_age), "dependents": int(p_dependents),
+            "monthly_income": int(p_income), "monthly_necessities": int(p_nec),
+            "monthly_family": int(p_fam), "emergency_ok": bool(p_emergency),
+            "horizon_label": p_horizon, "horizon_years": _HOR_MAP[p_horizon],
+            "risk": p_risk, "goals": p_goals,
+            "sip_inr": int(p_sip), "tax_bracket": int(p_tax),
+            "plan_type": p_plan, "exclude_categories": p_exclude,
+            "saved_at": date.today().isoformat(),
+        }
+        st.rerun()
+
+    if "mf_profile" not in st.session_state:
+        st.info("Complete the profile form above to get fund recommendations.")
+        st.stop()
+
+    prof = st.session_state.mf_profile
+
+    if not prof.get("emergency_ok", True):
+        st.warning(
+            "⚠️  Build your emergency fund first (Liquid / Ultra Short Duration funds). "
+            "Rushing into equity SIPs without a buffer often leads to panic withdrawals."
+        )
+
+    # ── Category mapping + SIP allocation ─────────────────────────────────────
+    horizon_yrs  = float(prof.get("horizon_years", 10.0))
+    risk         = prof.get("risk", "Aggressive")
+    goals        = prof.get("goals", [])
+    tax_goal     = "Tax Saving (ELSS)" in goals
+    income_goal  = "Regular Income (IDCW)" in goals
+    exclude_cats = set(prof.get("exclude_categories", []))
+
+    def _hb(y: float) -> str:
+        return "short" if y < 3 else ("mid" if y < 7 else "long")
+
+    _rk = (risk, "any") if risk == "Conservative" else (risk, _hb(horizon_yrs))
+
+    _BASE_W: dict[tuple, dict] = {
+        ("Conservative",    "any"):  {"Liquid": 0.20, "Ultra Short Duration": 0.20,
+                                      "Short Duration": 0.30, "Balanced Advantage": 0.30},
+        ("Moderate",        "short"): {"Balanced Advantage": 0.40, "Large Cap": 0.30,
+                                       "Short Duration": 0.30},
+        ("Moderate",        "mid"):   {"Large Cap": 0.35, "Flexi Cap": 0.30,
+                                       "Large & Mid Cap": 0.25, "ELSS": 0.10},
+        ("Moderate",        "long"):  {"Large Cap": 0.30, "Flexi Cap": 0.25,
+                                       "Large & Mid Cap": 0.20, "Mid Cap": 0.15, "ELSS": 0.10},
+        ("Aggressive",      "mid"):   {"Flexi Cap": 0.35, "Multi Cap": 0.25,
+                                       "Large & Mid Cap": 0.25, "ELSS": 0.10,
+                                       "International / Global": 0.05},
+        ("Aggressive",      "long"):  {"Large Cap": 0.25, "Flexi Cap": 0.30,
+                                       "Small Cap": 0.20, "Multi Cap": 0.10,
+                                       "ELSS": 0.10, "International / Global": 0.05},
+        ("Very Aggressive", "long"):  {"Small Cap": 0.30, "Mid Cap": 0.25,
+                                       "Flexi Cap": 0.30, "Thematic": 0.15},
+    }
+
+    _weights = dict(_BASE_W.get(_rk, _BASE_W.get((risk, "long"), {"Flexi Cap": 1.0})))
+
+    for _ec in list(_weights.keys()):
+        if _ec in exclude_cats:
+            del _weights[_ec]
+
+    _ELSS_CAP = 12_500
+    if not tax_goal and "ELSS" in _weights:
+        _ew = _weights.pop("ELSS")
+        for _fb in ["Flexi Cap", "Large Cap", "Multi Cap", "Balanced Advantage"]:
+            if _fb in _weights:
+                _weights[_fb] += _ew
+                break
+    elif tax_goal and "ELSS" not in _weights and "ELSS" not in exclude_cats:
+        _weights["ELSS"] = 0.10
+
+    _tw = sum(_weights.values()) or 1.0
+    _weights = {k: v / _tw for k, v in _weights.items()}
+
+    sip = int(prof.get("sip_inr", 5_000))
+    alloc: dict[str, float] = {}
+    _overflow = 0.0
+    for _cat, _w in _weights.items():
+        _amt = sip * _w
+        if _cat == "ELSS" and tax_goal and _amt > _ELSS_CAP:
+            _overflow = _amt - _ELSS_CAP
+            _amt = _ELSS_CAP
+        alloc[_cat] = _amt
+    if _overflow > 0:
+        for _fb in ["Flexi Cap", "Large Cap", "Multi Cap", "Balanced Advantage"]:
+            if _fb in alloc:
+                alloc[_fb] += _overflow
+                break
+
+    if not alloc:
+        st.error("All recommended categories are excluded. Remove some from the exclusion list.")
+        st.stop()
+
+    alloc_df = pd.DataFrame([
+        {"Category": k, "Amount (₹)": round(v), "Pct": round(v / sip * 100, 1)}
+        for k, v in alloc.items()
+    ])
+
+    # ── SIP allocation display ────────────────────────────────────────────────
+    st.subheader("Recommended SIP Allocation")
+    _pc, _tc = st.columns([1, 1])
+    with _pc:
+        _fp = px.pie(alloc_df, names="Category", values="Amount (₹)",
+                     title=f"Monthly SIP: ₹{sip:,.0f}")
+        _fp.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(_fp, use_container_width=True)
+    with _tc:
+        _da = alloc_df.copy()
+        _da["Amount (₹)"] = _da["Amount (₹)"].apply(lambda x: f"₹{x:,.0f}")
+        _da["Pct"]        = _da["Pct"].apply(lambda x: f"{x:.1f}%")
+        st.dataframe(_da, use_container_width=True, hide_index=True)
+        st.caption(f"Total: ₹{sum(alloc.values()):,.0f} / month")
+        if income_goal:
+            st.caption("Income goal → prefer IDCW plans (change plan type filter above).")
+        if tax_goal and "ELSS" in alloc:
+            st.caption(f"ELSS capped at ₹{_ELSS_CAP:,}/month = ₹{_ELSS_CAP*12:,}/year (full 80C deduction at {prof.get('tax_bracket',30)}%).")
+
+    # ── Fund scoring ──────────────────────────────────────────────────────────
+    st.subheader("Fund Recommendations")
+
+    _score_cats = list(alloc.keys())
+    _cats_sql   = ", ".join(f"'{c}'" for c in _score_cats)
+    _plan_type  = prof.get("plan_type", "Direct")
+    if _plan_type == "Direct":
+        _plan_filter = "lower(s.scheme_name) LIKE '%direct%'"
+    elif _plan_type == "Regular":
+        _plan_filter = "lower(s.scheme_name) NOT LIKE '%direct%'"
+    else:
+        _plan_filter = "1=1"
+
+    _enr = query(f"""
+        SELECT e.scheme_code, s.scheme_name, s.scheme_category, s.fund_house,
+               e.cagr_5y, e.cagr_3y, e.consistency_score, e.sip_return_5y,
+               e.sortino_1y, e.sharpe_1y, e.max_drawdown_pct, e.volatility_1y,
+               e.beta_vs_nifty, e.return_1y, e.return_3y, e.return_5y
+        FROM market.mf_nav_enriched e FINAL
+        JOIN market.mf_schemes s ON e.scheme_code = s.scheme_code
+        WHERE s.scheme_category IN ({_cats_sql})
+          AND s.is_active = 1
+          AND {_plan_filter}
+          AND e.return_5y > 0
+          AND e.cagr_5y IS NOT NULL
+        ORDER BY e.date DESC
+        LIMIT 1 BY e.scheme_code
+    """)
+
+    if _enr.empty:
+        st.warning("No fund data found for selected categories. Ensure mf_nav_enriched is populated.")
+        st.stop()
+
+    # ── Scoring helpers ───────────────────────────────────────────────────────
+    _W11 = {
+        "cagr_5y":           +0.15,
+        "consistency_score": +0.15,
+        "sip_return_5y":     +0.15,
+        "sortino_1y":        +0.12,
+        "sharpe_1y":         +0.12,
+        "upside_capture":    +0.10,
+        "alpha":             +0.05,
+        "downside_capture":  -0.12,
+        "max_drawdown_pct":  -0.09,
+        "volatility_1y":     -0.06,
+        "beta_vs_nifty":     -0.04,
+    }
+    _W9 = {k: v for k, v in _W11.items()
+           if k not in ("upside_capture", "downside_capture", "alpha")}
+
+    def _norm_score(sub: pd.DataFrame, weights: dict) -> pd.Series:
+        sub = sub.copy()
+        _pk = [k for k, v in weights.items() if v > 0 and k in sub.columns]
+        _nk = [k for k, v in weights.items() if v < 0 and k in sub.columns]
+        for k in _pk + _nk:
+            mn, mx = sub[k].min(), sub[k].max()
+            sub[k] = (sub[k] - mn) / (mx - mn) if mx > mn else 0.5
+        _s = sum(sub[k] * weights[k] for k in _pk) if _pk else pd.Series(0.0, index=sub.index)
+        _s -= sum(sub[k] * abs(weights[k]) for k in _nk)
+        mn_s, mx_s = _s.min(), _s.max()
+        return (_s - mn_s) / (mx_s - mn_s) * 100 if mx_s > mn_s else _s * 0 + 50.0
+
+    # Ensure all metric columns exist and are numeric.
+    # upside_capture / downside_capture / alpha come from later joins — skip here.
+    _enr = _enr.copy()
+    _LATE_COLS = {"upside_capture", "downside_capture", "alpha"}
+    for _col in list(_W11.keys()):
+        if _col in _LATE_COLS:
+            continue
+        if _col not in _enr.columns:
+            _enr[_col] = 0.0
+        else:
+            _enr[_col] = pd.to_numeric(_enr[_col], errors="coerce").fillna(0.0)
+
+    # First pass: 9-metric score → shortlist top-30 per category for capture query
+    _enr["_s9"] = 0.0
+    for _cat in _score_cats:
+        _m = _enr["scheme_category"] == _cat
+        if _m.sum() > 0:
+            _enr.loc[_m, "_s9"] = _norm_score(_enr.loc[_m], _W9).values
+
+    _top30_codes = (
+        _enr.sort_values("_s9", ascending=False)
+            .groupby("scheme_category")
+            .head(30)["scheme_code"]
+            .astype(str).tolist()
+    )
+    _top30_sql = ", ".join(f"'{c}'" for c in _top30_codes)
+
+    # Upside / downside capture for shortlisted funds
+    _cap_df = query(f"""
+        WITH
+        nifty_m AS (
+            SELECT toStartOfMonth(date) AS m,
+                   (argMax(close, date) - argMin(close, date))
+                    / nullIf(argMin(close, date), 0) * 100 AS nr
+            FROM market.ohlcv_daily
+            WHERE symbol = '^NSEI' AND date >= today() - INTERVAL 5 YEAR
+            GROUP BY m
+        ),
+        fund_m AS (
+            SELECT scheme_code, toStartOfMonth(date) AS m,
+                   (argMax(nav, date) - argMin(nav, date))
+                    / nullIf(argMin(nav, date), 0) * 100 AS fr
+            FROM market.mf_nav
+            WHERE scheme_code IN ({_top30_sql})
+              AND date >= today() - INTERVAL 5 YEAR
+            GROUP BY scheme_code, m
+        ),
+        jnd AS (
+            SELECT f.scheme_code, f.fr, n.nr
+            FROM fund_m f JOIN nifty_m n ON f.m = n.m
+            WHERE n.nr != 0
+        )
+        SELECT scheme_code,
+               avgIf(fr / nr * 100, nr > 0) AS upside_capture,
+               avgIf(fr / nr * 100, nr < 0) AS downside_capture
+        FROM jnd GROUP BY scheme_code
+    """) if _top30_sql else pd.DataFrame()
+
+    # Nifty 5Y CAGR for alpha
+    _nc_df = query("""
+        SELECT argMax(close, date) / nullIf(argMin(close, date), 0) AS ratio,
+               dateDiff('year', min(date), max(date)) AS yrs
+        FROM market.ohlcv_daily
+        WHERE symbol = '^NSEI' AND date >= today() - INTERVAL 5 YEAR
+    """)
+    if not _nc_df.empty and float(_nc_df.iloc[0]["yrs"]) > 0:
+        _nifty5y = (float(_nc_df.iloc[0]["ratio"]) ** (1.0 / float(_nc_df.iloc[0]["yrs"])) - 1) * 100
+    else:
+        _nifty5y = 12.0
+
+    if not _cap_df.empty:
+        _enr = _enr.merge(_cap_df, on="scheme_code", how="left")
+        for _cc in ("upside_capture", "downside_capture"):
+            _enr[_cc] = pd.to_numeric(_enr[_cc], errors="coerce").fillna(0.0)
+    else:
+        _enr["upside_capture"]   = 0.0
+        _enr["downside_capture"] = 0.0
+
+    _enr["alpha"] = (_enr["cagr_5y"] - _enr["beta_vs_nifty"] * _nifty5y).fillna(0.0)
+
+    # Second pass: full 11-metric score
+    _enr["Quality Score"] = 0.0
+    for _cat in _score_cats:
+        _m = _enr["scheme_category"] == _cat
+        if _m.sum() > 0:
+            _enr.loc[_m, "Quality Score"] = _norm_score(_enr.loc[_m], _W11).values
+
+    _enr["Fund"] = _enr["scheme_name"].str[:46]
+
+    _DCOLS = ["Fund", "Quality Score", "return_1y", "cagr_5y", "sharpe_1y",
+              "sortino_1y", "beta_vs_nifty", "upside_capture", "downside_capture",
+              "alpha", "max_drawdown_pct", "volatility_1y"]
+    _DREN  = {
+        "return_1y": "1Y%", "cagr_5y": "5Y CAGR",
+        "sharpe_1y": "Sharpe", "sortino_1y": "Sortino",
+        "beta_vs_nifty": "Beta", "upside_capture": "Up Cap",
+        "downside_capture": "Dn Cap", "alpha": "Alpha",
+        "max_drawdown_pct": "MaxDD%", "volatility_1y": "Vol%",
+    }
+
+    # ── Per-category tabs (top 5) ─────────────────────────────────────────────
+    st.markdown("**Top 5 per Category**")
+    _tabs = st.tabs(_score_cats)
+    for _tab, _cat in zip(_tabs, _score_cats):
+        with _tab:
+            _sub = (_enr[_enr["scheme_category"] == _cat]
+                    .sort_values("Quality Score", ascending=False)
+                    .head(5))
+            if _sub.empty:
+                st.info(f"No data for {_cat}")
+                continue
+            _d = _sub[[c for c in _DCOLS if c in _sub.columns]].rename(columns=_DREN)
+            _nc = [c for c in _d.columns if c != "Fund"]
+            st.dataframe(
+                _d.style.format({c: "{:.1f}" for c in _nc}, na_rep="—"),
+                use_container_width=True, hide_index=True,
+            )
+
+    # ── Combined top 10 ───────────────────────────────────────────────────────
+    st.markdown("**Combined Top 10 (all categories)**")
+    _top10 = _enr.sort_values("Quality Score", ascending=False).head(10)
+    _d10   = _top10[["Fund", "scheme_category"] + [c for c in _DCOLS[1:] if c in _top10.columns]].rename(
+        columns={"scheme_category": "Category", **_DREN}
+    )
+    _nc10  = [c for c in _d10.columns if c not in ("Fund", "Category")]
+    st.dataframe(
+        _d10.style.format({c: "{:.1f}" for c in _nc10}, na_rep="—"),
+        use_container_width=True, hide_index=True,
+    )
+
+    with st.expander("How is the Quality Score calculated?"):
+        # Build a human-readable narrative from the actual weights dict
+        _pos_items = sorted(
+            [(k, v) for k, v in _W11.items() if v > 0], key=lambda x: -x[1]
+        )
+        _neg_items = sorted(
+            [(k, abs(v)) for k, v in _W11.items() if v < 0], key=lambda x: -x[1]
+        )
+        _total_pos = sum(v for _, v in _pos_items)
+        _total_neg = sum(v for _, v in _neg_items)
+        _metric_labels = {
+            "cagr_5y": "5-year CAGR", "consistency_score": "consistency score",
+            "sip_return_5y": "5-year SIP return", "sortino_1y": "Sortino ratio (1Y)",
+            "sharpe_1y": "Sharpe ratio (1Y)", "upside_capture": "upside capture ratio",
+            "alpha": "alpha vs Nifty", "downside_capture": "downside capture ratio",
+            "max_drawdown_pct": "max drawdown", "volatility_1y": "1-year volatility",
+            "beta_vs_nifty": "beta vs Nifty",
+        }
+        _pos_desc = ", ".join(
+            f"**{_metric_labels.get(k, k)}** ({v:.0%})" for k, v in _pos_items
+        )
+        _neg_desc = ", ".join(
+            f"**{_metric_labels.get(k, k)}** ({v:.0%})" for k, v in _neg_items
+        )
+        st.markdown(
+            f"Each fund is given a **Quality Score from 0 to 100**, computed separately "
+            f"within its category so funds are always compared to peers — not the entire universe.\n\n"
+            f"**{_total_pos:.0%} of the score rewards higher values:** {_pos_desc}.\n\n"
+            f"**{_total_neg:.0%} of the score penalises higher values** (lower is safer/better): "
+            f"{_neg_desc}.\n\n"
+            f"Every metric is first normalised 0–1 within the category (min-max), then multiplied "
+            f"by its weight and summed. The final score is scaled so the best fund in a category "
+            f"scores 100 and the worst scores 0.\n\n"
+            f"*Upside capture* = how much of the market's rally the fund captured; "
+            f"*downside capture* = how much of the market's fall the fund absorbed (lower = better). "
+            f"*Alpha* = fund's 5Y CAGR minus (beta × Nifty 5Y CAGR) — skill beyond market exposure. "
+            f"Both are computed from 5 years of monthly returns against Nifty 50."
+        )
         st.dataframe(
-            display_cols.style.applymap(_color_quality, subset=["Quality"]),
+            pd.DataFrame([
+                {"Metric": _metric_labels.get(k, k),
+                 "Direction": "↑ higher is better" if v > 0 else "↓ lower is better",
+                 "Weight": f"{abs(v):.0%}"}
+                for k, v in _W11.items()
+            ]),
             use_container_width=True, hide_index=True,
         )
 
-        st.markdown("---")
-        # ── Quality distribution chart ────────────────────────────────────────
-        import plotly.express as px
-        q_counts = fund_df["quality"].value_counts().sort_index().reset_index()
-        q_counts.columns = ["Quality Score", "Count"]
-        q_counts["Label"] = q_counts["Quality Score"].map(
-            {0: "0 – Avoid", 1: "1 – Weak", 2: "2 – Fair", 3: "3 – Good", 4: "4 – Quality"}
-        )
-        fig = px.bar(q_counts, x="Label", y="Count",
-                     color="Quality Score",
-                     color_continuous_scale=["#7a2a2a", "#7a4a2a", "#7a7a2a", "#4a9a5a", "#1a7a3a"],
-                     title="Fundamental Quality Distribution")
-        st.plotly_chart(fig, use_container_width=True)
-
-
-elif page == "Edge Analysis":
-    import plotly.express as px
-    import plotly.graph_objects as go
-
-    st.title("Edge Analysis — Index Straddle Selling")
-    st.caption(
-        "Backtested on historical expiries. "
-        "1DTE = sell ATM straddle at T-1 EOD, hold to expiry. 0DTE = estimated open price straddle."
-    )
-
-    sym_sel = st.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0)
-
-    lot_sizes = {"NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 40}
-    lot = lot_sizes.get(sym_sel, 1)
-
-    with st.expander("Strategy Explained", expanded=False):
-        st.markdown(f"""
-**What we trade**: We sell an ATM (at-the-money) straddle on {sym_sel} at its expiry day.
-A straddle = sell 1 CE (call option) + 1 PE (put option) at the same strike price nearest to spot. Lot size: **{lot} shares**.
-
-**Why sell?** Options decay to zero on expiry day. If {sym_sel} stays near our strike, both options expire worthless and we keep the full premium. We profit when the market *doesn't move much*.
-
-**The edge**: Implied Volatility (IV) — what options are priced at — tends to overestimate actual market moves. This difference (Implied - Realized) is the **Volatility Risk Premium (VRP)**. When VRP > 0, option sellers have a structural advantage.
-
-**How we manage risk**:
-- Target: close the trade when we've kept ~₹2000 profit (options lost enough value)
-- Stop: exit if options gain ₹1000 (market moved against us)
-- Trailing stop: once target is hit, trail at 75% of peak profit to lock in gains
-- Entry window: 09:30–14:00 IST; forced exit at 15:20 IST (before close)
-
-**Key insight from backtest**:
-- **NIFTY**: 65.3% 1DTE win rate; Tuesday expiries 75.8% win
-- **BANKNIFTY**: 84.1% 1DTE win rate; VRP statistically significant (p<0.0001); Tuesday 94.4% win
-- **FINNIFTY**: 68% win rate; weaker edge but still positive expectancy
+    # ── NAV trend (indexed to 100, last 3 years) ──────────────────────────────
+    st.markdown("**NAV Trend — Top 10 (indexed to 100)**")
+    _t10_sql = ", ".join(f"'{c}'" for c in _top10["scheme_code"].astype(str))
+    if _t10_sql:
+        _nav_df = query(f"""
+            SELECT n.scheme_code, n.date, n.nav, s.scheme_name
+            FROM market.mf_nav n
+            JOIN market.mf_schemes s ON n.scheme_code = s.scheme_code
+            WHERE n.scheme_code IN ({_t10_sql})
+              AND n.date >= today() - INTERVAL 3 YEAR
+            ORDER BY n.scheme_code, n.date
         """)
+        if not _nav_df.empty:
+            _nav_df["date"] = pd.to_datetime(_nav_df["date"])
+            _nav_df = _nav_df.sort_values(["scheme_code", "date"])
 
-    ea_df = query(
-        "SELECT expiry_date, day_of_week, spot_t1, spot_expiry, atm_strike, "
-        "       entry_1dte, exit_1dte, profit_1dte_pts, profit_1dte_pct, win_1dte, "
-        "       estimated_0dte_entry, profit_0dte_pts, profit_0dte_pct, win_0dte, "
-        "       implied_move_pct, realized_move_pct, vrp, "
-        "       best_profit_pts, best_dist_from_atm, atm_profit_pts, "
-        "       iv_rank, atm_iv, pcr "
-        "FROM analysis.edge_analysis FINAL "
-        f"WHERE symbol = '{sym_sel}' "
-        "ORDER BY expiry_date"
+            def _idx100(g):
+                g = g.copy()
+                _f = g["nav"].iloc[0]
+                g["indexed"] = g["nav"] / _f * 100 if _f > 0 else g["nav"]
+                return g
+
+            _nav_df = _nav_df.groupby("scheme_code", group_keys=False).apply(_idx100)
+            _nav_df["label"] = _nav_df["scheme_name"].str[:32]
+            _fn = px.line(_nav_df, x="date", y="indexed", color="label",
+                          labels={"indexed": "NAV (indexed 100)", "date": "", "label": "Fund"},
+                          height=420)
+            _fn.update_layout(legend=dict(orientation="h", y=-0.32, font_size=9))
+            st.plotly_chart(_fn, use_container_width=True)
+
+    # ── Portfolio Review ───────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Portfolio Review")
+
+    _sch_df = query("""
+        SELECT scheme_code, scheme_name, scheme_category
+        FROM market.mf_schemes WHERE is_active = 1
+        ORDER BY scheme_name
+    """)
+
+    if _sch_df.empty:
+        st.info("No scheme data available for fund lookup.")
+        st.stop()
+
+    _sch_map = dict(zip(_sch_df["scheme_name"], _sch_df["scheme_code"].astype(str)))
+
+    st.markdown("Enter your current mutual fund holdings:")
+    _hd = prof.get("holdings", [])
+    _htmpl = (
+        pd.DataFrame(_hd)[["Fund", "Units", "Avg NAV"]]
+        if isinstance(_hd, list) and _hd and isinstance(_hd[0], dict) and "Fund" in _hd[0]
+        else pd.DataFrame([{"Fund": "", "Units": 0.0, "Avg NAV": 0.0}])
     )
 
-    if ea_df.empty:
-        st.warning("No edge analysis data. Run: docker compose run --rm edge_analysis")
-    else:
-        # ── Summary KPIs ──────────────────────────────────────────────────────
-        st.markdown("---")
-        st.subheader("Summary Statistics")
-        n = len(ea_df)
-        wr_1dte = ea_df["win_1dte"].mean() * 100
-        avg_vrp = ea_df["vrp"].mean()
-        avg_win_1  = ea_df.loc[ea_df["win_1dte"] == 1, "profit_1dte_pts"].mean()
-        avg_loss_1 = ea_df.loc[ea_df["win_1dte"] == 0, "profit_1dte_pts"].mean()
-        exp_1dte = wr_1dte / 100 * avg_win_1 + (1 - wr_1dte / 100) * avg_loss_1
-        exp_inr = exp_1dte * lot
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Expiries analysed", n)
-        c2.metric("1DTE win rate", f"{wr_1dte:.1f}%")
-        c3.metric("Avg VRP", f"{avg_vrp:+.3f}%")
-        c4.metric("Expectancy (pts)", f"{exp_1dte:+.0f}")
-        c5.metric(f"Expectancy (₹, {lot} lot)", fmt_inr(exp_inr))
-
-        st.markdown("---")
-
-        # ── Win rates by condition ─────────────────────────────────────────────
-        st.subheader("Win Rate by Market Condition")
-
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            st.markdown("**By ATM IV bucket**")
-            bins_iv = [0, 12, 16, 20, 25, 100]
-            labels_iv = ["<12", "12–16", "16–20", "20–25", ">25"]
-            ea_df["iv_bucket"] = pd.cut(ea_df["atm_iv"], bins=bins_iv, labels=labels_iv)
-            iv_grp = ea_df.groupby("iv_bucket", observed=True).agg(
-                N=("win_1dte", "count"),
-                WinPct=("win_1dte", lambda x: x.mean() * 100),
-                AvgProfit=("profit_1dte_pts", "mean"),
-            ).reset_index()
-            iv_grp.columns = ["ATM IV", "N", "Win %", "Avg Profit (pts)"]
-            iv_grp["Win %"] = iv_grp["Win %"].round(1)
-            iv_grp["Avg Profit (pts)"] = iv_grp["Avg Profit (pts)"].round(1)
-            st.dataframe(iv_grp, hide_index=True, use_container_width=True)
-
-        with col_b:
-            st.markdown("**By Day of Week**")
-            dow_grp = ea_df.groupby("day_of_week").agg(
-                N=("win_1dte", "count"),
-                WinPct=("win_1dte", lambda x: x.mean() * 100),
-                AvgProfit=("profit_1dte_pts", "mean"),
-            ).reset_index()
-            dow_grp.columns = ["Day", "N", "Win %", "Avg Profit (pts)"]
-            dow_grp["Win %"] = dow_grp["Win %"].round(1)
-            dow_grp["Avg Profit (pts)"] = dow_grp["Avg Profit (pts)"].round(1)
-            st.dataframe(dow_grp, hide_index=True, use_container_width=True)
-
-        st.markdown("---")
-
-        # ── IV Rank conditional ────────────────────────────────────────────────
-        st.subheader("Win Rate by IV Rank")
-        bins_ivr = [0, 20, 40, 60, 80, 101]
-        labels_ivr = ["0–20", "20–40", "40–60", "60–80", "80+"]
-        ea_df["ivr_bucket"] = pd.cut(ea_df["iv_rank"], bins=bins_ivr, labels=labels_ivr)
-        ivr_grp = ea_df.groupby("ivr_bucket", observed=True).agg(
-            N=("win_1dte", "count"),
-            WinPct=("win_1dte", lambda x: x.mean() * 100),
-            AvgProfit=("profit_1dte_pts", "mean"),
-        ).reset_index()
-
-        fig_ivr = px.bar(
-            ivr_grp, x="ivr_bucket", y="WinPct",
-            text=ivr_grp["N"].apply(lambda n: f"n={n}"),
-            color="WinPct",
-            color_continuous_scale=["#7a2a2a", "#7a7a2a", "#1a7a3a"],
-            range_color=[40, 100],
-            labels={"ivr_bucket": "IV Rank Bucket", "WinPct": "Win Rate (%)"},
-            title="1DTE Win Rate by IV Rank"
-        )
-        fig_ivr.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="50% break-even")
-        st.plotly_chart(fig_ivr, use_container_width=True)
-
-        st.markdown("---")
-
-        # ── Per-expiry profit scatter ──────────────────────────────────────────
-        st.subheader("Per-Expiry Profit Distribution (1DTE)")
-        ea_df["expiry_str"] = ea_df["expiry_date"].astype(str)
-        ea_df["color"] = ea_df["win_1dte"].map({1: "Win", 0: "Loss"})
-
-        fig_scatter = px.scatter(
-            ea_df, x="expiry_str", y="profit_1dte_pts",
-            color="color",
-            color_discrete_map={"Win": "#1a7a3a", "Loss": "#7a2a2a"},
-            labels={"expiry_str": "Expiry Date", "profit_1dte_pts": "Profit (pts)"},
-            title="Per-Expiry Straddle Profit (1DTE)",
-            hover_data=["atm_iv", "iv_rank", "pcr"],
-        )
-        fig_scatter.add_hline(y=0, line_dash="dash", line_color="gray")
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-        st.markdown("---")
-
-        # ── Cumulative P&L ────────────────────────────────────────────────────
-        st.subheader("Cumulative P&L (1DTE, equal size every expiry)")
-        ea_df_sorted = ea_df.sort_values("expiry_date")
-        ea_df_sorted["cumulative_pnl"] = ea_df_sorted["profit_1dte_pts"].cumsum()
-
-        fig_cum = go.Figure()
-        fig_cum.add_trace(go.Scatter(
-            x=ea_df_sorted["expiry_str"],
-            y=ea_df_sorted["cumulative_pnl"],
-            mode="lines+markers",
-            name="Cumulative P&L",
-            line=dict(color="#4a9aff", width=2),
-            marker=dict(
-                color=ea_df_sorted["win_1dte"].map({1: "#1a7a3a", 0: "#7a2a2a"}),
-                size=6,
+    _hedit = st.data_editor(
+        _htmpl,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Fund": st.column_config.SelectboxColumn(
+                "Fund Name", options=list(_sch_map.keys()), required=False,
             ),
-        ))
-        fig_cum.add_hline(y=0, line_dash="dash", line_color="gray")
-        fig_cum.update_layout(title="Cumulative Straddle P&L (pts)", xaxis_title="Expiry", yaxis_title="Points")
-        st.plotly_chart(fig_cum, use_container_width=True)
-
-        st.markdown("---")
-
-        # ── Stop/Target calibration (1DTE % profit) ───────────────────────────
-        st.subheader("Stop / Target Calibration (1DTE, % of collected premium)")
-        pct_col = "profit_1dte_pct"
-        if ea_df[pct_col].abs().sum() > 0:
-            targets = [20, 30, 40, 50, 60, 70, 80]
-            stops   = [20, 30, 50, 80, 100]
-
-            target_hits = []
-            for t in targets:
-                hit_pct = (ea_df[pct_col] >= t).mean() * 100
-                target_hits.append({"Threshold": f"Keep {t}%", "Hit Rate (%)": round(hit_pct, 1), "Type": "Target"})
-
-            stop_hits = []
-            for s in stops:
-                breached_pct = (ea_df[pct_col] <= -s).mean() * 100
-                stop_hits.append({"Threshold": f"Lose {s}%", "Hit Rate (%)": round(breached_pct, 1), "Type": "Stop"})
-
-            calib_df = pd.DataFrame(target_hits + stop_hits)
-            col_t, col_s = st.columns(2)
-            with col_t:
-                st.markdown("**Targets — how often do we keep X% of premium?**")
-                st.dataframe(calib_df[calib_df["Type"] == "Target"][["Threshold", "Hit Rate (%)"]], hide_index=True)
-            with col_s:
-                st.markdown("**Stops — how often does loss exceed X% of premium?**")
-                st.dataframe(calib_df[calib_df["Type"] == "Stop"][["Threshold", "Hit Rate (%)"]], hide_index=True)
-
-        st.markdown("---")
-        # ── Raw data ──────────────────────────────────────────────────────────
-        with st.expander("Raw per-expiry data"):
-            show_cols = ["expiry_date", "day_of_week", "atm_iv", "iv_rank", "pcr",
-                         "profit_1dte_pts", "profit_1dte_pct", "win_1dte", "vrp"]
-            st.dataframe(ea_df[show_cols].sort_values("expiry_date", ascending=False),
-                         hide_index=True, use_container_width=True)
-
-
-elif page == "Weekend Theta":
-    import plotly.express as px
-    import plotly.graph_objects as go
-
-    st.title("Weekend Theta Harvest")
-    st.caption(
-        "Sell ATM straddle Friday EOD → buy back Monday EOD. "
-        "Captures weekend time decay (Sat+Sun) with zero overnight market risk."
+            "Units": st.column_config.NumberColumn("Units held", min_value=0.0, format="%.3f"),
+            "Avg NAV": st.column_config.NumberColumn("Avg purchase NAV (₹)", min_value=0.0, format="%.2f"),
+        },
     )
 
-    with st.expander("How it works", expanded=False):
-        st.markdown("""
-**The insight**: Options price in 3 calendar days of theta decay over the weekend, but the market is
-closed Saturday and Sunday — no adverse moves can happen. By selling Friday evening and closing
-Monday evening, you capture this decay while holding through only **one trading session** of gap risk.
+    if st.checkbox("Save holdings with profile on next 'Save Profile'"):
+        st.session_state.mf_profile["holdings"] = _hedit.to_dict("records")
 
-**Typical decay**: 25–34% of the collected premium evaporates over the weekend.
+    if st.button("Analyse Portfolio", use_container_width=True):
+        _valid = _hedit[
+            _hedit["Fund"].notna() & (_hedit["Fund"] != "") &
+            (_hedit["Units"] > 0) & (_hedit["Avg NAV"] > 0)
+        ].copy()
 
-**Entry**: Friday 3:30 PM IST — sell ATM straddle, collect full premium.
-**Exit**: Monday 3:30 PM IST — buy back the same straddle for less premium.
-**Profit**: Entry premium − Exit premium.
+        if _valid.empty:
+            st.warning("Add at least one holding with units and avg NAV.")
+        else:
+            _valid["scheme_code"] = _valid["Fund"].map(_sch_map)
+            _hcodes = _valid["scheme_code"].dropna().astype(str).tolist()
+            _hsql   = ", ".join(f"'{c}'" for c in _hcodes)
 
-This works on *any* symbol that has a weekly or monthly Tuesday expiry:
-- **NIFTY**: every Friday (weekly expiry)
-- **BANKNIFTY**: last Friday before monthly expiry
-- **FINNIFTY**: last Friday before monthly expiry
+            _lat = query(f"""
+                SELECT n.scheme_code,
+                       argMax(n.nav, n.date) AS current_nav,
+                       any(s.scheme_category) AS category,
+                       any(e.return_1y)  AS ret1y,
+                       any(e.return_3y)  AS ret3y,
+                       any(e.return_5y)  AS ret5y
+                FROM market.mf_nav n
+                JOIN market.mf_schemes s ON n.scheme_code = s.scheme_code
+                LEFT JOIN (
+                    SELECT scheme_code, return_1y, return_3y, return_5y
+                    FROM market.mf_nav_enriched FINAL
+                    LIMIT 1 BY scheme_code
+                ) e ON n.scheme_code = e.scheme_code
+                WHERE n.scheme_code IN ({_hsql})
+                GROUP BY n.scheme_code
+            """)
 
-⚠️ Main risk: large Monday gap (>1%) can eat into the decay. The backtest shows even 1%+ gaps
-are absorbed by the premium — but extreme events (budget, RBI, global shock) can cause 2–3% gaps
-that turn the trade negative.
-        """)
+            if _lat.empty:
+                st.warning("Could not fetch current NAV for selected funds.")
+            else:
+                _valid["scheme_code"] = _valid["scheme_code"].astype(str)
+                _lat["scheme_code"]   = _lat["scheme_code"].astype(str)
+                _mg = _valid.merge(_lat, on="scheme_code", how="left")
+                _mg["current_nav"]    = pd.to_numeric(_mg["current_nav"], errors="coerce")
+                _mg["current_value"]  = _mg["Units"] * _mg["current_nav"]
+                _mg["invested_value"] = _mg["Units"] * _mg["Avg NAV"]
+                _mg["return_pct"]     = ((_mg["current_nav"] / _mg["Avg NAV"] - 1) * 100).round(2)
 
-    # ── Cross-symbol summary ──────────────────────────────────────────────────
-    st.subheader("Strategy Comparison Across Symbols")
+                _bench = query("""
+                    SELECT
+                        (argMax(close, date) -
+                         argMaxIf(close, date, date <= today() - INTERVAL 1 YEAR)) /
+                         nullIf(argMaxIf(close, date, date <= today() - INTERVAL 1 YEAR), 0)
+                         * 100 AS b1y,
+                        (argMax(close, date) -
+                         argMaxIf(close, date, date <= today() - INTERVAL 3 YEAR)) /
+                         nullIf(argMaxIf(close, date, date <= today() - INTERVAL 3 YEAR), 0)
+                         * 100 AS b3y
+                    FROM market.ohlcv_daily WHERE symbol = '^NSEI'
+                """)
+                _b1 = float(_bench.iloc[0]["b1y"]) if not _bench.empty else 0.0
+                _b3 = float(_bench.iloc[0]["b3y"]) if not _bench.empty else 0.0
 
-    lot_sizes = {"NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 40}
-    summary_rows = []
-    for sym in ["NIFTY", "BANKNIFTY", "FINNIFTY"]:
-        sdf = query(
-            "SELECT win_mon, profit_mon_pts, straddle_entry, weekend_decay_pts, gap_pct "
-            "FROM analysis.weekend_theta_trades FINAL "
-            f"WHERE symbol='{sym}' ORDER BY expiry_date"
-        )
-        if sdf.empty:
-            continue
-        wr   = sdf["win_mon"].mean() * 100
-        avg_p = sdf.loc[sdf["win_mon"]==1, "profit_mon_pts"].mean()
-        avg_l = sdf.loc[sdf["win_mon"]==0, "profit_mon_pts"].mean()
-        exp  = wr/100*(avg_p or 0) + (1-wr/100)*(avg_l if not pd.isna(avg_l) else 0)
-        lot  = lot_sizes.get(sym, 1)
-        summary_rows.append({
-            "Symbol":          sym,
-            "Triplets":        len(sdf),
-            "Win % (Mon exit)": f"{wr:.1f}%",
-            "Avg premium":     f"{sdf['straddle_entry'].mean():.0f} pts",
-            "Weekend decay":   f"{sdf['weekend_decay_pts'].mean():.0f} pts ({sdf['weekend_decay_pts'].mean()/sdf['straddle_entry'].mean()*100:.0f}%)",
-            "Expectancy (pts)": f"{exp:+.0f}",
-            f"Expectancy (₹)":  fmt_inr(exp * lot),
-            "Big gap (≥1%)":   f"{(sdf['gap_pct'].abs()>=1.0).mean()*100:.0f}% of Mon",
-        })
+                _mg["alpha_1y"] = (pd.to_numeric(_mg["ret1y"], errors="coerce") - _b1).round(2)
+                _mg["alpha_3y"] = (pd.to_numeric(_mg["ret3y"], errors="coerce") - _b3).round(2)
 
-    if summary_rows:
-        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+                _ti = _mg["invested_value"].sum()
+                _tc = _mg["current_value"].sum()
+                _tg = _tc - _ti
 
-    st.info(
-        "100% win rate for NIFTY and BANKNIFTY across all backtested weekends. "
-        "Weekend time decay consistently exceeds Monday gap risk. Exit on Monday — "
-        "do NOT hold to Tuesday expiry (win rate drops to 55–64%)."
-    )
+                _m1, _m2, _m3 = st.columns(3)
+                _m1.metric("Total Invested",  f"₹{_ti:,.0f}")
+                _m2.metric("Current Value",   f"₹{_tc:,.0f}")
+                _m3.metric("Gain / Loss",     f"₹{_tg:,.0f}",
+                           f"{_tg / _ti * 100:.1f}%" if _ti > 0 else "—")
 
-    st.markdown("---")
+                _sh = _mg[["Fund", "category", "Units", "Avg NAV",
+                            "current_nav", "current_value", "return_pct",
+                            "ret1y", "alpha_1y", "ret3y", "alpha_3y"]].rename(columns={
+                    "category": "Category", "current_nav": "Curr NAV",
+                    "current_value": "Value (₹)", "return_pct": "Return%",
+                    "ret1y": "1Y%", "alpha_1y": "Alpha 1Y",
+                    "ret3y": "3Y%", "alpha_3y": "Alpha 3Y",
+                })
+                st.dataframe(
+                    _sh.style.format({
+                        "Value (₹)": "₹{:,.0f}", "Return%": "{:.2f}",
+                        "1Y%": "{:.1f}", "Alpha 1Y": "{:.1f}",
+                        "3Y%": "{:.1f}", "Alpha 3Y": "{:.1f}",
+                    }, na_rep="—"),
+                    use_container_width=True, hide_index=True,
+                )
 
-    # ── Per-symbol detail ─────────────────────────────────────────────────────
-    sym_sel = st.selectbox("Drill into symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0)
-    lot = lot_sizes.get(sym_sel, 1)
+                # Rebalancing vs target allocation
+                st.markdown("**Rebalancing vs Target**")
+                _cg = (_mg.groupby("category")["current_value"]
+                          .sum().reset_index()
+                          .rename(columns={"category": "Category",
+                                           "current_value": "Current (₹)"}))
+                _cg["Current%"] = (_cg["Current (₹)"] / _tc * 100 if _tc > 0 else 0)
+                _tp = {k: v / sip * 100 for k, v in alloc.items()}
+                _cg["Target%"] = _cg["Category"].map(_tp).fillna(0)
+                _cg["Delta%"]  = _cg["Current%"] - _cg["Target%"]
 
-    wt_df = query(
-        "SELECT expiry_date, friday_date, monday_date, spot_friday, spot_monday, "
-        "       straddle_entry, straddle_mon_exit, profit_mon_pts, profit_mon_pct, win_mon, "
-        "       profit_exp_pts, profit_exp_pct, win_exp, "
-        "       gap_pct, gap_pts, weekend_decay_pts, iv_rank, atm_iv, pcr "
-        "FROM analysis.weekend_theta_trades FINAL "
-        f"WHERE symbol='{sym_sel}' ORDER BY expiry_date"
-    )
+                for _tc2, _tw2 in _tp.items():
+                    if _tc2 not in _cg["Category"].values:
+                        _cg = pd.concat([_cg, pd.DataFrame([{
+                            "Category": _tc2, "Current (₹)": 0,
+                            "Current%": 0.0, "Target%": _tw2, "Delta%": -_tw2,
+                        }])], ignore_index=True)
 
-    if wt_df.empty:
-        st.warning(f"No data for {sym_sel}. Run: docker compose run --rm weekend_theta_backtest --symbol {sym_sel}")
-    else:
-        n    = len(wt_df)
-        wr   = wt_df["win_mon"].mean() * 100
-        avg_decay = wt_df["weekend_decay_pts"].mean()
-        avg_entry = wt_df["straddle_entry"].mean()
-        wins = wt_df.loc[wt_df["win_mon"]==1, "profit_mon_pts"]
-        losses = wt_df.loc[wt_df["win_mon"]==0, "profit_mon_pts"]
-        avg_w = wins.mean() if not wins.empty else 0
-        avg_l = losses.mean() if not losses.empty else 0
-        exp  = wr/100*avg_w + (1-wr/100)*avg_l
+                _cg["Action"] = _cg["Delta%"].apply(
+                    lambda d: "🔴 REDUCE" if d > 5 else ("🟡 ADD" if d < -5 else "🟢 OK")
+                )
+                _rd = _cg[["Category", "Target%", "Current%", "Delta%", "Action"]].copy()
+                _rd["Target%"]  = _rd["Target%"].apply(lambda x: f"{x:.1f}%")
+                _rd["Current%"] = _rd["Current%"].apply(lambda x: f"{x:.1f}%")
+                _rd["Delta%"]   = _rd["Delta%"].apply(lambda x: f"{x:+.1f}%")
+                st.dataframe(_rd, use_container_width=True, hide_index=True)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Weekends backtested", n)
-        c2.metric("Win rate (Mon exit)", f"{wr:.1f}%")
-        c3.metric("Avg premium collected", f"{avg_entry:.0f} pts")
-        c4.metric("Avg weekend decay", f"{avg_decay:.0f} pts ({avg_decay/avg_entry*100:.0f}%)")
-        c5.metric(f"Expectancy (₹, {lot} lot)", fmt_inr(exp * lot))
-
-        st.markdown("---")
-
-        # ── Decay per weekend scatter ──────────────────────────────────────────
-        wt_df["expiry_str"] = wt_df["expiry_date"].astype(str)
-        wt_df["color"]      = wt_df["win_mon"].map({1: "Win", 0: "Loss"})
-
-        fig_scatter = px.scatter(
-            wt_df, x="expiry_str", y="profit_mon_pts",
-            color="color",
-            color_discrete_map={"Win": "#1a7a3a", "Loss": "#7a2a2a"},
-            size=wt_df["straddle_entry"].clip(upper=wt_df["straddle_entry"].quantile(0.95)),
-            labels={"expiry_str": "Expiry (next Tuesday)", "profit_mon_pts": "Profit Mon exit (pts)"},
-            title=f"{sym_sel} — Profit per Weekend (size = premium collected)",
-            hover_data=["straddle_entry", "gap_pct", "weekend_decay_pts"],
-        )
-        fig_scatter.add_hline(y=0, line_dash="dash", line_color="gray")
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-        # ── Cumulative P&L ────────────────────────────────────────────────────
-        wt_sorted = wt_df.sort_values("expiry_date").copy()
-        wt_sorted["cum_pnl_mon"] = wt_sorted["profit_mon_pts"].cumsum()
-        wt_sorted["cum_pnl_exp"] = wt_sorted["profit_exp_pts"].cumsum()
-
-        fig_cum = go.Figure()
-        fig_cum.add_trace(go.Scatter(
-            x=wt_sorted["expiry_str"], y=wt_sorted["cum_pnl_mon"],
-            name="Exit Monday (recommended)",
-            line=dict(color="#1a7a3a", width=2),
-        ))
-        fig_cum.add_trace(go.Scatter(
-            x=wt_sorted["expiry_str"], y=wt_sorted["cum_pnl_exp"],
-            name="Hold to Expiry",
-            line=dict(color="#4a9aff", width=2, dash="dot"),
-        ))
-        fig_cum.add_hline(y=0, line_dash="dash", line_color="gray")
-        fig_cum.update_layout(
-            title=f"{sym_sel} — Cumulative Weekend Theta P&L",
-            xaxis_title="Expiry cycle", yaxis_title="Points",
-        )
-        st.plotly_chart(fig_cum, use_container_width=True)
-
-        st.markdown("---")
-
-        # ── Gap risk breakdown ─────────────────────────────────────────────────
-        st.subheader("Monday Gap Risk")
-        col_g1, col_g2 = st.columns(2)
-
-        with col_g1:
-            gap_bins = pd.cut(
-                wt_df["gap_pct"],
-                bins=[-10, -1, -0.5, 0.5, 1, 10],
-                labels=["Gap Down >1%", "Down 0.5-1%", "Flat ±0.5%", "Up 0.5-1%", "Gap Up >1%"]
-            )
-            gap_grp = wt_df.groupby(gap_bins, observed=True).agg(
-                N=("win_mon", "count"),
-                WinPct=("win_mon", lambda x: x.mean() * 100),
-                AvgProfit=("profit_mon_pts", "mean"),
-            ).reset_index()
-            gap_grp.columns = ["Gap Bucket", "N", "Win %", "Avg Profit (pts)"]
-            gap_grp["Win %"] = gap_grp["Win %"].round(1)
-            gap_grp["Avg Profit (pts)"] = gap_grp["Avg Profit (pts)"].round(1)
-            st.markdown("**Win rate by Monday gap size**")
-            st.dataframe(gap_grp, hide_index=True, use_container_width=True)
-
-        with col_g2:
-            fig_gap = px.histogram(
-                wt_df, x="gap_pct", nbins=20,
-                color="color",
-                color_discrete_map={"Win": "#1a7a3a", "Loss": "#7a2a2a"},
-                labels={"gap_pct": "Monday gap (%)", "count": "Weekends"},
-                title="Distribution of Monday Gaps",
-            )
-            fig_gap.add_vline(x=0, line_dash="dash", line_color="gray")
-            st.plotly_chart(fig_gap, use_container_width=True)
-
-        st.markdown("---")
-
-        # ── Raw table ─────────────────────────────────────────────────────────
-        with st.expander("Raw per-weekend data"):
-            show = wt_df[[
-                "friday_date", "monday_date", "expiry_date",
-                "straddle_entry", "straddle_mon_exit",
-                "profit_mon_pts", "profit_mon_pct", "win_mon",
-                "profit_exp_pts", "win_exp",
-                "gap_pct", "weekend_decay_pts", "iv_rank", "pcr",
-            ]].sort_values("friday_date", ascending=False)
-            st.dataframe(show, hide_index=True, use_container_width=True)
-
-
-# ── Auto-refresh ──────────────────────────────────────────────────────────────
-time.sleep(60)
-st.rerun()
+                _p1, _p2 = st.columns(2)
+                with _p1:
+                    _fcp = px.pie(_cg, names="Category", values="Current (₹)",
+                                  title="Current Allocation")
+                    st.plotly_chart(_fcp, use_container_width=True)
+                with _p2:
+                    _ftp = px.pie(alloc_df, names="Category", values="Amount (₹)",
+                                  title="Target Allocation")
+                    st.plotly_chart(_ftp, use_container_width=True)

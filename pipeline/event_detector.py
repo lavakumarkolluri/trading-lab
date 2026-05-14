@@ -35,27 +35,16 @@ Usage:
 
 import os
 import sys
-import logging
 import argparse
 import threading
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
-import clickhouse_connect
 
-# ── Logging ────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
-
-# ── Config ─────────────────────────────────────────────
-CH_HOST = os.getenv("CH_HOST", "clickhouse")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASS = os.getenv("CH_PASSWORD", "")
+from ch_utils import ch_client as get_ch_client
+from logging_utils import get_logger
+log = get_logger(__name__)
 
 EVENT_THRESHOLD_PCT = 2.0    # minimum |pct_change| to qualify as an event
 GAP_OPEN_PCT        = 1.005  # multiplier: open >= prev_close * 1.005 = gap up
@@ -72,13 +61,6 @@ results = {
 }
 results_lock = threading.Lock()
 
-
-# ── ClickHouse client ──────────────────────────────────
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT,
-        username=CH_USER, password=CH_PASS
-    )
 
 
 # ══════════════════════════════════════════════════════

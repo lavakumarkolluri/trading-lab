@@ -3,3 +3,5 @@ plotly
 pandas
 clickhouse-connect
 numpy
+cryptography
+docker

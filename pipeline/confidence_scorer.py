@@ -25,7 +25,6 @@ Usage:
 
 import io
 import json
-import logging
 import os
 import pickle
 import argparse
@@ -34,8 +33,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import clickhouse_connect
-from minio import Minio
 from minio.error import S3Error
 import xgboost as xgb
 from sklearn.linear_model import LogisticRegression
@@ -43,35 +40,18 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, accuracy_score
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
-
-GIT_SHA = os.getenv("GIT_SHA", "unknown")
+from ch_utils import ch_client, minio_client, GIT_SHA
+from logging_utils import get_logger
+from pipeline_utils import record_run as _record_run_helper
+log = get_logger(__name__, fmt="%(asctime)s %(levelname)s %(message)s")
 
 
 def _record_run(ch, status: str, started_at: datetime, error_msg: str = ""):
-    try:
-        ch.command(
-            """INSERT INTO system_meta.pipeline_runs
-               (service, started_at, finished_at, status, git_sha, error_msg)
-               VALUES ({svc:String},{start:DateTime},{end:DateTime},{st:String},{sha:String},{err:String})""",
-            parameters={"svc": "confidence_scorer", "start": started_at,
-                        "end": datetime.utcnow(), "st": status,
-                        "sha": GIT_SHA, "err": error_msg},
-        )
-    except Exception as e:
-        log.warning("pipeline_runs write failed: %s", e)
+    _record_run_helper(ch, "confidence_scorer", status, started_at, error_msg)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CH_HOST   = os.getenv("CH_HOST", "clickhouse")
-CH_PORT   = int(os.getenv("CH_PORT", "8123"))
-CH_USER   = os.getenv("CH_USER", "default")
-CH_PASS   = os.getenv("CH_PASSWORD", "")
-MINIO_HOST = os.getenv("MINIO_HOST", "minio:9000")
-MINIO_USER = os.getenv("MINIO_USER", "admin")
-MINIO_PASS = os.getenv("MINIO_PASSWORD", "")
 MINIO_BUCKET = "trading-data"
 MODELS_PREFIX = "models/confidence_scorer"
 
@@ -105,12 +85,10 @@ MIN_TRAIN    = 25
 # ── Connections ───────────────────────────────────────────────────────────────
 
 def get_ch():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER, password=CH_PASS
-    )
+    return ch_client()
 
 def get_mc():
-    return Minio(MINIO_HOST, access_key=MINIO_USER, secret_key=MINIO_PASS, secure=False)
+    return minio_client()
 
 
 # ── Model abstraction ─────────────────────────────────────────────────────────
@@ -384,6 +362,9 @@ def load_options_chain(ch, symbol: str) -> pd.DataFrame:
 # ── Feature Extraction ────────────────────────────────────────────────────────
 
 def find_atm_strike(ce: pd.Series, pe: pd.Series) -> Optional[float]:
+    # Deduplicate strikes (keep max LTP per strike to handle multi-expiry rows)
+    ce = ce.groupby(level=0).max()
+    pe = pe.groupby(level=0).max()
     common = ce.index.intersection(pe.index)
     common = common[(ce.loc[common] > 0.5) & (pe.loc[common] > 0.5)]
     if len(common) < 2:
@@ -397,10 +378,10 @@ def extract_chain_features(chain, snap_date, expiry) -> Optional[dict]:
     if snap.empty:
         return None
 
-    ce = snap[snap.option_type == "CE"].set_index("strike")["ltp"]
-    pe = snap[snap.option_type == "PE"].set_index("strike")["ltp"]
-    ce_oi = snap[snap.option_type == "CE"].set_index("strike")["oi"]
-    pe_oi = snap[snap.option_type == "PE"].set_index("strike")["oi"]
+    ce    = snap[snap.option_type == "CE"].set_index("strike")["ltp"].groupby(level=0).last()
+    pe    = snap[snap.option_type == "PE"].set_index("strike")["ltp"].groupby(level=0).last()
+    ce_oi = snap[snap.option_type == "CE"].set_index("strike")["oi"].groupby(level=0).last()
+    pe_oi = snap[snap.option_type == "PE"].set_index("strike")["oi"].groupby(level=0).last()
 
     atm = find_atm_strike(ce, pe)
     if atm is None:
@@ -877,12 +858,24 @@ def score_today(ch, mc, symbol: str) -> None:
         log.warning(f"[{symbol}] could not extract chain features for {next_expiry}")
         return
 
+    # Fall back to nearest available EOD date for IV/POI/VIX features when
+    # today's intraday snap has no corresponding EOD summary yet
+    def _nearest_eod(index, snap):
+        if snap in index:
+            return snap
+        past = [d for d in index if d <= snap]
+        return past[-1] if past else snap
+
+    eod_snap = _nearest_eod(eod.index, latest_snap)
+    poi_snap = _nearest_eod(poi.index, latest_snap)
+    vix_snap = _nearest_eod(vix.index, latest_snap)
+
     row = {}
     row.update(chain_feats)
-    row.update(extract_eod_features(eod, latest_snap))
-    row.update(extract_poi_features(poi, latest_snap))
+    row.update(extract_eod_features(eod, eod_snap))
+    row.update(extract_poi_features(poi, poi_snap))
     row.update(temporal_features(next_expiry))
-    row["vix"] = float(vix.loc[latest_snap, "vix"]) if latest_snap in vix.index else 0.0
+    row["vix"] = float(vix.loc[vix_snap, "vix"]) if vix_snap in vix.index else 0.0
     if not tech.empty:
         row.update(_tech_row(tech, latest_snap, eod))
     row.update(extract_event_features(event_dates, latest_snap, next_expiry))
