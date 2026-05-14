@@ -345,6 +345,11 @@ def job_confidence_scorer_daily():
     _run("confidence_scorer", "--score-only")
 
 
+def job_signal_agent():
+    log.info("=== Signal Agent: explaining today's confidence scores ===")
+    _run("signal_agent")
+
+
 def job_strategy_selector_recommend():
     log.info("=== Strategy selector daily recommendation triggered ===")
     _run("strategy_selector", "--recommend")
@@ -829,6 +834,11 @@ def main():
     # Uses existing model; ensures intraday_monitor has fresh scores each morning
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("13:00").do(job_confidence_scorer_daily)
+
+    # Signal Agent: explain today's confidence scores at 13:10 UTC (18:40 IST)
+    # Runs 10 min after scorer so scores are written before report is generated
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("13:10").do(job_signal_agent)
 
     # Graduation gate: after daily scorer at 13:05 UTC (18:35 IST)
     # Updates analysis.strategy_graduation so dashboard shows current stage
