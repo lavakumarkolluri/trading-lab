@@ -229,6 +229,39 @@ def test_min_train_at_least_60():
 
 # ── CRIT-002: Walk-forward split must use entry_date, not expiry_dt ──────────
 
+# ── CRIT-003: load_eod_summary must filter by symbol ─────────────────────────
+
+def test_load_eod_summary_filters_by_symbol():
+    """load_eod_summary must pass symbol to the query so BANKNIFTY doesn't get NIFTY data."""
+    from unittest.mock import MagicMock, patch
+    ch = MagicMock()
+    ch.query.return_value.result_rows = []
+
+    with patch.object(cs, "_has_symbol_col_eod", return_value=True):
+        cs.load_eod_summary(ch, "BANKNIFTY")
+
+    call_sql = ch.query.call_args[0][0]
+    assert "symbol" in call_sql.lower(), "Query must filter by symbol column"
+    params = ch.query.call_args[1].get("parameters", {}) or ch.query.call_args[0][1] if len(ch.query.call_args[0]) > 1 else {}
+    # Accept either positional or keyword parameters
+    call_kwargs = ch.query.call_args
+    all_args = str(call_kwargs)
+    assert "BANKNIFTY" in all_args, "BANKNIFTY symbol must be passed to the query"
+
+
+def test_load_eod_summary_legacy_no_symbol_col():
+    """When symbol column doesn't exist (pre-migration), query must not include WHERE symbol."""
+    from unittest.mock import MagicMock, patch
+    ch = MagicMock()
+    ch.query.return_value.result_rows = []
+
+    with patch.object(cs, "_has_symbol_col_eod", return_value=False):
+        cs.load_eod_summary(ch, "BANKNIFTY")
+
+    call_sql = ch.query.call_args[0][0]
+    assert "WHERE symbol" not in call_sql, "Legacy path must not filter by symbol"
+
+
 def test_walk_forward_no_future_leak():
     """Rows whose entry_date is before fold_start must not appear in test set.
 

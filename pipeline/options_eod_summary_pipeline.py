@@ -37,7 +37,7 @@ from ch_utils import ch_client as get_ch
 from logging_utils import get_logger
 log = get_logger(__name__)
 
-SYMBOLS = ["NIFTY"]   # options_eod_summary is NIFTY-centric (nifty_spot col, no symbol col)
+SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]   # CRIT-003: all symbols
 
 
 def fetch_already_computed(ch) -> set:
@@ -183,6 +183,7 @@ def process_date(ch, symbol: str, d: date) -> dict | None:
     atm_pe_iv = float(df_exp[(df_exp["strike"] == atm) & (df_exp["option_type"] == "PE")]["iv"].sum())
 
     return {
+        "symbol":         symbol,
         "date":           d,
         "expiry":         expiry,
         "nifty_spot":     spot,
@@ -201,11 +202,12 @@ def process_date(ch, symbol: str, d: date) -> dict | None:
 
 def insert_rows(ch, rows: list[dict]):
     df = pd.DataFrame(rows)
-    ch.insert_df("market.options_eod_summary", df[[
-        "date", "expiry", "nifty_spot", "total_ce_oi", "total_pe_oi",
-        "pcr", "max_pain_strike", "atm_strike", "atm_ce_iv", "atm_pe_iv",
-        "iv_rank", "iv_percentile", "version",
-    ]])
+    cols = ["date", "expiry", "nifty_spot", "total_ce_oi", "total_pe_oi",
+            "pcr", "max_pain_strike", "atm_strike", "atm_ce_iv", "atm_pe_iv",
+            "iv_rank", "iv_percentile", "version"]
+    if _has_symbol_col(ch):
+        cols = ["symbol"] + cols
+    ch.insert_df("market.options_eod_summary", df[cols])
 
 
 def main():
@@ -238,12 +240,19 @@ def main():
         log.info(f"=== Processing {symbol} from {from_date} ===")
         dates = fetch_dates(ch, symbol, from_date)
 
-        # Skip already computed dates
-        done = ch.query(
-            "SELECT DISTINCT date FROM market.options_eod_summary FINAL "
-            "WHERE date >= {fd:Date}",
-            parameters={"fd": from_date},
-        ).result_rows
+        # Skip already computed (date, symbol) pairs
+        if _has_symbol_col(ch):
+            done = ch.query(
+                "SELECT DISTINCT date FROM market.options_eod_summary FINAL "
+                "WHERE symbol={sym:String} AND date >= {fd:Date}",
+                parameters={"sym": symbol, "fd": from_date},
+            ).result_rows
+        else:
+            done = ch.query(
+                "SELECT DISTINCT date FROM market.options_eod_summary FINAL "
+                "WHERE date >= {fd:Date}",
+                parameters={"fd": from_date},
+            ).result_rows
         done_dates = {r[0] for r in done}
         dates = [d for d in dates if d not in done_dates]
 

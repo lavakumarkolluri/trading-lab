@@ -308,13 +308,28 @@ def compute_tech_signals(ohlcv: pd.DataFrame) -> pd.DataFrame:
     }, index=cl.index)
 
 
-def load_eod_summary(ch) -> pd.DataFrame:
-    r = ch.query("""
-        SELECT date, iv_rank, iv_percentile, atm_ce_iv, atm_pe_iv, iv_skew,
-               pcr, nifty_spot, ce_wall_strike, pe_wall_strike
-        FROM market.options_eod_summary FINAL
-        ORDER BY date
-    """)
+def _has_symbol_col_eod(ch) -> bool:
+    try:
+        cols = [r[0] for r in ch.query("DESCRIBE market.options_eod_summary").result_rows]
+        return "symbol" in cols
+    except Exception:
+        return False
+
+
+def load_eod_summary(ch, symbol: str = "NIFTY") -> pd.DataFrame:
+    """Load EOD summary for a specific symbol. Falls back to unfiltered for legacy schema."""
+    cols_sql = ("date, iv_rank, iv_percentile, atm_ce_iv, atm_pe_iv, iv_skew, "
+                "pcr, nifty_spot, ce_wall_strike, pe_wall_strike")
+    if _has_symbol_col_eod(ch):
+        r = ch.query(
+            f"SELECT {cols_sql} FROM market.options_eod_summary FINAL "
+            "WHERE symbol = {sym:String} ORDER BY date",
+            parameters={"sym": symbol},
+        )
+    else:
+        r = ch.query(
+            f"SELECT {cols_sql} FROM market.options_eod_summary FINAL ORDER BY date"
+        )
     df = pd.DataFrame(r.result_rows, columns=[
         "date", "iv_rank", "iv_percentile", "atm_ce_iv", "atm_pe_iv", "iv_skew",
         "pcr_eod", "nifty_spot", "ce_wall_strike", "pe_wall_strike"
@@ -498,7 +513,7 @@ def _tech_row(tech, snap_date, eod) -> dict:
 def build_dataset(ch, symbol: str) -> pd.DataFrame:
     log.info(f"[{symbol}] loading data…")
     chain       = load_options_chain(ch, symbol)
-    eod         = load_eod_summary(ch)
+    eod         = load_eod_summary(ch, symbol)
     poi         = load_participant_oi(ch)
     vix         = load_vix(ch)
     event_dates = load_events(ch)
@@ -851,7 +866,7 @@ def score_today(ch, mc, symbol: str) -> None:
     feat_cols  = meta.get("features", FEATURE_COLS)
 
     chain       = load_options_chain(ch, symbol)
-    eod         = load_eod_summary(ch)
+    eod         = load_eod_summary(ch, symbol)
     poi         = load_participant_oi(ch)
     vix         = load_vix(ch)
     event_dates = load_events(ch)
