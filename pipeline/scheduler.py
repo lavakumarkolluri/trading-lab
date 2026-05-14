@@ -26,6 +26,7 @@ Docker:
 import os
 import logging
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -655,14 +656,26 @@ def _assess_clickhouse_system_tables():
         _log_cleanup("clickhouse_system_tables", "error", detail=str(e))
 
 
+def _run_background(service: str, *args: str):
+    """Start a long-running intraday service in a daemon thread.
+
+    _run() calls subprocess.run() (blocking). Intraday services run for 6+ hours,
+    which would freeze the scheduler loop if called directly. Running in a daemon
+    thread keeps schedule.run_pending() firing every 30 s.
+    """
+    t = threading.Thread(target=_run, args=(service,) + args, daemon=True, name=service)
+    t.start()
+    log.info("Started %s in background thread %s", service, t.name)
+
+
 def job_option_chain_intraday():
     log.info("=== Option chain intraday scraper triggered ===")
-    _run("option_chain_intraday")
+    _run_background("option_chain_intraday")
 
 
 def job_intraday_monitor():
     log.info("=== Intraday straddle monitor triggered ===")
-    _run("intraday_monitor")
+    _run_background("intraday_monitor")
 
 
 def job_option_chain_eod():
