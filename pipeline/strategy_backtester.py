@@ -2,7 +2,7 @@
 """
 strategy_backtester.py — Defined-risk option selling strategy backtester
 
-Strategies: Iron Condor, Bull Put Spread, Bear Call Spread
+Strategies: Iron Fly, Iron Condor, Bull Put Spread, Bear Call Spread
 All positions are hedged — no naked legs.
 
 For each symbol × expiry × strategy variant (short_n, wing_m):
@@ -46,6 +46,14 @@ def _record_run(ch, status: str, started_at: datetime, error_msg: str = ""):
 SYMBOLS     = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 SHORT_N_MAX = 4   # max steps from ATM for short leg
 WING_M_MAX  = 4   # max wing width in steps
+
+# Iron fly: fixed wing distance per symbol (short_n=0, sell exactly at ATM)
+IRON_FLY_WINGS = {
+    "NIFTY":      4,   # 4 × 50pt = 200pt wings
+    "BANKNIFTY":  5,   # 5 × 100pt = 500pt wings
+    "FINNIFTY":   4,   # 4 × 50pt = 200pt wings
+    "MIDCPNIFTY": 8,   # 8 × 25pt = 200pt wings
+}
 
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -261,6 +269,56 @@ def compute_bear_call(idx, entry_date, expiry, atm,
     )
 
 
+def compute_iron_fly(idx, entry_date, expiry, atm,
+                     step, symbol) -> Optional[dict]:
+    """
+    Iron Fly: sell ATM CE + sell ATM PE (straddle),
+              buy  (atm + wing_m*step) CE + buy (atm - wing_m*step) PE (wings).
+
+    Uses fixed wing distance per symbol (IRON_FLY_WINGS).
+    short_n=0 (sell at ATM), wing_m=symbol-specific step count.
+    """
+    wing_m = IRON_FLY_WINGS.get(symbol, 4)
+
+    sce = get_ltp(idx, entry_date, expiry, atm, "CE")          # sell ATM CE
+    spe = get_ltp(idx, entry_date, expiry, atm, "PE")          # sell ATM PE
+    lce = get_ltp(idx, entry_date, expiry, atm + wing_m * step, "CE")  # buy OTM CE
+    lpe = get_ltp(idx, entry_date, expiry, atm - wing_m * step, "PE")  # buy OTM PE
+    if any(p is None for p in [sce, spe, lce, lpe]):
+        return None
+    if any(p < 0.05 for p in [sce, spe, lce, lpe]):
+        return None
+
+    net_credit = (sce + spe) - (lce + lpe)
+    if net_credit <= 0:
+        return None
+    max_loss = wing_m * step - net_credit
+
+    xsce = get_ltp(idx, expiry, expiry, atm, "CE")
+    xspe = get_ltp(idx, expiry, expiry, atm, "PE")
+    xlce = get_ltp(idx, expiry, expiry, atm + wing_m * step, "CE")
+    xlpe = get_ltp(idx, expiry, expiry, atm - wing_m * step, "PE")
+    if any(v is None for v in (xsce, xspe, xlce, xlpe)):
+        return None
+    exit_cost = (xsce + xspe) - (xlce + xlpe)
+    pnl = max(net_credit - exit_cost, -max_loss) if max_loss > 0 else net_credit - exit_cost
+
+    return dict(
+        strategy="iron_fly", short_n=0, wing_m=wing_m,
+        short_ce_strike=atm, short_pe_strike=atm,
+        long_ce_strike=atm + wing_m * step,
+        long_pe_strike=atm - wing_m * step,
+        short_ce_entry=sce, short_pe_entry=spe,
+        long_ce_entry=lce, long_pe_entry=lpe,
+        short_ce_settle=xsce, short_pe_settle=xspe,
+        long_ce_settle=xlce, long_pe_settle=xlpe,
+        net_credit=net_credit, max_loss=max_loss,
+        exit_cost=exit_cost, pnl_pts=pnl,
+        pnl_pct=pnl / (wing_m * step) * 100,
+        target=int(pnl > 0),
+    )
+
+
 # ── Main Processing ───────────────────────────────────────────────────────────
 
 def process_symbol(ch, symbol: str, from_date: Optional[date] = None) -> pd.DataFrame:
@@ -295,6 +353,11 @@ def process_symbol(ch, symbol: str, from_date: Optional[date] = None) -> pd.Data
         step = detect_strike_step(chain, symbol, expiry)
         base = dict(symbol=symbol, expiry=expiry, entry_date=entry_date,
                     atm_strike=atm, strike_step=step)
+
+        # Iron fly: single fixed configuration per expiry (short_n=0, ATM straddle)
+        r = compute_iron_fly(idx, entry_date, expiry, atm, step, symbol)
+        if r:
+            rows.append({**base, **r})
 
         # Hedged strategies only — no naked positions
         for sn in range(1, SHORT_N_MAX + 1):

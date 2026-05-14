@@ -514,24 +514,29 @@ if page == "System Health":
     # ── Confidence Scores ─────────────────────────────────────────────────────
     st.subheader("🧠 Confidence Scores")
     scores_df = query("""
-        SELECT symbol, score_date, confidence, expected_pnl_pct, features_json
+        SELECT symbol, score_date, confidence, expected_pnl_pct, features_json,
+               ifNull(strategy_type, 'iron_fly') AS strategy_type
         FROM analysis.confidence_scores FINAL
         WHERE score_date >= today() - 7
-        ORDER BY symbol, score_date DESC
+        ORDER BY symbol, strategy_type, score_date DESC
     """)
 
     if scores_df.empty:
         st.error("No confidence scores in the last 7 days. Run: confidence_scorer --score-only")
     else:
         scores_df["score_date"] = pd.to_datetime(scores_df["score_date"]).dt.date
-        latest_scores = scores_df.groupby("symbol").first().reset_index()
+        # Get best strategy per symbol (highest confidence in last 7 days)
+        latest_best = (scores_df
+                       .sort_values("confidence", ascending=False)
+                       .groupby("symbol").first().reset_index())
 
         score_rows = []
         for sym in SYMBOLS:
-            row = latest_scores[latest_scores["symbol"] == sym]
+            row = latest_best[latest_best["symbol"] == sym]
             if row.empty:
                 score_rows.append({
-                    "🎯 Symbol": sym, "📊 Confidence": "—", "🚦 Gate": "🔴 NO-GO",
+                    "🎯 Symbol": sym, "🎲 Strategy": "—",
+                    "📊 Confidence": "—", "🚦 Gate": "🔴 NO-GO",
                     "📈 Exp P&L": "—", "📅 Score Date": "—",
                     "🔬 IV Rank": "—", "🌡️ VIX": "—", "📉 PCR": "—",
                     "⚠️ Missing": "no score",
@@ -548,6 +553,7 @@ if page == "System Health":
                 miss = missing_features(str(r.get("features_json", "") or ""))
                 score_rows.append({
                     "🎯 Symbol":   sym,
+                    "🎲 Strategy": str(r.get("strategy_type", "iron_fly")).replace("_", " "),
                     "📊 Confidence": f"{conf:.0f}/100",
                     "🚦 Gate":     "🟢 GO" if conf >= MIN_CONFIDENCE else "🔴 NO-GO",
                     "📈 Exp P&L":  f"{float(r.get('expected_pnl_pct', 0)):+.1f}%",
@@ -558,6 +564,19 @@ if page == "System Health":
                     "⚠️ Missing":  ", ".join(miss) if miss else "—",
                 })
         st.dataframe(pd.DataFrame(score_rows), use_container_width=True, hide_index=True)
+
+        # Per-strategy breakdown (expandable)
+        with st.expander("Per-strategy breakdown (all 4 strategies)", expanded=False):
+            all_strat_rows = []
+            for _, r in scores_df.sort_values(["symbol","confidence"], ascending=[True,False]).iterrows():
+                all_strat_rows.append({
+                    "Symbol": r["symbol"],
+                    "Strategy": str(r.get("strategy_type", "—")).replace("_", " "),
+                    "Confidence": f"{float(r['confidence']):.0f}/100",
+                    "Gate": "🟢" if float(r["confidence"]) >= MIN_CONFIDENCE else "🔴",
+                    "Score Date": str(r["score_date"]),
+                })
+            st.dataframe(pd.DataFrame(all_strat_rows), use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -982,10 +1001,11 @@ elif page == "Model":
 
     scores_df = query("""
         SELECT symbol, score_date, next_expiry,
-               confidence, expected_pnl_pct, features_json
+               confidence, expected_pnl_pct, features_json,
+               ifNull(strategy_type, 'iron_fly') AS strategy_type
         FROM analysis.confidence_scores FINAL
         WHERE score_date >= today() - 3
-        ORDER BY symbol, score_date DESC, version DESC
+        ORDER BY symbol, confidence DESC, score_date DESC
     """)
 
     vix_df = query("""
@@ -1019,18 +1039,24 @@ elif page == "Model":
                 st.error(f"**{sym}**\nNo score")
                 continue
 
+            # Best strategy = highest confidence (scores_df already sorted by confidence DESC)
             row = sym_scores.iloc[0]
             conf = float(row["confidence"])
             expiry = str(row["next_expiry"])[:10]
             exp_pnl_pct = float(row["expected_pnl_pct"])
             feats_json = row["features_json"] if row["features_json"] else ""
             miss = missing_features(feats_json)
+            selected_strategy = str(row.get("strategy_type", "iron_fly")).replace("_", " ")
 
             signal_ok  = conf >= MIN_CONFIDENCE
             card_color = "🟢" if signal_ok else "🔴"
 
             # Graduation model: prominent headline, detail below
             st.markdown(f"### {card_color} {sym}")
+
+            # Selected strategy badge
+            strat_emoji = {"iron fly": "🦅", "iron condor": "🦅", "bull put": "📈", "bear call": "📉"}
+            st.caption(f"{strat_emoji.get(selected_strategy, '🎲')} **{selected_strategy.upper()}**")
 
             # Confidence gauge (simple colored metric)
             conf_level = ("HIGH" if conf >= 70 else "MED" if conf >= MIN_CONFIDENCE else "LOW")
@@ -1088,6 +1114,27 @@ elif page == "Model":
                 st.success("✅ All features present", icon=None)
 
             st.caption(f"Expiry: {expiry}")
+
+    # ── Multi-strategy comparison table ──────────────────────────────────────
+    if not scores_df.empty and "strategy_type" in scores_df.columns:
+        strategies_present = scores_df["strategy_type"].dropna().unique()
+        if len(strategies_present) > 1:
+            st.subheader("Strategy Confidence Breakdown")
+            st.caption("All 4 strategy models scored for today. The highest-confidence strategy is selected.")
+            pivot_rows = []
+            for sym in SYMBOLS:
+                sym_s = scores_df[scores_df["symbol"] == sym]
+                if sym_s.empty:
+                    continue
+                row_data = {"Symbol": sym}
+                for _, sr in sym_s.iterrows():
+                    strat = str(sr.get("strategy_type", "iron_fly")).replace("_", " ")
+                    conf = float(sr["confidence"])
+                    gate = "🟢" if conf >= MIN_CONFIDENCE else "🔴"
+                    row_data[strat] = f"{gate} {conf:.0f}"
+                pivot_rows.append(row_data)
+            if pivot_rows:
+                st.dataframe(pd.DataFrame(pivot_rows), use_container_width=True, hide_index=True)
 
     st.divider()
 

@@ -472,6 +472,31 @@ def get_scorecard_confidence(ch, symbol: str) -> float:
         return 50.0
 
 
+def get_selected_strategy(ch, symbol: str) -> tuple[str, float]:
+    """Return (strategy_type, confidence) for the ML-selected strategy.
+    Picks the strategy with highest confidence from the last 7 days.
+    Falls back to ('iron_fly', 50.0) if no multi-strategy scores exist yet.
+    """
+    try:
+        r = ch.query("""
+            SELECT strategy_type, confidence
+            FROM analysis.confidence_scores FINAL
+            WHERE symbol = {sym:String}
+              AND score_date >= today() - 7
+              AND strategy_type != ''
+            ORDER BY confidence DESC
+            LIMIT 1
+        """, parameters={"sym": symbol})
+        if r.result_rows:
+            strat, conf = r.result_rows[0]
+            return str(strat), float(conf)
+    except Exception:
+        pass
+    # Fallback: single confidence score, assume iron_fly
+    conf = get_scorecard_confidence(ch, symbol)
+    return "iron_fly", conf
+
+
 _CRITICAL_SCORE_FEATURES = ["iv_rank", "atm_ce_iv", "vix"]
 
 def get_score_features_json(ch, symbol: str) -> dict:
@@ -834,7 +859,7 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
         log.info(f"[{symbol}] premium {snap['straddle']:.1f} < 2× stop {stop_pts*2:.1f} — skip")
         return
 
-    scorecard_conf = get_scorecard_confidence(ch, symbol)
+    selected_strategy, scorecard_conf = get_selected_strategy(ch, symbol)
     if scorecard_conf < MIN_CONFIDENCE:
         log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} < {MIN_CONFIDENCE:.0f} — skip (low confidence)")
         return
@@ -847,7 +872,13 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
                     "score may be unreliable; skipping entry")
         return
 
-    log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} — ENTERING")
+    log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} strategy={selected_strategy} — ENTERING")
+    if selected_strategy != "iron_fly":
+        # Other strategies (iron_condor, bull_put, bear_call) share the same
+        # wing/entry logic for paper trading — full per-strategy order dispatch
+        # is Phase 2 after live graduation. Log and proceed with iron_fly structure.
+        log.info(f"[{symbol}] strategy={selected_strategy} selected but paper-trading as iron_fly "
+                 "(live dispatch Phase 2)")
     record_entry(ch, symbol, snap, lot_size, scorecard_conf, dry_run, kite_mgr)
 
 

@@ -188,3 +188,93 @@ def test_bull_put_pnl_winning():
     assert r["net_credit"] == pytest.approx(50.0)   # 80 - 30
     assert r["pnl_pts"] > 0
     assert r["target"] == 1
+
+
+# ── compute_iron_fly P&L formula ──────────────────────────────────────────────
+
+def _if_prices(entry, expiry, atm=24000, step=50, wing_m=4,
+               sce=120.0, spe=110.0, lce=30.0, lpe=25.0,
+               xsce=0.5, xspe=0.5, xlce=0.05, xlpe=0.05):
+    """Return price dict for an iron fly with known values."""
+    return {
+        (entry, expiry, float(atm), "CE"): sce,
+        (entry, expiry, float(atm), "PE"): spe,
+        (entry, expiry, float(atm + wing_m * step), "CE"): lce,
+        (entry, expiry, float(atm - wing_m * step), "PE"): lpe,
+        (expiry, expiry, float(atm), "CE"): xsce,
+        (expiry, expiry, float(atm), "PE"): xspe,
+        (expiry, expiry, float(atm + wing_m * step), "CE"): xlce,
+        (expiry, expiry, float(atm - wing_m * step), "PE"): xlpe,
+    }
+
+
+def test_iron_fly_net_credit():
+    """net_credit = (sell_ATM_CE + sell_ATM_PE) - (buy_wing_CE + buy_wing_PE)."""
+    entry  = date(2025, 5, 6)
+    expiry = date(2025, 5, 13)
+    idx = _make_idx(_if_prices(entry, expiry, sce=120.0, spe=110.0, lce=30.0, lpe=25.0))
+    r = bt.compute_iron_fly(idx, entry, expiry, 24000, 50, "NIFTY")
+    assert r is not None
+    assert r["net_credit"] == pytest.approx(175.0)   # (120+110) - (30+25)
+    assert r["strategy"] == "iron_fly"
+    assert r["short_n"] == 0
+
+
+def test_iron_fly_pnl_winning_trade():
+    """Both ATM options settle near-zero → keep net_credit → pnl > 0, target=1."""
+    entry  = date(2025, 5, 6)
+    expiry = date(2025, 5, 13)
+    idx = _make_idx(_if_prices(entry, expiry))
+    r = bt.compute_iron_fly(idx, entry, expiry, 24000, 50, "NIFTY")
+    assert r is not None
+    assert r["pnl_pts"] > 0
+    assert r["target"] == 1
+
+
+def test_iron_fly_pnl_with_loss():
+    """Market moves far: ATM CE settles deep ITM → exit_cost > net_credit → loss."""
+    entry  = date(2025, 5, 6)
+    expiry = date(2025, 5, 13)
+    # net_credit = (120+110)-(30+25) = 175; wing = 4*50 = 200; max_loss = 25
+    # Settlement: ATM CE=350 (deep ITM), ATM PE≈0, wing CE=150, wing PE≈0
+    # exit_cost = (350+0.5)-(150+0.05) = 200.45 → pnl = 175-200.45 = -25.45 → capped at -25
+    prices = _if_prices(entry, expiry, xsce=350.0, xspe=0.5, xlce=150.0, xlpe=0.05)
+    idx = _make_idx(prices)
+    r = bt.compute_iron_fly(idx, entry, expiry, 24000, 50, "NIFTY")
+    assert r is not None
+    assert r["pnl_pts"] < 0
+    assert r["target"] == 0
+    assert r["pnl_pts"] >= -r["max_loss"] - 0.01   # capped at max_loss
+
+
+def test_iron_fly_returns_none_when_debit():
+    """Wings cost more than short straddle → net_credit ≤ 0 → skip."""
+    entry  = date(2025, 5, 6)
+    expiry = date(2025, 5, 13)
+    prices = _if_prices(entry, expiry, sce=10.0, spe=10.0, lce=50.0, lpe=50.0)
+    idx = _make_idx(prices)
+    r = bt.compute_iron_fly(idx, entry, expiry, 24000, 50, "NIFTY")
+    assert r is None
+
+
+def test_iron_fly_returns_none_on_missing_leg():
+    """Missing settlement price for any leg → return None."""
+    entry  = date(2025, 5, 6)
+    expiry = date(2025, 5, 13)
+    prices = _if_prices(entry, expiry)
+    del prices[(expiry, expiry, 24200.0, "CE")]   # remove wing CE settlement
+    idx = _make_idx(prices)
+    r = bt.compute_iron_fly(idx, entry, expiry, 24000, 50, "NIFTY")
+    assert r is None
+
+
+def test_iron_fly_wing_m_from_symbol():
+    """NIFTY uses wing_m=4 (4×50=200pt wings); result reflects that."""
+    entry  = date(2025, 5, 6)
+    expiry = date(2025, 5, 13)
+    idx = _make_idx(_if_prices(entry, expiry))
+    r = bt.compute_iron_fly(idx, entry, expiry, 24000, 50, "NIFTY")
+    assert r is not None
+    assert r["wing_m"] == 4
+    assert r["long_ce_strike"] == pytest.approx(24200.0)
+    assert r["long_pe_strike"] == pytest.approx(23800.0)

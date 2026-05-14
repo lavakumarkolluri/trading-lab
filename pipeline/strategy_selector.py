@@ -13,11 +13,11 @@ Modes
 Expiry schedule (NSE weekly options)
 -------------------------------------
   Monday    → MIDCPNIFTY
-  Tuesday   → FINNIFTY
+  Tuesday   → NIFTY, FINNIFTY
   Wednesday → BANKNIFTY
-  Thursday  → NIFTY
 
-Only the symbol whose expiry falls on/after today is recommended on a given day.
+Only the symbol(s) whose expiry falls on/after today is recommended on a given day.
+Strategy is selected by the highest-confidence ML model across all 4 strategies.
 """
 
 import argparse
@@ -60,13 +60,17 @@ SCORE_W_ALIGNMENT  = 20   # PCR + iv_skew agreement on direction
 VIX_SWEET_LO       = 14.0
 VIX_SWEET_HI       = 22.0
 
-# Weekday → symbol mapping (0=Mon … 6=Sun)
-WEEKDAY_SYMBOL = {
-    0: "MIDCPNIFTY",
-    1: "FINNIFTY",
-    2: "BANKNIFTY",
-    3: "NIFTY",
+# Weekday → symbol(s) mapping (0=Mon … 6=Sun). Tuesday has two expiries.
+WEEKDAY_SYMBOLS: dict[int, list[str]] = {
+    0: ["MIDCPNIFTY"],
+    1: ["NIFTY", "FINNIFTY"],  # both expire Tuesday
+    2: ["BANKNIFTY"],
 }
+# Keep legacy dict for backward-compat (used internally only)
+WEEKDAY_SYMBOL = {0: "MIDCPNIFTY", 1: "NIFTY", 2: "BANKNIFTY"}
+
+# Minimum ML confidence for any strategy to be tradeable
+ML_CONFIDENCE_THRESHOLD = 60.0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -193,6 +197,52 @@ def get_confidence(ch, score_date: date, symbol: str):
     pcr_bias = feats.get("pcr_oi", 1.0)
     iv_skew  = feats.get("iv_skew", 0.0)
     return conf, pcr_bias, iv_skew, expiry
+
+
+def get_all_strategy_scores(ch, score_date: date, symbol: str) -> list[tuple]:
+    """Load ML confidence scores for all 4 strategies for this symbol/date.
+    Returns list of (strategy_type, confidence, next_expiry) sorted by confidence DESC.
+    Falls back up to 7 days to handle weekend scoring runs.
+    """
+    rows = ch.query(
+        "SELECT strategy_type, confidence, next_expiry "
+        "FROM analysis.confidence_scores FINAL "
+        "WHERE score_date >= {d:Date} - INTERVAL 7 DAY "
+        "  AND score_date <= {d:Date} "
+        "  AND symbol = {sym:String} "
+        "  AND strategy_type != '' "
+        "ORDER BY score_date DESC, strategy_type",
+        parameters={"d": score_date, "sym": symbol},
+    ).result_rows
+    if not rows:
+        return []
+    # Pick latest score per strategy (in case multiple dates returned)
+    seen = {}
+    for strat, conf, expiry in rows:
+        if strat not in seen:
+            seen[strat] = (strat, float(conf), expiry)
+    return sorted(seen.values(), key=lambda x: x[1], reverse=True)
+
+
+def select_strategy_by_ml(ch, score_date: date, symbol: str,
+                           min_confidence: float = ML_CONFIDENCE_THRESHOLD):
+    """Pick the strategy with highest ML confidence above threshold.
+    Returns (strategy, confidence, next_expiry) or None if all below threshold.
+    """
+    scores = get_all_strategy_scores(ch, score_date, symbol)
+    if not scores:
+        return None
+    strategy, confidence, expiry = scores[0]
+    if confidence < min_confidence:
+        log.info("[%s] best ML strategy %s confidence %.1f < %.1f — no trade",
+                 symbol, strategy, confidence, min_confidence)
+        return None
+    log.info("[%s] ML strategy selected: %s (confidence=%.1f) from %d strategies scored",
+             symbol, strategy, confidence, len(scores))
+    for s, c, _ in scores:
+        log.info("  [%s]  %-15s  confidence=%.1f%s",
+                 symbol, s, c, "  ← selected" if s == strategy else "")
+    return strategy, confidence, expiry
 
 
 def pick_strategy(confidence: float, pcr_bias: float, iv_skew: float,
@@ -492,29 +542,27 @@ def is_trading_holiday(ch, d: date) -> bool:
     return len(rows) > 0
 
 
-def run_recommend(ch):
-    today = date.today()
-    weekday = today.weekday()
-
-    if weekday not in WEEKDAY_SYMBOL:
-        log.info("No expiry today (weekday=%d). Nothing to recommend.", weekday)
-        return
-
-    if is_trading_holiday(ch, today):
-        log.info("Today %s is a trading holiday — no recommendation.", today)
-        return
-
-    symbol = WEEKDAY_SYMBOL[weekday]
+def _recommend_symbol(ch, symbol: str, today: date):
+    """Run recommendation logic for a single symbol. Called from run_recommend()."""
     log.info("Recommending for %s expiry on %s", symbol, today)
 
-    result = get_confidence(ch, today, symbol)
-    if result is None:
-        log.warning("No confidence score for %s on %s — skipping", symbol, today)
-        return
+    # Prefer ML-based strategy selection over rule-based pick_strategy()
+    ml_result = select_strategy_by_ml(ch, today, symbol)
+    if ml_result is not None:
+        strategy, confidence, expiry = ml_result
+        # Still load pcr_bias/iv_skew for composite score calculation
+        legacy = get_confidence(ch, today, symbol)
+        pcr_bias = legacy[1] if legacy else 1.0
+        iv_skew  = legacy[2] if legacy else 0.0
+    else:
+        # Fall back to legacy rule-based strategy selection
+        result = get_confidence(ch, today, symbol)
+        if result is None:
+            log.warning("No confidence score for %s on %s — skipping", symbol, today)
+            return
+        confidence, pcr_bias, iv_skew, expiry = result
+        strategy = None   # determined below after VIX check
 
-    confidence, pcr_bias, iv_skew, expiry = result
-
-    # Fetch chain snapshot date early — needed for VIX and EOD signals
     snap_date = get_latest_chain_snapshot(ch, symbol, expiry)
     vix = get_vix(ch, snap_date) if snap_date else None
     signals = get_eod_signals(ch, expiry, snap_date) if snap_date else {}
@@ -523,7 +571,6 @@ def run_recommend(ch):
     term_slope = vol_signals["term_slope"]
     skew_2pct  = vol_signals["skew_2pct"]
 
-    # Phase 2: composite trade_score gate
     trade_score, score_breakdown = compute_trade_score(
         confidence, vix, iv_rank, pcr_bias, iv_skew, term_slope=term_slope
     )
@@ -542,21 +589,22 @@ def run_recommend(ch):
                  trade_score, TRADE_SCORE_THRESHOLD, symbol)
         return
 
-    # Hard VIX gate still applies (catches extreme regimes regardless of score)
     if vix is not None and (vix < VIX_MIN or vix > VIX_MAX):
         log.info("VIX %.2f outside [%.1f, %.1f] — no trade for %s",
                  vix, VIX_MIN, VIX_MAX, symbol)
         return
 
-    strategy = pick_strategy(confidence, pcr_bias, iv_skew, skew_from_surface=skew_2pct)
-    log.info("Signal: pcr=%.2f iv_skew=%.2f skew_2pct=%.3f → strategy=%s",
-             pcr_bias, iv_skew, skew_2pct, strategy)
-    params   = get_optimal_params(ch, symbol, strategy)
+    if strategy is None:
+        strategy = pick_strategy(confidence, pcr_bias, iv_skew, skew_from_surface=skew_2pct)
+        log.info("Rule-based signal: pcr=%.2f iv_skew=%.2f skew_2pct=%.3f → strategy=%s",
+                 pcr_bias, iv_skew, skew_2pct, strategy)
+
+    params = get_optimal_params(ch, symbol, strategy)
     if params is None:
         log.warning("No optimal params for %s/%s — skipping", symbol, strategy)
         return
 
-    iv_rank_mult = 0.5 + iv_rank / 100.0   # 0.5x at iv_rank=0, 1.5x at iv_rank=100
+    iv_rank_mult = 0.5 + iv_rank / 100.0
     log.info("iv_rank=%.1f → lot_mult=%.2f | max_pain=%.0f | CE_wall=%.0f | PE_wall=%.0f",
              iv_rank, iv_rank_mult,
              signals.get("max_pain_strike", 0), signals.get("ce_wall_strike", 0),
@@ -569,7 +617,6 @@ def run_recommend(ch):
     base_lots   = int(risk_budget / (max_loss * lot_size)) if max_loss > 0 else 1
     lots        = max(1, int(base_lots * iv_rank_mult))
 
-    # Drawdown cap: max loss per trade ≤ avg winning trade P&L
     avg_win = get_avg_win_pnl(ch)
     if avg_win and max_loss > 0:
         cap_lots = max(1, int(avg_win / (max_loss * lot_size)))
@@ -593,6 +640,8 @@ def run_recommend(ch):
         log.warning("Could not price legs for %s/%s — skipping", symbol, expiry)
         return
 
+    # Overwrite strategy with ML-selected value (build_recommendation uses pick_strategy internally)
+    rec["strategy"] = strategy
     insert_recommendation(ch, rec)
     log.info(
         "Recommendation: %s %s | strategy=%s sn=%d wm=%d | "
@@ -600,6 +649,25 @@ def run_recommend(ch):
         symbol, expiry, strategy, params["short_n"], params["wing_m"],
         rec["net_credit"], rec["max_loss"], lots, trade_score, confidence,
     )
+
+
+def run_recommend(ch):
+    today = date.today()
+    weekday = today.weekday()
+
+    if weekday not in WEEKDAY_SYMBOLS:
+        log.info("No expiry today (weekday=%d). Nothing to recommend.", weekday)
+        return
+
+    if is_trading_holiday(ch, today):
+        log.info("Today %s is a trading holiday — no recommendation.", today)
+        return
+
+    for symbol in WEEKDAY_SYMBOLS[weekday]:
+        try:
+            _recommend_symbol(ch, symbol, today)
+        except Exception as e:
+            log.error("Recommendation failed for %s: %s", symbol, e, exc_info=True)
 
 
 def run_backtest(ch):
