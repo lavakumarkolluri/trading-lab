@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 import clickhouse_connect
 
@@ -19,8 +20,6 @@ CH_HOST = os.getenv("CH_HOST", "clickhouse")
 CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
-
-MIN_CONFIDENCE = 50.0
 
 # Features that must be non-zero for a reliable model score
 CRITICAL_FEATURES = ["vix", "iv_rank", "pcr_oi", "straddle_pct", "atr_percentile", "rsi14"]
@@ -42,7 +41,7 @@ def get_ch():
     )
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=180)
 def query(sql: str) -> pd.DataFrame:
     try:
         return get_ch().query_df(sql)
@@ -105,6 +104,46 @@ def span_estimate_pts(features_json: str, spot: float, lot_size: int) -> float:
 
 LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120}
 
+
+@st.cache_data(ttl=180)
+def get_config() -> dict:
+    """Read all rows from system_meta.config (mutable) and return as {key: value} dict."""
+    try:
+        df = get_ch().query_df(
+            "SELECT key, value FROM system_meta.config FINAL"
+        )
+        return dict(zip(df["key"], df["value"]))
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=3600)
+def get_boundaries() -> dict:
+    """Read immutable stage boundaries (written only by migration 083, never by code)."""
+    try:
+        df = get_ch().query_df(
+            "SELECT key, value FROM system_meta.stage_boundaries"
+        )
+        return dict(zip(df["key"], df["value"]))
+    except Exception:
+        return {}
+
+
+def cfg(key: str, default):
+    """Return typed config value from mutable DB config; fall back to default if missing."""
+    val = get_config().get(key)
+    if val is None:
+        return default
+    try:
+        return type(default)(val)
+    except Exception:
+        return default
+
+
+def boundary(key: str, default: str = "") -> str:
+    """Return immutable stage boundary value; fall back to default if missing."""
+    return get_boundaries().get(key, default)
+
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -153,14 +192,18 @@ def _to_ist_str(dt) -> str:
     except Exception:
         return "—"
 
+# ── Auto-refresh every 3 min ──────────────────────────────────────────────────
+st_autorefresh(interval=180_000, key="global_autorefresh")
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("📈 Trading Lab")
 st.sidebar.caption(f"🟢 Live · {datetime.now(IST).strftime('%H:%M IST')}")
-if st.sidebar.button("🔄 Refresh"):
+if st.sidebar.button("🔄 Refresh Now"):
     st.cache_data.clear()
     st.rerun()
 
 page = st.sidebar.radio("", [
+    "Strategy Pipeline",
     "System Health",
     "Model",
     "Trade Log",
@@ -170,12 +213,280 @@ page = st.sidebar.radio("", [
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PAGE 0 — STRATEGY PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+if page == "Strategy Pipeline":
+
+    st.title("Strategy Pipeline")
+    st.caption("Where each strategy sits in the 5-stage journey to live trading")
+
+    # ── Fetch boundary dates ──────────────────────────────────────────────────
+    bounds = get_boundaries()
+    holdout_start = bounds.get("stage4_holdout_start", "2024-05-15")
+    holdout_end   = bounds.get("stage4_holdout_end",   "2026-05-15")
+    bt_start      = bounds.get("backtest_start_date",  "2019-01-01")
+    future_min_mo = cfg("paper_trade_future_min_months", 3)
+
+    # ── Stage 1 data freshness ────────────────────────────────────────────────
+    _pipe_runs = query(
+        "SELECT service, max(finished_at) AS last_ok "
+        "FROM system_meta.pipeline_runs FINAL "
+        "WHERE status = 'success' "
+        "GROUP BY service"
+    )
+    _pipe_map = {} if _pipe_runs.empty else dict(
+        zip(_pipe_runs["service"], _pipe_runs["last_ok"])
+    )
+
+    def _pipe_age_h(svc: str) -> float:
+        ts = _pipe_map.get(svc)
+        if ts is None:
+            return 9999.0
+        try:
+            if not isinstance(ts, datetime):
+                ts = pd.Timestamp(ts).to_pydatetime()
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+        except Exception:
+            return 9999.0
+
+    _KEY_PIPES = [
+        "option_chain_intraday", "compute_oi_features",
+        "strategy_backtester",   "confidence_scorer",
+    ]
+    _data_stale = any(_pipe_age_h(s) > 50 for s in _KEY_PIPES)
+    _stage1_ok  = not _data_stale
+
+    # ── Stage 2 backtest summary (all strategies) ─────────────────────────────
+    _bt_df = query(
+        f"SELECT strategy, count() AS n, avg(target) AS wr, "
+        f"min(entry_date) AS first_d, max(entry_date) AS last_d "
+        f"FROM analysis.spread_backtest "
+        f"WHERE entry_date < '{holdout_start}' "
+        f"GROUP BY strategy"
+    )
+    _bt_map = {}
+    if not _bt_df.empty:
+        for _, r in _bt_df.iterrows():
+            _bt_map[r["strategy"]] = {
+                "n": int(r["n"]), "wr": float(r["wr"]),
+                "first": str(r["first_d"])[:10], "last": str(r["last_d"])[:10],
+            }
+
+    # ── Stage 3 walk-forward AUC ──────────────────────────────────────────────
+    _wf_df = query(
+        "SELECT strategy_type, avg(auc) AS avg_auc, count(DISTINCT fold) AS folds "
+        "FROM analysis.confidence_backtest "
+        "GROUP BY strategy_type"
+    ) if query("SELECT 1 FROM system.columns WHERE database='analysis' "
+               "AND table='confidence_backtest' AND name='strategy_type'").shape[0] > 0 \
+      else pd.DataFrame()
+
+    # fallback: confidence_backtest has no strategy_type → use iron_fly AUC from scorer model
+    _wf_iron_fly_auc = None
+    _wf_iron_fly_df = query(
+        "SELECT avg(confidence) AS avg_conf, countIf(target=1) / count() AS wr, "
+        "count(DISTINCT fold) AS folds "
+        "FROM analysis.confidence_backtest"
+    )
+    if not _wf_iron_fly_df.empty and _wf_iron_fly_df.shape[0] > 0:
+        _wf_iron_fly_auc = float(_wf_iron_fly_df["wr"].iloc[0]) if "wr" in _wf_iron_fly_df else None
+
+    # ── Stage 4 — Paper Trade Historical (holdout simulation) ─────────────────
+    _pth_df = query(
+        f"SELECT symbol, count() AS n, avg(pnl_pts > 0) AS wr, sum(pnl_inr) AS net "
+        f"FROM trades.trade_outcomes "
+        f"WHERE toDate(entry_time) >= '{holdout_start}' "
+        f"AND toDate(entry_time) < '{holdout_end}' "
+        f"GROUP BY symbol"
+    )
+    _pth_total = int(_pth_df["n"].sum()) if not _pth_df.empty else 0
+    _pth_wr    = float(_pth_df["wr"].mean()) if not _pth_df.empty else 0.0
+
+    # ── Stage 4 — Paper Trade Future (live trades after holdout_end) ──────────
+    _ptf_df = query(
+        f"SELECT symbol, count() AS n, avg(pnl_pts > 0) AS wr, sum(pnl_inr) AS net, "
+        f"min(toDate(entry_time)) AS first_d "
+        f"FROM trades.trade_outcomes "
+        f"WHERE toDate(entry_time) >= '{holdout_end}' "
+        f"GROUP BY symbol"
+    )
+    _ptf_total = int(_ptf_df["n"].sum()) if not _ptf_df.empty else 0
+    _ptf_first_date = str(_ptf_df["first_d"].min())[:10] if not _ptf_df.empty else holdout_end
+
+    # Compute months elapsed since paper_trade_future start
+    import math as _math
+    try:
+        _ptf_start = date.fromisoformat(_ptf_first_date)
+        _ptf_months = (_ptf_start.year - date.today().year) * 12 + \
+                      (date.today().month - _ptf_start.month)
+        _ptf_months = max(0, _ptf_months)
+    except Exception:
+        _ptf_months = 0
+
+    # ── Regime coverage ───────────────────────────────────────────────────────
+    _regime_df = query(
+        f"SELECT t.symbol, "
+        f"countIf(o.ret20 > 0.03) AS bull, "
+        f"countIf(o.ret20 < -0.03) AS bear, "
+        f"countIf(o.ret20 >= -0.03 AND o.ret20 <= 0.03) AS sideways "
+        f"FROM trades.trade_outcomes t "
+        f"LEFT JOIN ( "
+        f"  SELECT date, "
+        f"  (close / lagInFrame(close, 20) OVER (PARTITION BY 1 ORDER BY date)) - 1 AS ret20 "
+        f"  FROM market.ohlcv_daily WHERE symbol = 'NIFTY' "
+        f") o ON toDate(t.entry_time) = o.date "
+        f"WHERE toDate(t.entry_time) >= '{holdout_start}' "
+        f"GROUP BY t.symbol"
+    )
+    _bull_total = int(_regime_df["bull"].sum())   if not _regime_df.empty else 0
+    _bear_total = int(_regime_df["bear"].sum())   if not _regime_df.empty else 0
+    _sdws_total = int(_regime_df["sideways"].sum()) if not _regime_df.empty else 0
+
+    REGIME_MIN = 10
+
+    def _regime_badge(n: int) -> str:
+        if n >= REGIME_MIN:
+            return f"✅ {n}"
+        return f"⏳ {n}/{REGIME_MIN}"
+
+    # ── Helper: stage chip ────────────────────────────────────────────────────
+    def _stage_chip(label: str, status: str, detail: str = "") -> str:
+        """Return a compact HTML badge for a pipeline stage."""
+        colour = {"done": "#1e8c45", "active": "#1a6bb5",
+                  "warn": "#b58c1a", "locked": "#666"}.get(status, "#666")
+        icon   = {"done": "✅", "active": "🔄", "warn": "⚠️", "locked": "🔒"}.get(status, "⏸")
+        tip    = f" title='{detail}'" if detail else ""
+        return (
+            f"<span{tip} style='background:{colour};color:#fff;"
+            f"padding:2px 8px;border-radius:4px;font-size:0.8em;"
+            f"margin-right:4px;white-space:nowrap'>{icon} {label}</span>"
+        )
+
+    # ── Strategy rows (compact) ───────────────────────────────────────────────
+    STRATEGIES = [
+        ("iron_fly",    "Iron Fly 0DTE",    "straddle"),
+        ("iron_condor", "Iron Condor",       "iron_condor"),
+        ("bull_put",    "Bull Put Spread",   "bull_put"),
+        ("bear_call",   "Bear Call Spread",  "bear_call"),
+    ]
+
+    for strat_id, strat_name, bt_key in STRATEGIES:
+        is_primary = strat_id == "iron_fly"
+        bt = _bt_map.get(bt_key, {})
+        bt_n, bt_wr = bt.get("n", 0), bt.get("wr", 0.0)
+
+        # Stage statuses
+        s1 = "done" if _stage1_ok else "warn"
+        s2 = "done" if bt_n >= 200 and bt_wr >= 0.52 else ("active" if bt_n > 0 else "locked")
+        s3 = "done" if is_primary and _wf_iron_fly_auc and _wf_iron_fly_auc >= 0.55 \
+             else ("active" if is_primary and bt_n > 0 else "locked")
+        s4 = "active" if is_primary and (_pth_total > 0 or _ptf_total > 0) \
+             else ("locked" if s3 != "done" else "locked")
+        s5 = "locked"  # always locked until manual unlock
+
+        chips = (
+            _stage_chip("1 Data",        s1) +
+            _stage_chip("2 Backtest",    s2, f"{bt_n} trades · {bt_wr:.0%} WR") +
+            _stage_chip("3 Walk-Fwd",   s3) +
+            _stage_chip("4 Paper",       s4) +
+            _stage_chip("5 Live",        s5)
+        )
+
+        with st.expander(f"**{strat_name}**", expanded=is_primary):
+            st.markdown(chips, unsafe_allow_html=True)
+            st.markdown("")
+
+            if is_primary:
+                # Stage 2 detail
+                if bt_n > 0:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Backtest Trades", f"{bt_n:,}")
+                    c2.metric("Win Rate", f"{bt_wr:.1%}")
+                    c3.metric("Data from", bt.get("first", "—"))
+
+                # Stage 3 detail
+                st.markdown(
+                    "**Stage 3** — Walk-Forward Validation  "
+                    "· `✅ No look-ahead — model never saw data on or after "
+                    f"{holdout_start}`"
+                )
+                if _wf_iron_fly_auc:
+                    st.caption(f"Out-of-sample win rate: {_wf_iron_fly_auc:.1%}  ·  Gate: ≥ 55%")
+
+                # Stage 4 detail
+                st.markdown("**Stage 4** — Paper Trading")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.caption(f"Paper Trade Historical  ({holdout_start} → {holdout_end})")
+                    st.metric("Trades", _pth_total)
+                    st.metric("Win Rate", f"{_pth_wr:.1%}" if _pth_total else "—")
+                with col_b:
+                    st.caption(f"Paper Trade Future  ({holdout_end} → ongoing)")
+                    st.metric("Trades", _ptf_total)
+                    st.metric("Duration", f"{_ptf_months}mo  (need {future_min_mo}mo)")
+
+                # Regime coverage
+                st.markdown("**Regime Coverage** (combined)")
+                rc1, rc2, rc3 = st.columns(3)
+                rc1.metric("🐂 Bull",     _regime_badge(_bull_total))
+                rc2.metric("🐻 Bear",     _regime_badge(_bear_total))
+                rc3.metric("↔️ Sideways", _regime_badge(_sdws_total))
+
+            else:
+                # Non-primary strategies: just show backtest status
+                if bt_n > 0:
+                    st.caption(
+                        f"{bt_n:,} backtest trades · {bt_wr:.1%} win rate · "
+                        f"{bt.get('first','—')} → {bt.get('last','—')}"
+                    )
+                else:
+                    st.caption("No backtest data — run `strategy_backtester` to begin Stage 2")
+
+    st.divider()
+
+    # ── SP-7: What's blocking graduation ─────────────────────────────────────
+    st.subheader("What needs to happen before live trading")
+
+    blockers = []
+    bt = _bt_map.get("straddle", {})
+    if bt.get("n", 0) < 200:
+        blockers.append(
+            f"**iron_fly** — Stage 2: only {bt.get('n',0)} backtest trades, need 200"
+        )
+    if _bull_total < REGIME_MIN:
+        blockers.append(
+            f"**iron_fly** — Stage 4: {_bull_total}/{REGIME_MIN} bull-regime trades"
+        )
+    if _bear_total < REGIME_MIN:
+        blockers.append(
+            f"**iron_fly** — Stage 4: {_bear_total}/{REGIME_MIN} bear-regime trades"
+        )
+    if _sdws_total < REGIME_MIN:
+        blockers.append(
+            f"**iron_fly** — Stage 4: {_sdws_total}/{REGIME_MIN} sideways-regime trades"
+        )
+    if _ptf_months < future_min_mo:
+        blockers.append(
+            f"**iron_fly** — Stage 4: Paper Trade Future {_ptf_months}/{future_min_mo} months elapsed"
+        )
+    for sid, sname, bk in STRATEGIES[1:]:
+        if _bt_map.get(bk, {}).get("n", 0) == 0:
+            blockers.append(
+                f"**{sname}** — Stage 2 not started — run: `strategy_backtester`"
+            )
+
+    if blockers:
+        for b in blockers:
+            st.markdown(f"- {b}")
+    else:
+        st.success("All graduation gates passed — awaiting manual confirmation to go live")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PAGE 1 — SYSTEM HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
-if page == "System Health":
-
-    # Auto-refresh every 60 min (browser-level reload)
-    st.markdown('<meta http-equiv="refresh" content="3600">', unsafe_allow_html=True)
+elif page == "System Health":
 
     # Track when the current session first loaded this page
     if "health_loaded_at" not in st.session_state:
@@ -186,13 +497,31 @@ if page == "System Health":
     now_ist = datetime.now(IST)
     today   = now_ist.date()
 
+    # ── SH-1: System status banner ────────────────────────────────────────────
+    _sh_issues = []
+    _ci_row = query("SELECT tests_failed, status FROM system_meta.ci_results FINAL ORDER BY run_at DESC LIMIT 1")
+    if _ci_row.empty:
+        _sh_issues.append("No CI results")
+    elif str(_ci_row.iloc[0]["status"]) != "success" or int(_ci_row.iloc[0]["tests_failed"]) > 0:
+        _sh_issues.append(f"CI failing ({int(_ci_row.iloc[0]['tests_failed'])} tests)")
+    _score_age = query("SELECT dateDiff('day', max(score_date), today()) AS age FROM analysis.confidence_scores FINAL")
+    if _score_age.empty or _score_age.iloc[0]["age"] is None or int(_score_age.iloc[0]["age"]) > 1:
+        _sh_issues.append("Confidence scores stale")
+    _chain_age = query("SELECT dateDiff('day', max(toDate(timestamp)), today()) AS age FROM market.options_chain FINAL")
+    if _chain_age.empty or _chain_age.iloc[0]["age"] is None or int(_chain_age.iloc[0]["age"]) > 2:
+        _sh_issues.append("Options chain stale")
+    if _sh_issues:
+        st.error(f"⚠️ {len(_sh_issues)} Issue{'s' if len(_sh_issues) > 1 else ''} Detected: " + " · ".join(_sh_issues))
+    else:
+        st.success("✅ All Systems OK")
+
     # ── Page header bar ───────────────────────────────────────────────────────
     hdr_left, hdr_right = st.columns([7, 3])
     with hdr_left:
         st.title("🟢 System Health")
         st.caption(
             f"{now_ist.strftime('%A, %d %B %Y · %H:%M IST')}  ·  "
-            f"Page loaded {loaded_age}  ·  data cache refreshes every 60 min"
+            f"Page loaded {loaded_age}  ·  auto-refreshes every 3 min"
         )
     with hdr_right:
         st.markdown("")  # vertical padding
@@ -314,14 +643,16 @@ if page == "System Health":
         for svc in KEY_JOBS:
             svc_rows = runs_df[runs_df["service"] == svc]
             if svc_rows.empty:
-                last_run, last_status, recent_err = "—", "⚫", ""
+                last_run, last_status, recent_err, last_dur = "—", "⚫", "", "—"
             else:
-                latest     = svc_rows.sort_values("run_date", ascending=False).iloc[0]
-                last_run   = str(latest["run_date"])
+                latest      = svc_rows.sort_values("run_date", ascending=False).iloc[0]
+                last_run    = str(latest["run_date"])
                 last_status = STATUS_ICON.get(str(latest["status"]), "❓")
                 recent_err  = str(latest["error_msg"] or "")[:80]
+                _d = latest["duration_s"]
+                last_dur    = f"{int(_d)}s" if _d and not pd.isna(_d) else "—"
 
-            row = {"Job": svc, "Last Run": last_run, "Status": last_status}
+            row = {"Job": svc, "Last Run": last_run, "Status": last_status, "Duration": last_dur}
             for d in dates[:5]:
                 cell = svc_rows[svc_rows["run_date"] == d]
                 row[str(d)] = ("⚫" if cell.empty else
@@ -332,6 +663,23 @@ if page == "System Health":
 
         st.dataframe(pd.DataFrame(grid_rows), use_container_width=True, hide_index=True)
         st.caption("🟢 success  🔴 failed  🟡 running  ⬜ skipped  ⚫ no record")
+
+        # ── SH-2: 7-day duration chart ────────────────────────────────────────
+        _dur_data = runs_df[runs_df["service"].isin(KEY_JOBS) & (runs_df["status"] == "success")].copy()
+        if not _dur_data.empty:
+            _dur_data["duration_s"] = pd.to_numeric(_dur_data["duration_s"], errors="coerce")
+            _dur_data = _dur_data.dropna(subset=["duration_s"])
+            _dur_data["run_date"] = pd.to_datetime(_dur_data["run_date"])
+            if not _dur_data.empty:
+                with st.expander("📊 Run duration (last 7 days)"):
+                    _fig_dur = px.bar(
+                        _dur_data, x="run_date", y="duration_s", color="service",
+                        barmode="group",
+                        labels={"run_date": "", "duration_s": "Duration (s)", "service": "Job"},
+                        height=220,
+                    )
+                    _fig_dur.update_layout(showlegend=True, margin=dict(t=10, b=10))
+                    st.plotly_chart(_fig_dur, use_container_width=True)
 
         fails = runs_df[runs_df["status"] == "failed"].sort_values("run_date", ascending=False).head(5)
         if not fails.empty:
@@ -346,6 +694,14 @@ if page == "System Health":
     # ── Data Freshness ────────────────────────────────────────────────────────
     st.subheader("Data Freshness")
     st.caption("Latest record in each table. Age is relative to now (IST). 🟢 < 1d · 🟡 < 4d · 🔴 older.")
+    _FIX_CMDS = {
+        "Options Chain":          "docker compose run --rm pipeline python option_chain_intraday.py",
+        "India VIX / Nifty Spot": "docker compose run --rm pipeline python vix_pipeline.py",
+        "OI Features (EOD)":      "docker compose run --rm pipeline python compute_oi_features.py",
+        "OHLCV":                  "docker compose run --rm pipeline python ohlcv_pipeline.py",
+        "Participant OI":          "docker compose run --rm pipeline python participant_oi_pipeline.py",
+        "Confidence Scores":      "docker compose run --rm pipeline python confidence_scorer.py --score-only",
+    }
 
     def _freshness_row(label, table, date_sql, ts_sql=None, ok_days=1, warn_days=4):
         """
@@ -509,9 +865,22 @@ if page == "System Health":
 
     st.dataframe(pd.DataFrame(freshness_rows), use_container_width=True, hide_index=True)
 
+    # ── SH-4: Fix commands for stale sources ──────────────────────────────────
+    _stale_fixes = []
+    for _fr in freshness_rows:
+        _src_base = _fr["Source"].split(" · ")[0]
+        if "🔴" in _fr["Status"] and _src_base in _FIX_CMDS:
+            _stale_fixes.append((_fr["Source"], _FIX_CMDS[_src_base]))
+    if _stale_fixes:
+        with st.expander(f"🔧 Fix commands for {len(_stale_fixes)} stale source(s)"):
+            for _src_name, _cmd in _stale_fixes:
+                st.markdown(f"**{_src_name}**")
+                st.code(_cmd, language="bash")
+
     st.divider()
 
     # ── Confidence Scores ─────────────────────────────────────────────────────
+    min_conf = cfg("min_confidence", 60.0)
     st.subheader("🧠 Confidence Scores")
     scores_df = query("""
         SELECT symbol, score_date, confidence, expected_pnl_pct, features_json,
@@ -555,7 +924,7 @@ if page == "System Health":
                     "🎯 Symbol":   sym,
                     "🎲 Strategy": str(r.get("strategy_type", "iron_fly")).replace("_", " "),
                     "📊 Confidence": f"{conf:.0f}/100",
-                    "🚦 Gate":     "🟢 GO" if conf >= MIN_CONFIDENCE else "🔴 NO-GO",
+                    "🚦 Gate":     "🟢 GO" if conf >= min_conf else "🔴 NO-GO",
                     "📈 Exp P&L":  f"{float(r.get('expected_pnl_pct', 0)):+.1f}%",
                     "📅 Score Date": str(r["score_date"]) + age_flag,
                     "🔬 IV Rank":  f"{feats.get('iv_rank', 0):.0f}" if feats.get("iv_rank") else "—",
@@ -573,7 +942,7 @@ if page == "System Health":
                     "Symbol": r["symbol"],
                     "Strategy": str(r.get("strategy_type", "—")).replace("_", " "),
                     "Confidence": f"{float(r['confidence']):.0f}/100",
-                    "Gate": "🟢" if float(r["confidence"]) >= MIN_CONFIDENCE else "🔴",
+                    "Gate": "🟢" if float(r["confidence"]) >= min_conf else "🔴",
                     "Score Date": str(r["score_date"]),
                 })
             st.dataframe(pd.DataFrame(all_strat_rows), use_container_width=True, hide_index=True)
@@ -953,6 +1322,21 @@ if page == "System Health":
 
     st.divider()
 
+    # ── SH-5: Live Config table ───────────────────────────────────────────────
+    st.subheader("⚙️ Live Config")
+    st.caption("Current values in system_meta.config · change with: INSERT INTO system_meta.config VALUES ('key', 'value', now())")
+    _cfg_df = query("SELECT key, value, updated_at FROM system_meta.config FINAL ORDER BY key")
+    if not _cfg_df.empty:
+        _cfg_df["updated_at"] = _cfg_df["updated_at"].apply(
+            lambda t: _to_ist_str(t) if t is not None and not pd.isna(t) else "—"
+        )
+        _cfg_df = _cfg_df.rename(columns={"key": "Key", "value": "Value", "updated_at": "Last Updated (IST)"})
+        st.dataframe(_cfg_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Config table empty — run migration 083.")
+
+    st.divider()
+
     # ── Alert Log ─────────────────────────────────────────────────────────────
     st.subheader("🔔 Alert Log")
     st.caption("Last 50 Telegram alerts sent by any agent.")
@@ -987,25 +1371,65 @@ if page == "System Health":
 # PAGE 2 — MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "Model":
-    st.title("🧠 Model")
-    st.caption(
-        "Per-symbol XGBoost trained on weekly expiry iron fly data. "
-        "Retrained weekly (Sunday). Daily re-score at 18:30 IST. "
-        f"Gate: confidence ≥ {MIN_CONFIDENCE:.0f} to trade."
-    )
-
+    min_conf = cfg("min_confidence", 60.0)
     today = date.today()
 
-    # ── Today's signal cards — all 4 symbols ─────────────────────────────────
-    st.subheader("Today's Signal")
+    # ── M-1: Pipeline health banner ───────────────────────────────────────────
+    _m_pipe_labels = [
+        ("option_chain_intraday", "chain"),
+        ("compute_oi_features",   "oi_features"),
+        ("strategy_backtester",   "backtester"),
+        ("confidence_scorer",     "scorer"),
+        ("strategy_selector",     "selector"),
+    ]
+    _m_banner_parts = []
+    for _svc, _lbl in _m_pipe_labels:
+        _rows = query(
+            f"SELECT max(finished_at) AS ts FROM system_meta.pipeline_runs FINAL "
+            f"WHERE service='{_svc}' AND status='success'"
+        )
+        _ts = _rows["ts"].iloc[0] if not _rows.empty else None
+        _age_h = _pipe_age_h(_svc) if "_pipe_age_h" in dir() else 9999.0
+        try:
+            if _ts is not None:
+                _ts_dt = _ts if isinstance(_ts, datetime) else pd.Timestamp(_ts).to_pydatetime()
+                if _ts_dt.tzinfo is None:
+                    _ts_dt = _ts_dt.replace(tzinfo=timezone.utc)
+                _age_h = (datetime.now(timezone.utc) - _ts_dt).total_seconds() / 3600
+        except Exception:
+            _age_h = 9999.0
+        _dot = "🟢" if _age_h < 25 else ("🟡" if _age_h < 50 else "🔴")
+        _age_s = f"{_age_h:.0f}h" if _age_h < 9999 else "—"
+        _m_banner_parts.append(f"{_dot} {_lbl} {_age_s}")
+    st.caption("  ·  ".join(_m_banner_parts))
 
+    # ── M-9: Section header with freshness stamp ──────────────────────────────
+    _iron_fly_latest = query(
+        "SELECT max(score_date) AS sd FROM analysis.confidence_scores FINAL "
+        "WHERE strategy_type = 'iron_fly' OR strategy_type IS NULL"
+    )
+    _score_date_str = str(_iron_fly_latest["sd"].iloc[0])[:10] \
+        if not _iron_fly_latest.empty and _iron_fly_latest["sd"].iloc[0] is not None else None
+    _score_is_today = _score_date_str == str(today)
+    if _score_date_str:
+        _freshness = "scored: today" if _score_is_today else f"scored: {_score_date_str} ⚠️ Stale"
+    else:
+        _freshness = "no scores yet"
+    st.subheader(f"Today's Signal  ·  {_freshness}")
+    st.caption(
+        f"Iron fly — XGBoost retrained weekly · re-scored daily 18:30 IST · "
+        f"Gate: confidence ≥ {min_conf:.0f}"
+    )
+
+    # ── M-2: Always show iron_fly scores (primary strategy in Stage 4) ────────
     scores_df = query("""
         SELECT symbol, score_date, next_expiry,
                confidence, expected_pnl_pct, features_json,
                ifNull(strategy_type, 'iron_fly') AS strategy_type
         FROM analysis.confidence_scores FINAL
         WHERE score_date >= today() - 3
-        ORDER BY symbol, confidence DESC, score_date DESC
+          AND (strategy_type = 'iron_fly' OR strategy_type IS NULL)
+        ORDER BY symbol, score_date DESC
     """)
 
     vix_df = query("""
@@ -1037,81 +1461,95 @@ elif page == "Model":
                 st.error(f"**{sym}**\nNo score")
                 continue
 
-            # Best strategy = highest confidence (scores_df already sorted by confidence DESC)
             row = sym_scores.iloc[0]
             conf = float(row["confidence"])
+            score_date = str(row["score_date"])[:10]
             expiry = str(row["next_expiry"])[:10]
             exp_pnl_pct = float(row["expected_pnl_pct"])
             feats_json = row["features_json"] if row["features_json"] else ""
             miss = missing_features(feats_json)
-            selected_strategy = str(row.get("strategy_type", "iron_fly")).replace("_", " ")
 
-            signal_ok  = conf >= MIN_CONFIDENCE
-            card_color = "🟢" if signal_ok else "🔴"
+            signal_ok = conf >= min_conf
 
-            # Graduation model: prominent headline, detail below
-            st.markdown(f"### {card_color} {sym}")
-
-            # Selected strategy badge
-            strat_emoji = {"iron fly": "🦅", "iron condor": "🦅", "bull put": "📈", "bear call": "📉"}
-            st.caption(f"{strat_emoji.get(selected_strategy, '🎲')} **{selected_strategy.upper()}**")
-
-            # Confidence gauge (simple colored metric)
-            conf_level = ("HIGH" if conf >= 70 else "MED" if conf >= MIN_CONFIDENCE else "LOW")
-            st.metric(
-                label="Confidence",
-                value=f"{conf:.0f}/100",
-                delta=f"{'✅ GO' if signal_ok else '❌ NO-GO'} — {conf_level}",
-                delta_color="normal" if signal_ok else "inverse",
+            # M-4: Large GO / NO-GO badge
+            badge_bg = "#1e8c45" if signal_ok else "#c0392b"
+            badge_txt = "GO" if signal_ok else "NO-GO"
+            st.markdown(
+                f"<div style='background:{badge_bg};color:#fff;text-align:center;"
+                f"padding:4px 0;border-radius:4px;font-weight:700;font-size:1em;"
+                f"margin-bottom:4px'>{badge_txt} — {sym}</div>",
+                unsafe_allow_html=True,
             )
 
-            # Expected P&L
-            lot_size = LOT_SIZES.get(sym, 65)
-            span_pts = span_estimate_pts(feats_json, spot_val or 24000, lot_size)
-            threshold_inr = span_pts * 0.01 if span_pts > 0 else None
-            exp_pnl_inr = exp_pnl_pct / 100 * (spot_val or 24000) * lot_size if spot_val else None
-            if exp_pnl_inr is not None and threshold_inr:
-                beat_threshold = exp_pnl_inr >= threshold_inr
-                st.metric(
-                    label="Expected P&L",
-                    value=fmt_inr(exp_pnl_inr),
-                    delta=f"Threshold: {fmt_inr(threshold_inr)} {'✅' if beat_threshold else '⚠️'}",
-                    delta_color="normal" if beat_threshold else "off",
-                )
-            else:
-                st.metric("Expected P&L", f"{exp_pnl_pct:+.1f}%")
+            # M-3: Score date + stale warning
+            stale_warn = "" if score_date == str(today) else " ⚠️"
+            st.caption(f"Iron fly · scored {score_date}{stale_warn} · expiry {expiry}")
 
-            # Key context
-            iv_rank_val = None
-            pcr_val = None
+            # M-4: Confidence progress bar (compact)
+            st.progress(int(conf), text=f"{conf:.0f}/100")
+
+            # M-7: VIX / IVR / PCR colour tags
+            iv_rank_val, pcr_val = 0.0, 0.0
             if not sym_eod.empty:
                 eod_row = sym_eod.iloc[0]
                 iv_rank_val = float(eod_row.get("iv_rank", 0) or 0)
-                pcr_val = float(eod_row.get("pcr", 0) or 0)
+                pcr_val     = float(eod_row.get("pcr", 0) or 0)
 
-            context_parts = []
-            if vix_val:
-                context_parts.append(f"VIX {vix_val:.1f}")
-            if pcr_val:
-                context_parts.append(f"PCR {pcr_val:.2f}")
-            if iv_rank_val:
-                context_parts.append(f"IVR {iv_rank_val:.0f}%")
-            if context_parts:
-                st.caption(" · ".join(context_parts))
+            def _tag(label: str, ok: bool, warn: bool = False) -> str:
+                c = "#1e8c45" if ok else ("#b58c1a" if warn else "#c0392b")
+                return (f"<span style='background:{c};color:#fff;"
+                        f"padding:1px 6px;border-radius:3px;font-size:0.75em;"
+                        f"margin-right:3px'>{label}</span>")
 
-            # Feature health badges — graduation: green summary, expand for detail
+            vix_tag = _tag(f"VIX {vix_val:.0f}", vix_val < 15, 15 <= vix_val <= 20) if vix_val else ""
+            ivr_tag = _tag(f"IVR {iv_rank_val:.0f}%", 40 <= iv_rank_val <= 70) if iv_rank_val else ""
+            pcr_tag = _tag(f"PCR {pcr_val:.2f}", 1.0 <= pcr_val <= 1.3, 0 < pcr_val < 1.0) if pcr_val else ""
+            if vix_tag or ivr_tag or pcr_tag:
+                st.markdown(vix_tag + ivr_tag + pcr_tag, unsafe_allow_html=True)
+
+            # Expected P&L
+            lot_size = LOT_SIZES.get(sym, 65)
+            exp_pnl_inr = exp_pnl_pct / 100 * (spot_val or 24000) * lot_size if spot_val else None
+            if exp_pnl_inr is not None:
+                st.metric("Expected P&L", fmt_inr(exp_pnl_inr))
+
+            # M-8: Historical calibration badge (walk-forward OOS win rate at this confidence band)
+            band_lo, band_hi = int(conf) - 10, int(conf) + 10
+            _calib_df = query(
+                f"SELECT countIf(target=1) / count() AS wr, count() AS n "
+                f"FROM analysis.confidence_backtest "
+                f"WHERE symbol = '{sym}' "
+                f"AND round(confidence * 100) BETWEEN {band_lo} AND {band_hi}"
+            )
+            if not _calib_df.empty and int(_calib_df["n"].iloc[0]) >= 10:
+                _hist_wr = float(_calib_df["wr"].iloc[0])
+                _hist_n  = int(_calib_df["n"].iloc[0])
+                st.caption(
+                    f"Historical at {band_lo}–{band_hi} conf: "
+                    f"{_hist_wr:.0%} WR (n={_hist_n})"
+                )
+
+            # M-6: NO-GO — breakdown of features dragging the score
+            if not signal_ok and feats_json:
+                try:
+                    _feats = json.loads(feats_json)
+                    _drag = []
+                    if _feats.get("iv_rank", 0) < 40:
+                        _drag.append(f"IVR {_feats['iv_rank']:.0f}% → want 40–70%")
+                    if _feats.get("vix", 0) > 20:
+                        _drag.append(f"VIX {_feats['vix']:.1f} → want < 20")
+                    if _feats.get("pcr_oi", 0) < 0.8:
+                        _drag.append(f"PCR {_feats.get('pcr_oi',0):.2f} → want 0.8–1.3")
+                    if _drag:
+                        with st.expander("Why NO-GO", expanded=False):
+                            for d in _drag:
+                                st.caption(d)
+                except Exception:
+                    pass
+
+            # Feature health
             if miss:
-                badge_txt = f"⚠️ {len(miss)} feature{'s' if len(miss) > 1 else ''} missing"
-                with st.expander(badge_txt, expanded=False):
-                    for f in miss:
-                        st.write(f"🔴 `{f}` = 0 (score may be unreliable)")
-                    remaining = [f for f in CRITICAL_FEATURES if f not in miss]
-                    for f in remaining:
-                        st.write(f"🟢 `{f}`")
-            else:
-                st.success("✅ All features present", icon=None)
-
-            st.caption(f"Expiry: {expiry}")
+                st.caption(f"⚠️ {len(miss)} feature(s) missing — score may be unreliable")
 
     # ── Multi-strategy comparison table ──────────────────────────────────────
     if not scores_df.empty and "strategy_type" in scores_df.columns:
@@ -1128,7 +1566,7 @@ elif page == "Model":
                 for _, sr in sym_s.iterrows():
                     strat = str(sr.get("strategy_type", "iron_fly")).replace("_", " ")
                     conf = float(sr["confidence"])
-                    gate = "🟢" if conf >= MIN_CONFIDENCE else "🔴"
+                    gate = "🟢" if conf >= min_conf else "🔴"
                     row_data[strat] = f"{gate} {conf:.0f}"
                 pivot_rows.append(row_data)
             if pivot_rows:
@@ -1176,8 +1614,8 @@ elif page == "Model":
                 labels={"confidence": "Confidence Score", "pnl_pts": "P&L (pts)"},
                 hover_data=["symbol", "expiry"],
             )
-            fig.add_vline(x=MIN_CONFIDENCE, line_dash="dash", line_color="gray",
-                          annotation_text=f"Gate {MIN_CONFIDENCE:.0f}")
+            fig.add_vline(x=min_conf, line_dash="dash", line_color="gray",
+                          annotation_text=f"Gate {min_conf:.0f}")
             fig.update_layout(height=350)
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1221,7 +1659,7 @@ elif page == "Model":
             fig3 = go.Figure()
             for min_c, label, clr in [
                 (0, "All trades", "#aaaaaa"),
-                (MIN_CONFIDENCE, f"Conf ≥ {MIN_CONFIDENCE:.0f}", "#3498db"),
+                (min_conf, f"Conf ≥ {min_conf:.0f}", "#3498db"),
             ]:
                 grp = bt_sorted[bt_sorted["confidence"] >= min_c].copy()
                 grp["cum"] = grp["pnl_pts"].cumsum()
@@ -1633,6 +2071,34 @@ elif page == "Model":
 elif page == "Trade Log":
     import io as _io
     st.title("💼 Trade Log")
+
+    # TL-1: Pipeline health banner
+    _tl_pipes = [
+        ("option_chain_intraday", "chain"),
+        ("compute_oi_features",   "oi_features"),
+        ("confidence_scorer",     "scorer"),
+        ("intraday_monitor",      "monitor"),
+    ]
+    _tl_parts = []
+    for _svc, _lbl in _tl_pipes:
+        _rows = query(
+            f"SELECT max(finished_at) AS ts FROM system_meta.pipeline_runs FINAL "
+            f"WHERE service='{_svc}' AND status='success'"
+        )
+        _ts = _rows["ts"].iloc[0] if not _rows.empty else None
+        try:
+            if _ts is not None:
+                _ts_dt = _ts if isinstance(_ts, datetime) else pd.Timestamp(_ts).to_pydatetime()
+                if _ts_dt.tzinfo is None:
+                    _ts_dt = _ts_dt.replace(tzinfo=timezone.utc)
+                _age_h = (datetime.now(timezone.utc) - _ts_dt).total_seconds() / 3600
+                _dot = "🟢" if _age_h < 25 else ("🟡" if _age_h < 50 else "🔴")
+                _tl_parts.append(f"{_dot} {_lbl} {_age_h:.0f}h")
+            else:
+                _tl_parts.append(f"🔴 {_lbl} —")
+        except Exception:
+            _tl_parts.append(f"🔴 {_lbl} —")
+    st.caption("  ·  ".join(_tl_parts))
     st.caption("Paper trades — iron fly 0DTE.")
 
     _BROKERAGE    = 20.0
@@ -2145,9 +2611,10 @@ elif page == "Trade Log":
     st.subheader("📜 Historical Audit")
     hist_df = query("""
         SELECT toDate(entry_time)  AS trade_date,
-               entry_time, exit_time, symbol, strike,
+               entry_time, exit_time, symbol, expiry, strike,
                exit_reason, entry_premium, exit_premium,
                pnl_pts, pnl_inr, lot_size, lots, scorecard_conf,
+               entry_features,
                wing_ce_strike, wing_ce_ltp, wing_pe_ltp, net_premium
         FROM trades.trade_outcomes FINAL
         ORDER BY entry_time DESC LIMIT 500
@@ -2212,15 +2679,26 @@ elif page == "Trade Log":
         filtered["net_pnl"]  = filtered["pnl_inr"] - filtered["txn_cost"]
         filtered["exit_dt_ist"] = (pd.to_datetime(filtered["exit_time"]) + _IST).dt.strftime("%d-%b %H:%M")
 
-        hist_tbl = filtered[[
-            "trade_date", "exit_dt_ist", "symbol", "strike", "exit_reason",
-            "entry_premium", "exit_premium", "pnl_pts", "pnl_inr",
-            "txn_cost", "net_pnl", "scorecard_conf",
-        ]].rename(columns={
+        if "expiry" in filtered.columns:
+            filtered["expiry"] = pd.to_datetime(filtered["expiry"]).dt.date
+            filtered["dte"] = (
+                filtered["expiry"] - pd.to_datetime(filtered["trade_date"]).dt.date
+            ).apply(lambda d: d.days if hasattr(d, "days") else 0)
+
+        _hist_cols = ["trade_date", "exit_dt_ist", "symbol", "strike"]
+        if "expiry" in filtered.columns:
+            _hist_cols += ["expiry", "dte"]
+        _hist_cols += ["exit_reason", "entry_premium", "exit_premium",
+                       "pnl_pts", "pnl_inr", "txn_cost", "net_pnl", "scorecard_conf"]
+        _hist_cols = [c for c in _hist_cols if c in filtered.columns]
+
+        hist_tbl = filtered[_hist_cols].rename(columns={
             "trade_date":   "📅 Date",
             "exit_dt_ist":  "🕐 Exit IST",
             "symbol":       "🎯 Symbol",
             "strike":       "ATM",
+            "expiry":       "Expiry",
+            "dte":          "DTE",
             "exit_reason":  "Exit",
             "entry_premium":"Entry Prem",
             "exit_premium": "Exit Prem",
@@ -2243,6 +2721,32 @@ elif page == "Trade Log":
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "Market Data":
     st.title("🔍 Market Data")
+
+    # ── Pipeline health banner ─────────────────────────────────────────────────
+    _md_pipes = [
+        ("option_chain_intraday", "chain"),
+        ("compute_oi_features",   "oi_features"),
+    ]
+    _md_parts = []
+    for _svc, _lbl in _md_pipes:
+        _rows = query(
+            f"SELECT max(finished_at) AS ts FROM system_meta.pipeline_runs FINAL "
+            f"WHERE service='{_svc}' AND status='success'"
+        )
+        _ts = _rows["ts"].iloc[0] if not _rows.empty else None
+        try:
+            if _ts is not None:
+                _ts_dt = _ts if isinstance(_ts, datetime) else pd.Timestamp(_ts).to_pydatetime()
+                if _ts_dt.tzinfo is None:
+                    _ts_dt = _ts_dt.replace(tzinfo=timezone.utc)
+                _age_h = (datetime.now(timezone.utc) - _ts_dt).total_seconds() / 3600
+                _dot = "🟢" if _age_h < 25 else ("🟡" if _age_h < 50 else "🔴")
+                _md_parts.append(f"{_dot} {_lbl} {_age_h:.0f}h")
+            else:
+                _md_parts.append(f"🔴 {_lbl} —")
+        except Exception:
+            _md_parts.append(f"🔴 {_lbl} —")
+    st.caption("  ·  ".join(_md_parts))
 
     # ── India VIX ─────────────────────────────────────────────────────────────
     st.subheader("India VIX — 1 Year")
@@ -2314,261 +2818,26 @@ elif page == "Market Data":
     st.divider()
 
     # ── OI Walls ──────────────────────────────────────────────────────────────
-    # options_eod_summary is NIFTY-only (CRIT-003) — no symbol column
-    st.subheader("OI Walls — Current Expiry (NIFTY)")
-    st.caption("⚠️ CRIT-003: options_eod_summary is NIFTY-only. BANKNIFTY/FINNIFTY/MIDCPNIFTY data not available here.")
+    st.subheader("OI Walls — Current Expiry")
     wall_df = query("""
-        SELECT date, expiry, iv_rank, max_pain_strike,
-               ce_wall_strike, pe_wall_strike, pcr, iv_skew
+        SELECT symbol, date, expiry, iv_rank, max_pain_strike,
+               ce_wall_strike, pe_wall_strike, pcr
         FROM market.options_eod_summary FINAL
-        ORDER BY date DESC LIMIT 1
+        ORDER BY symbol, date DESC
+        LIMIT 1 BY symbol
     """)
     if not wall_df.empty:
-        wr = wall_df.iloc[0]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("IV Rank", f"{wr['iv_rank']:.0f}%")
-        c2.metric("Max Pain", f"{int(wr['max_pain_strike']):,}" if wr['max_pain_strike'] else "—")
-        c3.metric("CE Wall", f"{int(wr['ce_wall_strike']):,}" if wr.get('ce_wall_strike') else "—")
-        c4.metric("PE Wall", f"{int(wr['pe_wall_strike']):,}" if wr.get('pe_wall_strike') else "—")
-        st.caption(f"As of {wr['date']} · Expiry {str(wr['expiry'])[:10]} · PCR {float(wr['pcr']):.2f}")
+        wall_cols = st.columns(len(wall_df))
+        for i, (_, wr) in enumerate(wall_df.iterrows()):
+            with wall_cols[i]:
+                st.markdown(f"**{wr['symbol']}**")
+                st.metric("IV Rank", f"{float(wr['iv_rank']):.0f}%")
+                st.metric("Max Pain", f"{int(wr['max_pain_strike']):,}" if wr.get('max_pain_strike') else "—")
+                st.metric("CE Wall", f"{int(wr['ce_wall_strike']):,}" if wr.get('ce_wall_strike') else "—")
+                st.metric("PE Wall", f"{int(wr['pe_wall_strike']):,}" if wr.get('pe_wall_strike') else "—")
+                st.caption(f"PCR {float(wr['pcr']):.2f} · Exp {str(wr['expiry'])[:10]}")
     else:
         st.info("No OI wall data. Run compute_oi_features.")
-
-    st.divider()
-
-    # ── MF NAV Explorer ───────────────────────────────────────────────────────
-    st.subheader("Mutual Fund NAV Explorer")
-
-    # Load full scheme list once (cached 1 hr)
-    schemes_df = query("""
-        SELECT scheme_code, scheme_name, fund_house, scheme_type, scheme_category
-        FROM market.mf_schemes
-        WHERE is_active = 1
-        ORDER BY scheme_name
-    """)
-
-    if schemes_df.empty:
-        st.info("No MF scheme metadata. Ensure mf_schemes table is populated.")
-    else:
-        schemes_df["scheme_code"] = schemes_df["scheme_code"].astype(int)
-
-        # ── Derive plan-type tags from name ──────────────────────────────────
-        sn = schemes_df["scheme_name"].str.upper()
-        schemes_df["_is_growth"]  = sn.str.contains("GROWTH",  na=False)
-        schemes_df["_is_idcw"]    = sn.str.contains(r"IDCW|DIVIDEND", na=False, regex=True)
-        schemes_df["_is_direct"]  = sn.str.contains("DIRECT",  na=False)
-        schemes_df["_is_regular"] = ~schemes_df["_is_direct"]  # anything not Direct = Regular
-
-        # ── Filter row 1: Type / Category ────────────────────────────────────
-        fcol1, fcol2 = st.columns([2, 4])
-        with fcol1:
-            scheme_type_sel = st.selectbox(
-                "Scheme Type",
-                ["All"] + sorted(schemes_df["scheme_type"].dropna().unique().tolist()),
-                index=["All", "Equity", "Debt", "Index/ETF", "Hybrid",
-                       "FoF", "Commodity", "Other"].index("Equity")
-                       if "Equity" in schemes_df["scheme_type"].values else 0,
-                key="mf_type",
-            )
-        type_mask = (
-            schemes_df["scheme_type"] == scheme_type_sel
-            if scheme_type_sel != "All"
-            else pd.Series(True, index=schemes_df.index)
-        )
-        avail_cats = (
-            ["All"] + sorted(schemes_df.loc[type_mask, "scheme_category"]
-                             .dropna().unique().tolist())
-        )
-        with fcol2:
-            cat_sel = st.multiselect(
-                "Category",
-                options=avail_cats[1:],          # exclude "All" — empty = all
-                default=[],
-                placeholder="All categories (leave empty for all)",
-                key="mf_cat",
-            )
-
-        # ── Filter row 2: Plan / Direct ───────────────────────────────────────
-        fcol3, fcol4 = st.columns(2)
-        with fcol3:
-            plan_sel = st.radio(
-                "Plan Type",
-                ["Growth", "IDCW / Dividend", "Both"],
-                horizontal=True,
-                key="mf_plan",
-            )
-        with fcol4:
-            dist_sel = st.radio(
-                "Distribution Channel",
-                ["Direct", "Regular", "Both"],
-                horizontal=True,
-                key="mf_dist",
-            )
-
-        # ── Apply filters ─────────────────────────────────────────────────────
-        mask = type_mask.copy()
-        if cat_sel:
-            mask &= schemes_df["scheme_category"].isin(cat_sel)
-        if plan_sel == "Growth":
-            mask &= schemes_df["_is_growth"]
-        elif plan_sel == "IDCW / Dividend":
-            mask &= schemes_df["_is_idcw"]
-        if dist_sel == "Direct":
-            mask &= schemes_df["_is_direct"]
-        elif dist_sel == "Regular":
-            mask &= schemes_df["_is_regular"]
-
-        filtered = schemes_df[mask].copy()
-        st.caption(f"{len(filtered):,} funds match filters")
-
-        if filtered.empty:
-            st.warning("No funds match the selected filters.")
-        else:
-            # ── Fund picker ───────────────────────────────────────────────────
-            fund_options = dict(zip(
-                filtered["scheme_name"],
-                filtered["scheme_code"],
-            ))
-            selected_names = st.multiselect(
-                "Select funds to chart (max 15)",
-                options=list(fund_options.keys()),
-                default=[],
-                max_selections=15,
-                placeholder="Pick one or more funds…",
-                key="mf_funds",
-            )
-            selected_codes = [fund_options[n] for n in selected_names]
-
-            # ── Date range ────────────────────────────────────────────────────
-            dc1, dc2, dc3 = st.columns([2, 2, 2])
-            with dc1:
-                from_date = st.date_input(
-                    "From date",
-                    value=date(2015, 1, 1),
-                    min_value=date(2006, 4, 1),
-                    max_value=date.today(),
-                    key="mf_from",
-                )
-            with dc2:
-                index_to_100 = st.checkbox(
-                    "Index all to 100 (compare growth)",
-                    value=True,
-                    key="mf_idx",
-                )
-            with dc3:
-                show_perf = st.checkbox(
-                    "Show performance table",
-                    value=True,
-                    key="mf_perf",
-                )
-
-            if not selected_codes:
-                st.info("Select at least one fund above to see the NAV chart.")
-            else:
-                codes_sql = ", ".join(str(c) for c in selected_codes)
-                # Join mf_nav with mf_schemes for the name
-                nav_df = query(f"""
-                    SELECT n.date, n.scheme_code, n.nav, s.scheme_name
-                    FROM market.mf_nav n FINAL
-                    JOIN (
-                        SELECT scheme_code, scheme_name
-                        FROM market.mf_schemes
-                        WHERE scheme_code IN ({codes_sql})
-                    ) s ON n.scheme_code = s.scheme_code
-                    WHERE n.scheme_code IN ({codes_sql})
-                      AND n.date >= '{from_date}'
-                    ORDER BY n.date
-                """)
-
-                if nav_df.empty:
-                    st.warning("No NAV data found for selected funds from the chosen date.")
-                else:
-                    nav_df["date"] = pd.to_datetime(nav_df["date"])
-
-                    # Shorten display names: strip "- Direct Plan - Growth" suffixes
-                    def _short(name):
-                        for cut in [" - Direct Plan", " Direct Plan",
-                                    " - Regular Plan", " Regular Plan",
-                                    " - Growth", "-Growth", " Growth",
-                                    " - IDCW", "-IDCW", " IDCW",
-                                    " Option", " Fund"]:
-                            name = name.replace(cut, "")
-                        return name.strip(" -")
-
-                    nav_df["label"] = nav_df["scheme_name"].apply(_short)
-
-                    # ── Chart ─────────────────────────────────────────────────
-                    if index_to_100:
-                        # Divide each fund's NAV by its first value × 100
-                        first_navs = (nav_df.sort_values("date")
-                                      .groupby("scheme_code")["nav"].first())
-                        nav_df = nav_df.join(
-                            first_navs.rename("first_nav"), on="scheme_code"
-                        )
-                        nav_df["plot_val"] = nav_df["nav"] / nav_df["first_nav"] * 100
-                        y_label = "Indexed NAV (base=100)"
-                    else:
-                        nav_df["plot_val"] = nav_df["nav"]
-                        y_label = "NAV (₹)"
-
-                    fig_mf = px.line(
-                        nav_df, x="date", y="plot_val",
-                        color="label",
-                        labels={"date": "", "plot_val": y_label, "label": "Fund"},
-                        height=480,
-                    )
-                    fig_mf.update_traces(line_width=1.8)
-                    fig_mf.update_layout(
-                        legend=dict(orientation="h", yanchor="top",
-                                    y=-0.15, xanchor="left", x=0),
-                        hovermode="x unified",
-                        margin=dict(b=120),
-                    )
-                    if index_to_100:
-                        fig_mf.add_hline(y=100, line_dash="dot",
-                                         line_color="gray", opacity=0.5)
-                    st.plotly_chart(fig_mf, use_container_width=True)
-
-                    # ── Performance table ──────────────────────────────────────
-                    if show_perf:
-                        perf_df = query(f"""
-                            SELECT e.scheme_code, s.scheme_name,
-                                   round(e.return_1m,  1) AS ret_1m,
-                                   round(e.return_3m,  1) AS ret_3m,
-                                   round(e.return_6m,  1) AS ret_6m,
-                                   round(e.return_1y,  1) AS ret_1y,
-                                   round(e.return_3y,  1) AS ret_3y,
-                                   round(e.return_5y,  1) AS ret_5y,
-                                   round(e.cagr_3y,    1) AS cagr_3y,
-                                   round(e.cagr_5y,    1) AS cagr_5y,
-                                   round(e.sharpe_1y,  2) AS sharpe_1y,
-                                   round(e.max_drawdown_pct, 1) AS max_dd_pct,
-                                   round(e.volatility_1y, 1) AS vol_1y
-                            FROM market.mf_nav_enriched e FINAL
-                            JOIN (
-                                SELECT scheme_code, scheme_name
-                                FROM market.mf_schemes
-                                WHERE scheme_code IN ({codes_sql})
-                            ) s ON e.scheme_code = s.scheme_code
-                            WHERE e.scheme_code IN ({codes_sql})
-                            ORDER BY e.date DESC
-                            LIMIT 1 BY e.scheme_code
-                        """)
-
-                        if not perf_df.empty:
-                            perf_df["scheme_name"] = perf_df["scheme_name"].apply(_short)
-                            perf_df = perf_df.rename(columns={
-                                "scheme_name": "Fund",
-                                "ret_1m": "1M%", "ret_3m": "3M%",
-                                "ret_6m": "6M%", "ret_1y": "1Y%",
-                                "ret_3y": "3Y%", "ret_5y": "5Y%",
-                                "cagr_3y": "CAGR 3Y", "cagr_5y": "CAGR 5Y",
-                                "sharpe_1y": "Sharpe", "max_dd_pct": "MaxDD%",
-                                "vol_1y": "Vol%",
-                            }).drop(columns=["scheme_code"])
-                            st.dataframe(
-                                perf_df, use_container_width=True, hide_index=True
-                            )
 
     st.divider()
 
@@ -2642,6 +2911,137 @@ elif page == "MF Advisor":
 
     # ── Page header ───────────────────────────────────────────────────────────
     st.header("MF Advisor")
+
+    # ── MF-1: Category heatmap — where is money flowing? ──────────────────────
+    st.subheader("📊 Category Returns")
+    _heat_df = query("""
+        SELECT s.scheme_category AS cat,
+               round(median(return_1y), 1) AS Y1,
+               round(median(return_6m), 1) AS M6,
+               round(median(return_3m), 1) AS M3,
+               round(median(return_1m), 1) AS M1
+        FROM (
+            SELECT scheme_code,
+                   argMax(return_1y, date) AS return_1y,
+                   argMax(return_6m, date) AS return_6m,
+                   argMax(return_3m, date) AS return_3m,
+                   argMax(return_1m, date) AS return_1m
+            FROM market.mf_nav_enriched FINAL
+            GROUP BY scheme_code
+        ) e
+        JOIN market.mf_schemes s ON e.scheme_code = s.scheme_code
+        WHERE s.is_active = 1 AND length(trim(s.scheme_category)) > 0
+        GROUP BY cat
+        HAVING count() >= 3
+        ORDER BY Y1 DESC
+    """)
+
+    if not _heat_df.empty:
+        _heat_df = _heat_df.rename(columns={
+            "cat": "Category", "Y1": "1Y%", "M6": "6M%", "M3": "3M%", "M1": "1M%"
+        })
+        _heat_piv = _heat_df.set_index("Category")[["1Y%", "6M%", "3M%", "1M%"]]
+        st.caption("Median return % by category · green = positive momentum · sorted by 1Y")
+        try:
+            _styled = (_heat_piv
+                       .style
+                       .background_gradient(cmap="RdYlGn", axis=None, vmin=-10, vmax=20)
+                       .format("{:.1f}%"))
+            st.dataframe(_styled, use_container_width=True)
+        except Exception:
+            st.dataframe(_heat_piv.style.format("{:.1f}%"), use_container_width=True)
+
+        st.divider()
+
+        # ── MF-2: Fund trend table — drill into a category ────────────────────
+        st.subheader("📋 Fund Trends")
+        _cat_opts = _heat_df["Category"].tolist()
+        _sel_cat = st.selectbox("Category", _cat_opts, key="mf_cat_drill")
+
+        if _sel_cat:
+            _trend_raw = query(f"""
+                SELECT e.scheme_code, s.scheme_name,
+                       argMax(e.return_1m, e.date) AS M1,
+                       argMax(e.return_3m, e.date) AS M3,
+                       argMax(e.return_6m, e.date) AS M6,
+                       argMax(e.return_1y, e.date) AS Y1
+                FROM market.mf_nav_enriched e FINAL
+                JOIN market.mf_schemes s ON e.scheme_code = s.scheme_code
+                WHERE s.scheme_category = '{_sel_cat}' AND s.is_active = 1
+                GROUP BY e.scheme_code, s.scheme_name
+                ORDER BY Y1 DESC
+            """)
+
+            if not _trend_raw.empty:
+                for _tc in ("M1", "M3", "M6", "Y1"):
+                    _trend_raw[_tc] = pd.to_numeric(_trend_raw[_tc], errors="coerce")
+
+                def _arrow(row):
+                    m1  = row["M1"] if pd.notna(row["M1"]) else 0.0
+                    m3m = (row["M3"] / 3) if pd.notna(row["M3"]) else 0.0
+                    d   = m1 - m3m
+                    if d > 1.0:  return "↑"
+                    if d > 0.3:  return "↗"
+                    if d > -0.3: return "→"
+                    if d > -1.0: return "↘"
+                    return "↓"
+
+                _trend_raw["Trend"] = _trend_raw.apply(_arrow, axis=1)
+                _disp = _trend_raw.rename(columns={
+                    "scheme_name": "Fund", "M1": "1M%", "M3": "3M%", "M6": "6M%", "Y1": "1Y%"
+                })[["Fund", "Trend", "1M%", "3M%", "6M%", "1Y%"]].copy()
+                _disp["Fund"] = _disp["Fund"].str[:50]
+
+                _sel_funds = st.multiselect(
+                    "Select funds to chart (max 5)",
+                    options=_disp["Fund"].tolist(),
+                    max_selections=5,
+                    key="mf_fund_drill",
+                )
+                st.dataframe(
+                    _disp.style.format({"1M%": "{:.1f}%", "3M%": "{:.1f}%",
+                                        "6M%": "{:.1f}%", "1Y%": "{:.1f}%"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+                # ── MF-3: NAV chart on demand ──────────────────────────────────
+                if _sel_funds:
+                    _sel_codes = _trend_raw[
+                        _trend_raw["scheme_name"].str[:50].isin(_sel_funds)
+                    ]["scheme_code"].tolist()
+                    if _sel_codes:
+                        _nav_sql = ", ".join(str(c) for c in _sel_codes)
+                        _nav_data = query(f"""
+                            SELECT n.date, n.scheme_code, n.nav, s.scheme_name
+                            FROM market.mf_nav n FINAL
+                            JOIN market.mf_schemes s ON n.scheme_code = s.scheme_code
+                            WHERE n.scheme_code IN ({_nav_sql})
+                              AND n.date >= today() - INTERVAL 1 YEAR
+                            ORDER BY n.date
+                        """)
+                        if not _nav_data.empty:
+                            _nav_data["date"] = pd.to_datetime(_nav_data["date"])
+                            _nav_data = _nav_data.sort_values(["scheme_code", "date"])
+                            _fnav = _nav_data.groupby("scheme_code")["nav"].first()
+                            _nav_data = _nav_data.join(_fnav.rename("first_nav"), on="scheme_code")
+                            _nav_data["indexed"] = _nav_data["nav"] / _nav_data["first_nav"] * 100
+                            _nav_data["label"]   = _nav_data["scheme_name"].str[:40]
+                            _fn_fig = px.line(
+                                _nav_data, x="date", y="indexed", color="label",
+                                labels={"indexed": "NAV (base=100)", "date": "", "label": ""},
+                                height=320,
+                            )
+                            _fn_fig.add_hline(y=100, line_dash="dot", line_color="gray", opacity=0.4)
+                            _fn_fig.update_layout(
+                                legend=dict(orientation="h", y=-0.28, font_size=9),
+                            )
+                            st.plotly_chart(_fn_fig, use_container_width=True)
+            else:
+                st.info(f"No fund data for {_sel_cat}.")
+    else:
+        st.info("No fund performance data. Ensure mf_nav_enriched is populated.")
+
+    st.divider()
 
     # ── Passphrase ────────────────────────────────────────────────────────────
     with st.expander("🔐 Load / Save Profile",

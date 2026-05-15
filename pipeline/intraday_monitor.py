@@ -64,7 +64,7 @@ STOP_COOLDOWN_M  = 30         # minutes to wait before re-entry after stop hit
 
 MIN_PREMIUM       = {"NIFTY": 40.0, "BANKNIFTY": 80.0, "FINNIFTY": 50.0, "MIDCPNIFTY": 30.0}
 MIN_NET_CREDIT    = {"NIFTY": 30.0, "BANKNIFTY": 60.0, "FINNIFTY": 40.0, "MIDCPNIFTY": 20.0}
-MIN_CONFIDENCE    = 60.0   # skip entry if scorecard below this (raised from 50 — coin-flip threshold)
+MIN_CONFIDENCE    = 60.0   # fallback default — runtime value read from system_meta.config each loop
 
 # Iron fly wing distances (OTM strikes to buy for defined-risk structure)
 WING_PTS = {"NIFTY": 200.0, "BANKNIFTY": 500.0, "FINNIFTY": 200.0, "MIDCPNIFTY": 200.0}
@@ -762,8 +762,22 @@ def update_trail(ch, pos, pnl_inr, dry_run=False):
 
 # ── Per-symbol tick ───────────────────────────────────────────────────────────
 
+def _get_min_conf(ch) -> float:
+    """Read min_confidence from system_meta.config; fall back to module default on any error."""
+    try:
+        rows = ch.query(
+            "SELECT value FROM system_meta.config FINAL WHERE key = 'min_confidence' LIMIT 1"
+        ).result_rows
+        if rows:
+            return float(rows[0][0])
+    except Exception as _e:
+        log.warning(f"Could not read min_confidence from config: {_e}")
+    return MIN_CONFIDENCE
+
+
 def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
-         kite_mgr: KiteOrderManager | None = None):
+         kite_mgr: KiteOrderManager | None = None,
+         min_confidence: float = MIN_CONFIDENCE):
     """One monitoring cycle for a symbol."""
     t = ist_time()
     lot_size = lot_sizes.get(symbol, DEFAULT_LOT_SIZES.get(symbol, 75))
@@ -877,8 +891,8 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
     except Exception as _e:
         log.warning(f"[{symbol}] live scoring failed ({_e}), using eod_conf={eod_conf:.1f}")
         scorecard_conf = eod_conf
-    if scorecard_conf < MIN_CONFIDENCE:
-        log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} < {MIN_CONFIDENCE:.0f} — skip (low confidence)")
+    if scorecard_conf < min_confidence:
+        log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} < {min_confidence:.0f} — skip (low confidence)")
         return
 
     # Gate: block entry when critical IV/VIX features are all zero — indicates
@@ -957,9 +971,11 @@ def main():
             continue
 
         log.info(f"--- Tick at {ist_now().strftime('%H:%M:%S')} IST ---")
+        _min_conf = _get_min_conf(ch)
+        log.info(f"min_confidence={_min_conf:.0f} (from system_meta.config)")
         for symbol in SYMBOLS:
             try:
-                tick(ch, symbol, lot_sizes, args.dry_run, kite_mgr)
+                tick(ch, symbol, lot_sizes, args.dry_run, kite_mgr, min_confidence=_min_conf)
             except Exception as e:
                 log.error(f"[{symbol}] tick failed: {e}", exc_info=True)
         # Heartbeat for Docker healthcheck

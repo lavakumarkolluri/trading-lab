@@ -145,7 +145,7 @@ def _check_confidence_scores(ch) -> tuple[bool, str]:
     try:
         rows = ch.query(
             "SELECT symbol, round(confidence, 0) AS conf "
-            "FROM analysis.scorecard FINAL "
+            "FROM analysis.confidence_scores FINAL "
             "WHERE symbol IN {syms:Array(String)} AND score_date >= {cutoff:Date} "
             "ORDER BY symbol",
             parameters={"syms": SYMBOLS, "cutoff": cutoff},

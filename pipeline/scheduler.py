@@ -736,6 +736,120 @@ def job_data_freshness_check():
     _run("data_freshness_check")
 
 
+_CLEANUP_LAST_RUN_FILE = "/tmp/data_cleanup_last_run"
+
+
+def _cleanup_last_run_ts() -> datetime | None:
+    try:
+        with open(_CLEANUP_LAST_RUN_FILE) as f:
+            return datetime.fromisoformat(f.read().strip())
+    except Exception:
+        return None
+
+
+def _cleanup_save_run_ts() -> None:
+    with open(_CLEANUP_LAST_RUN_FILE, "w") as f:
+        f.write(datetime.now(timezone.utc).isoformat())
+
+
+def job_data_cleanup():
+    """
+    Configurable-interval stale data cleanup + re-fetch.
+
+    Reads `cleanup_interval_hours` from system_meta.config (default 6).
+    Skips if not enough time has elapsed since last run.
+    Runs at most every hour (scheduled every 1h); effective frequency
+    is controlled by the config key without code changes.
+
+    Two actions per source:
+      1. Dedup / purge stale rows in ClickHouse tables.
+      2. Re-trigger the relevant pipeline if data is stale.
+    """
+    interval_h = 6
+    try:
+        ch = _ch_client()
+        rows = ch.query(
+            "SELECT value FROM system_meta.config FINAL WHERE key = 'cleanup_interval_hours'"
+        ).result_rows
+        if rows:
+            interval_h = int(rows[0][0])
+    except Exception as e:
+        log.warning("data_cleanup: could not read config, using default 6h: %s", e)
+
+    last = _cleanup_last_run_ts()
+    if last:
+        elapsed_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+        if elapsed_h < interval_h:
+            log.debug(
+                "data_cleanup: skipping — only %.1fh elapsed, interval=%dh",
+                elapsed_h, interval_h,
+            )
+            return
+
+    log.info("=== Data cleanup + re-fetch triggered (interval=%dh) ===", interval_h)
+    _cleanup_save_run_ts()
+
+    # IMPORTANT: this job NEVER writes to system_meta.stage_boundaries.
+    # That table is seeded once by migration 083 and must not be overwritten.
+    # Only OPTIMIZE and DELETE operations on market data tables are permitted here.
+
+    # ── 1. options_chain: keep last valid snapshot per (symbol, snap_date, expiry) ─
+    try:
+        ch = _ch_client()
+        deleted = ch.command(
+            """
+            ALTER TABLE market.options_chain DELETE
+            WHERE snap_date < today() - 7
+            """
+        )
+        log.info("data_cleanup: options_chain purged rows older than 7 days")
+        _log_cleanup("options_chain_purge", "ok", detail="rows >7d old removed")
+    except Exception as e:
+        log.warning("data_cleanup: options_chain purge failed: %s", e)
+        _log_cleanup("options_chain_purge", "error", detail=str(e))
+
+    # ── 2. confidence_scores: OPTIMIZE to surface dedup via ReplacingMergeTree ─
+    try:
+        ch = _ch_client()
+        ch.command("OPTIMIZE TABLE analysis.confidence_scores FINAL")
+        log.info("data_cleanup: confidence_scores OPTIMIZE FINAL done")
+        _log_cleanup("confidence_scores_dedup", "ok")
+    except Exception as e:
+        log.warning("data_cleanup: confidence_scores optimize failed: %s", e)
+        _log_cleanup("confidence_scores_dedup", "error", detail=str(e))
+
+    # ── 3. options_eod_summary: OPTIMIZE to surface dedup ──────────────────────
+    try:
+        ch = _ch_client()
+        ch.command("OPTIMIZE TABLE market.options_eod_summary FINAL")
+        log.info("data_cleanup: options_eod_summary OPTIMIZE FINAL done")
+        _log_cleanup("options_eod_summary_dedup", "ok")
+    except Exception as e:
+        log.warning("data_cleanup: options_eod_summary optimize failed: %s", e)
+        _log_cleanup("options_eod_summary_dedup", "error", detail=str(e))
+
+    # ── 4. Re-fetch if data is stale ───────────────────────────────────────────
+    # Check OI features staleness: if last compute_oi_features > 25h ago, re-run
+    try:
+        ch = _ch_client()
+        rows = ch.query(
+            """
+            SELECT max(finished_at) FROM system_meta.pipeline_runs FINAL
+            WHERE service = 'compute_oi_features' AND status = 'success'
+            """
+        ).result_rows
+        last_oi = rows[0][0] if rows else None
+        if last_oi:
+            age_h = (datetime.now(timezone.utc) - last_oi).total_seconds() / 3600
+            if age_h > 25:
+                log.warning("data_cleanup: compute_oi_features stale (%.1fh) — re-triggering", age_h)
+                _run("compute_oi_features")
+    except Exception as e:
+        log.warning("data_cleanup: OI features staleness check failed: %s", e)
+
+    log.info("=== Data cleanup complete ===")
+
+
 _dashboard_was_down = False  # track transitions to avoid repeat alerts
 
 
@@ -1090,6 +1204,12 @@ def main():
 
     # Cleanup KPI check: daily 10:15 UTC (shifted to avoid conflict)
     schedule.every().day.at("10:15").do(job_cleanup_kpi_check)
+
+    # Configurable-interval data cleanup + re-fetch (default every 6h from config)
+    # Runs every hour; effective frequency is controlled by system_meta.config
+    log.info("  Data cleanup        : every 1h check — effective interval from system_meta.config")
+    schedule.every().hour.do(job_data_cleanup)
+    job_data_cleanup()  # run once on startup
 
     # Auto-deploy: pull master every 15 min, rebuild+restart if code changed
     schedule.every(15).minutes.do(job_auto_deploy)
