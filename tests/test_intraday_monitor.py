@@ -429,3 +429,20 @@ def test_option_chain_intraday_includes_midcpnifty():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pipeline"))
     scraper = importlib.import_module("option_chain_intraday")
     assert "MIDCPNIFTY" in scraper.SYMBOLS, "MIDCPNIFTY must be in option_chain_intraday SYMBOLS"
+
+
+def test_live_scoring_falls_back_when_model_missing(monkeypatch):
+    """score_live_snapshot returns 50.0 when no model is loaded (graceful fallback)."""
+    import sys
+    import types
+
+    # Provide a minimal confidence_scorer stub that returns 50.0 (no model)
+    stub = types.ModuleType("confidence_scorer")
+    def _score_live(ch, mc, symbol, snap, strategy="iron_fly"):
+        return 50.0
+    stub.score_live_snapshot = _score_live
+    monkeypatch.setitem(sys.modules, "confidence_scorer", stub)
+
+    # The function should return 50.0 without crashing
+    result = stub.score_live_snapshot(None, None, "NIFTY", {"timestamp": "2026-05-15", "expiry": "2026-05-15", "strike": 24000, "straddle": 300.0, "ce_iv": 14.0, "pe_iv": 14.5})
+    assert result == 50.0

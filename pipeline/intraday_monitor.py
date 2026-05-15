@@ -867,7 +867,16 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
         log.info(f"[{symbol}] premium {snap['straddle']:.1f} < 2× stop {stop_pts*2:.1f} — skip")
         return
 
-    selected_strategy, scorecard_conf = get_selected_strategy(ch, symbol)
+    selected_strategy, eod_conf = get_selected_strategy(ch, symbol)
+    # Re-score using live chain snapshot for same-day accuracy;
+    # fall back to EOD score if live scoring fails (model not loaded, etc.)
+    try:
+        from confidence_scorer import score_live_snapshot
+        scorecard_conf = score_live_snapshot(ch, None, symbol, snap, selected_strategy)
+        log.info(f"[{symbol}] live_conf={scorecard_conf:.1f} eod_conf={eod_conf:.1f}")
+    except Exception as _e:
+        log.warning(f"[{symbol}] live scoring failed ({_e}), using eod_conf={eod_conf:.1f}")
+        scorecard_conf = eod_conf
     if scorecard_conf < MIN_CONFIDENCE:
         log.info(f"[{symbol}] scorecard={scorecard_conf:.0f} < {MIN_CONFIDENCE:.0f} — skip (low confidence)")
         return
