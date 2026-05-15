@@ -523,7 +523,7 @@ elif page == "System Health":
     _ci_row = query("SELECT tests_failed, status FROM system_meta.ci_results FINAL ORDER BY run_at DESC LIMIT 1")
     if _ci_row.empty:
         _sh_issues.append("No CI results")
-    elif str(_ci_row.iloc[0]["status"]) != "success" or int(_ci_row.iloc[0]["tests_failed"]) > 0:
+    elif int(_ci_row.iloc[0]["tests_failed"]) > 0 or str(_ci_row.iloc[0]["status"]) not in ("success", "pass"):
         _sh_issues.append(f"CI failing ({int(_ci_row.iloc[0]['tests_failed'])} tests)")
     _score_age = query("SELECT dateDiff('day', max(score_date), today()) AS age FROM analysis.confidence_scores FINAL")
     if _score_age.empty or _score_age.iloc[0]["age"] is None or int(_score_age.iloc[0]["age"]) > 1:
