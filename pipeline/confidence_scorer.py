@@ -346,6 +346,9 @@ def load_eod_summary(ch, symbol: str = "NIFTY") -> pd.DataFrame:
     ])
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df.set_index("date", inplace=True)
+    # options_eod_summary ORDER BY is (symbol, date, expiry) — multiple rows per date.
+    # Keep only the first (nearest expiry) so loc[] always returns a Series, not DataFrame.
+    df = df[~df.index.duplicated(keep="first")]
     return df
 
 
