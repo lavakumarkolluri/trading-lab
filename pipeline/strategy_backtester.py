@@ -70,11 +70,14 @@ def load_chain(ch, symbol: str, from_date: Optional[date] = None) -> pd.DataFram
     so the chain never has duplicate strikes after set_index().
     """
     date_filter = f"AND toDate(timestamp) >= '{from_date}'" if from_date else ""
+    # Alias must differ from the raw column name: ClickHouse resolves aliases
+    # in WHERE before GROUP BY, so "ltp" in WHERE would match "argMax(...) AS ltp"
+    # rather than the raw column, causing ILLEGAL_AGGREGATION.
     r = ch.query(f"""
         SELECT toDate(timestamp) AS snap_date,
                expiry, strike, option_type,
-               argMax(ltp, timestamp) AS ltp,
-               argMax(oi,  timestamp) AS oi
+               argMax(ltp, timestamp) AS last_ltp,
+               argMax(oi,  timestamp) AS last_oi
         FROM market.options_chain FINAL
         WHERE symbol = '{symbol}'
           AND ltp > 0.05
