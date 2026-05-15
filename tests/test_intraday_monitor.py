@@ -379,3 +379,53 @@ def test_stoploss_half_of_target_per_symbol():
         assert monitor.STOPLOSS_INR[sym] <= monitor.TARGET_INR[sym], (
             f"{sym}: STOPLOSS_INR ({monitor.STOPLOSS_INR[sym]}) > TARGET_INR ({monitor.TARGET_INR[sym]})"
         )
+
+
+# ── Net premium gate (high-DTE protection) ───────────────────────────────────
+
+def test_min_net_credit_defined_for_all_symbols():
+    """MIN_NET_CREDIT must exist for every symbol in SYMBOLS."""
+    assert hasattr(monitor, "MIN_NET_CREDIT"), "MIN_NET_CREDIT dict must exist"
+    assert isinstance(monitor.MIN_NET_CREDIT, dict)
+    for sym in monitor.SYMBOLS:
+        assert sym in monitor.MIN_NET_CREDIT, f"MIN_NET_CREDIT missing key '{sym}'"
+        assert monitor.MIN_NET_CREDIT[sym] > 0, f"{sym}: MIN_NET_CREDIT must be > 0"
+
+
+def test_net_premium_gate_blocks_expensive_wings():
+    """record_entry must skip (return None) when wing cost exceeds net credit threshold."""
+    from unittest.mock import MagicMock, patch
+    import intraday_monitor as m
+
+    sym = "NIFTY"
+    snap = {
+        "strike": 24000.0,
+        "ce_ltp": 100.0, "pe_ltp": 100.0,
+        "straddle": 200.0, "atm_iv": 15.0,
+        "expiry": "2026-05-20",
+        "timestamp": "2026-05-15 04:00:00",
+    }
+    ch = MagicMock()
+    # Wing cost = 180 → net_premium = 200 - 180 = 20 < MIN_NET_CREDIT[NIFTY]=30 → skip
+    with patch.object(m, "get_wing_ltps", return_value=(90.0, 90.0)), \
+         patch.object(m, "load_lot_sizes", return_value={"NIFTY": 65}):
+        result = m.record_entry(ch, sym, snap, 65, 70.0, dry_run=True, kite_mgr=None)
+    assert result is None, "record_entry should return None when net_premium < MIN_NET_CREDIT"
+
+
+# ── Intraday scraper SYMBOLS ──────────────────────────────────────────────────
+
+def test_option_chain_intraday_includes_midcpnifty():
+    """option_chain_intraday.py must include MIDCPNIFTY in SYMBOLS to enable Monday data collection."""
+    import importlib, sys, types
+
+    # Stub heavy deps so the module can be imported without installed packages
+    for mod_name in ["jugaad_data", "jugaad_data.nse", "minio"]:
+        if mod_name not in sys.modules:
+            sys.modules[mod_name] = types.ModuleType(mod_name)
+    if "jugaad_data.nse" in sys.modules:
+        sys.modules["jugaad_data.nse"].NSELive = MagicMock
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pipeline"))
+    scraper = importlib.import_module("option_chain_intraday")
+    assert "MIDCPNIFTY" in scraper.SYMBOLS, "MIDCPNIFTY must be in option_chain_intraday SYMBOLS"

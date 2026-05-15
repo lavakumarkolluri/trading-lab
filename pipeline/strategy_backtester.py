@@ -65,15 +65,21 @@ def get_ch():
 # ── Data Loading ──────────────────────────────────────────────────────────────
 
 def load_chain(ch, symbol: str, from_date: Optional[date] = None) -> pd.DataFrame:
-    """Load full options chain for a symbol (all strikes, both dates: prev + expiry)."""
+    """Load full options chain for a symbol.
+    Uses argMax to keep only the last intraday price per (date, expiry, strike, type)
+    so the chain never has duplicate strikes after set_index().
+    """
     date_filter = f"AND toDate(timestamp) >= '{from_date}'" if from_date else ""
     r = ch.query(f"""
         SELECT toDate(timestamp) AS snap_date,
-               expiry, strike, option_type, ltp, oi
+               expiry, strike, option_type,
+               argMax(ltp, timestamp) AS ltp,
+               argMax(oi,  timestamp) AS oi
         FROM market.options_chain FINAL
         WHERE symbol = '{symbol}'
           AND ltp > 0.05
           {date_filter}
+        GROUP BY snap_date, expiry, strike, option_type
         ORDER BY snap_date, expiry, strike, option_type
     """)
     df = pd.DataFrame(r.result_rows,
@@ -127,12 +133,12 @@ def find_atm(chain: pd.DataFrame, snap_date: date, expiry: date) -> Optional[flo
 
 
 
-def compute_iron_condor(idx, entry_date, expiry, atm,
+def compute_iron_condor(idx, entry_date, exit_date, expiry, atm,
                         step, short_n, wing_m) -> Optional[dict]:
     """
     IC: sell (atm + short_n*step) CE + sell (atm - short_n*step) PE
         buy  (atm + (short_n+wing_m)*step) CE + buy (atm - (short_n+wing_m)*step) PE
-    net_credit = sell legs - buy legs  (hedge cost already deducted)
+    Exit prices from exit_date (same day intraday exit, or expiry for settlement).
     """
     sce_k = atm + short_n * step
     spe_k = atm - short_n * step
@@ -150,20 +156,18 @@ def compute_iron_condor(idx, entry_date, expiry, atm,
 
     net_credit = (sce + spe) - (lce + lpe)
     if net_credit <= 0:
-        return None  # debit structure — skip
+        return None
 
-    max_loss = wing_m * step - net_credit  # single-side worst case
+    max_loss = wing_m * step - net_credit
     pnl_pct_denom = wing_m * step
 
-    # Settlement — all 4 legs must be present; missing settlement = skip trade
-    xsce = get_ltp(idx, expiry, expiry, sce_k, "CE")
-    xspe = get_ltp(idx, expiry, expiry, spe_k, "PE")
-    xlce = get_ltp(idx, expiry, expiry, lce_k, "CE")
-    xlpe = get_ltp(idx, expiry, expiry, lpe_k, "PE")
+    xsce = get_ltp(idx, exit_date, expiry, sce_k, "CE")
+    xspe = get_ltp(idx, exit_date, expiry, spe_k, "PE")
+    xlce = get_ltp(idx, exit_date, expiry, lce_k, "CE")
+    xlpe = get_ltp(idx, exit_date, expiry, lpe_k, "PE")
     if any(v is None for v in (xsce, xspe, xlce, xlpe)):
         return None
     exit_cost = (xsce + xspe) - (xlce + xlpe)
-    # Cap at theoretical max: bhavcopy LTP ≠ final settlement in edge cases
     pnl = max(net_credit - exit_cost, -max_loss) if max_loss > 0 else net_credit - exit_cost
 
     return dict(
@@ -181,12 +185,11 @@ def compute_iron_condor(idx, entry_date, expiry, atm,
     )
 
 
-def compute_bull_put(idx, entry_date, expiry, atm,
+def compute_bull_put(idx, entry_date, exit_date, expiry, atm,
                      step, short_n, wing_m) -> Optional[dict]:
     """
-    Bull Put Spread (bullish): sell (atm - short_n*step) PE, buy (atm - (short_n+wing_m)*step) PE
-    Profits if spot stays above the short PE strike.
-    Hedge cost (long PE) is deducted from net_credit.
+    Bull Put Spread: sell (atm - short_n*step) PE, buy (atm - (short_n+wing_m)*step) PE.
+    Exit prices from exit_date snapshot.
     """
     spe_k = atm - short_n * step
     lpe_k = atm - (short_n + wing_m) * step
@@ -198,13 +201,13 @@ def compute_bull_put(idx, entry_date, expiry, atm,
     if spe < 0.05 or lpe < 0.05:
         return None
 
-    net_credit = spe - lpe   # hedge cost deducted
+    net_credit = spe - lpe
     if net_credit <= 0:
         return None
     max_loss = wing_m * step - net_credit
 
-    xspe = get_ltp(idx, expiry, expiry, spe_k, "PE")
-    xlpe = get_ltp(idx, expiry, expiry, lpe_k, "PE")
+    xspe = get_ltp(idx, exit_date, expiry, spe_k, "PE")
+    xlpe = get_ltp(idx, exit_date, expiry, lpe_k, "PE")
     if xspe is None or xlpe is None:
         return None
     exit_cost = xspe - xlpe
@@ -225,12 +228,11 @@ def compute_bull_put(idx, entry_date, expiry, atm,
     )
 
 
-def compute_bear_call(idx, entry_date, expiry, atm,
+def compute_bear_call(idx, entry_date, exit_date, expiry, atm,
                       step, short_n, wing_m) -> Optional[dict]:
     """
-    Bear Call Spread (bearish): sell (atm + short_n*step) CE, buy (atm + (short_n+wing_m)*step) CE
-    Profits if spot stays below the short CE strike.
-    Hedge cost (long CE) is deducted from net_credit.
+    Bear Call Spread: sell (atm + short_n*step) CE, buy (atm + (short_n+wing_m)*step) CE.
+    Exit prices from exit_date snapshot.
     """
     sce_k = atm + short_n * step
     lce_k = atm + (short_n + wing_m) * step
@@ -247,8 +249,8 @@ def compute_bear_call(idx, entry_date, expiry, atm,
         return None
     max_loss = wing_m * step - net_credit
 
-    xsce = get_ltp(idx, expiry, expiry, sce_k, "CE")
-    xlce = get_ltp(idx, expiry, expiry, lce_k, "CE")
+    xsce = get_ltp(idx, exit_date, expiry, sce_k, "CE")
+    xlce = get_ltp(idx, exit_date, expiry, lce_k, "CE")
     if xsce is None or xlce is None:
         return None
     exit_cost = xsce - xlce
@@ -269,14 +271,15 @@ def compute_bear_call(idx, entry_date, expiry, atm,
     )
 
 
-def compute_iron_fly(idx, entry_date, expiry, atm,
+def compute_iron_fly(idx, entry_date, exit_date, expiry, atm,
                      step, symbol) -> Optional[dict]:
     """
     Iron Fly: sell ATM CE + sell ATM PE (straddle),
               buy  (atm + wing_m*step) CE + buy (atm - wing_m*step) PE (wings).
 
-    Uses fixed wing distance per symbol (IRON_FLY_WINGS).
-    short_n=0 (sell at ATM), wing_m=symbol-specific step count.
+    Entry prices from entry_date snapshot (prev-day EOD ≈ next-morning open).
+    Exit prices from exit_date snapshot (EOD of the day we hold the position).
+    For DTE=1: exit_date == expiry (settlement day) — matches the original 0DTE logic.
     """
     wing_m = IRON_FLY_WINGS.get(symbol, 4)
 
@@ -294,12 +297,18 @@ def compute_iron_fly(idx, entry_date, expiry, atm,
         return None
     max_loss = wing_m * step - net_credit
 
-    # Settlement: missing = option expired OTM (worthless = 0.0).
-    # load_chain filters ltp > 0.05, so deep-OTM legs are absent on expiry day.
-    xsce = get_ltp(idx, expiry, expiry, atm, "CE") or 0.0
-    xspe = get_ltp(idx, expiry, expiry, atm, "PE") or 0.0
-    xlce = get_ltp(idx, expiry, expiry, atm + wing_m * step, "CE") or 0.0
-    xlpe = get_ltp(idx, expiry, expiry, atm - wing_m * step, "PE") or 0.0
+    # Exit prices: use exit_date snapshot. On expiry day, missing = expired OTM (0.0).
+    is_expiry = (exit_date == expiry)
+    xsce = get_ltp(idx, exit_date, expiry, atm, "CE")
+    xspe = get_ltp(idx, exit_date, expiry, atm, "PE")
+    xlce = get_ltp(idx, exit_date, expiry, atm + wing_m * step, "CE")
+    xlpe = get_ltp(idx, exit_date, expiry, atm - wing_m * step, "PE")
+    if is_expiry:
+        xsce = xsce or 0.0; xspe = xspe or 0.0
+        xlce = xlce or 0.0; xlpe = xlpe or 0.0
+    elif any(v is None for v in (xsce, xspe, xlce, xlpe)):
+        return None  # non-expiry: need all 4 legs present
+
     exit_cost = (xsce + xspe) - (xlce + xlpe)
     pnl = max(net_credit - exit_cost, -max_loss) if max_loss > 0 else net_credit - exit_cost
 
@@ -329,50 +338,56 @@ def process_symbol(ch, symbol: str, from_date: Optional[date] = None) -> pd.Data
     idx = build_index(chain)
 
     expiries      = sorted(chain["expiry"].unique())
-    expiry_snaps  = set(chain["snap_date"].unique())
-    log.info(f"[{symbol}] {len(expiries)} expiry dates, building index done")
+    trading_days  = sorted(chain["snap_date"].unique())
+    log.info(f"[{symbol}] {len(expiries)} expiries, {len(trading_days)} trading days")
+
+    # prev_day_map: for each snap_date, the immediately preceding snap_date
+    prev_day_map  = {trading_days[i]: trading_days[i - 1]
+                     for i in range(1, len(trading_days))}
+
+    MAX_DTE = 5   # only trade within 5 days of expiry (wings too expensive beyond)
 
     rows = []
-    for expiry in expiries:
-        # Previous trading day (latest snap before expiry)
-        candidates = sorted(chain[
-            (chain.expiry == expiry) & (chain.snap_date < expiry)
-        ]["snap_date"].unique())
-        if not candidates:
-            continue
-        entry_date = candidates[-1]
+    for cur_day in trading_days:
+        prev_day = prev_day_map.get(cur_day)
+        if prev_day is None:
+            continue  # no prior trading day — can't price entry
 
-        # Need expiry-day settlement data
-        if expiry not in expiry_snaps:
-            continue
+        for expiry in expiries:
+            if cur_day > expiry:
+                continue  # past expiry
+            dte = (expiry - cur_day).days
+            if dte > MAX_DTE:
+                continue  # wings uneconomical beyond 5 days
 
-        atm = find_atm(chain, entry_date, expiry)
-        if atm is None:
-            continue
+            # Entry ATM from prev_day (approximates opening price on cur_day)
+            atm = find_atm(chain, prev_day, expiry)
+            if atm is None:
+                continue
 
-        step = detect_strike_step(chain, symbol, expiry)
-        base = dict(symbol=symbol, expiry=expiry, entry_date=entry_date,
-                    atm_strike=atm, strike_step=step)
+            step = detect_strike_step(chain, symbol, expiry)
+            base = dict(symbol=symbol, expiry=expiry, entry_date=prev_day,
+                        atm_strike=atm, strike_step=step)
 
-        # Iron fly: single fixed configuration per expiry (short_n=0, ATM straddle)
-        r = compute_iron_fly(idx, entry_date, expiry, atm, step, symbol)
-        if r:
-            rows.append({**base, **r})
+            # Iron fly (primary strategy): entry=prev_day prices, exit=cur_day prices
+            r = compute_iron_fly(idx, prev_day, cur_day, expiry, atm, step, symbol)
+            if r:
+                rows.append({**base, **r})
 
-        # Hedged strategies only — no naked positions
-        for sn in range(1, SHORT_N_MAX + 1):
-            for wm in range(1, WING_M_MAX + 1):
-                for fn in [compute_iron_condor, compute_bull_put, compute_bear_call]:
-                    r = fn(idx, entry_date, expiry, atm, step, sn, wm)
-                    if r:
-                        rows.append({**base, **r})
+            # Hedged directional strategies
+            for sn in range(1, SHORT_N_MAX + 1):
+                for wm in range(1, WING_M_MAX + 1):
+                    for fn in [compute_iron_condor, compute_bull_put, compute_bear_call]:
+                        r = fn(idx, prev_day, cur_day, expiry, atm, step, sn, wm)
+                        if r:
+                            rows.append({**base, **r})
 
     df = pd.DataFrame(rows)
     if df.empty:
         log.warning(f"[{symbol}] no valid trades found")
         return df
 
-    log.info(f"[{symbol}] {len(df)} strategy×expiry combinations")
+    log.info(f"[{symbol}] {len(df)} strategy×date combinations")
     return df
 
 

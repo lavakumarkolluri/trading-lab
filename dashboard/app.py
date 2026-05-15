@@ -1724,6 +1724,107 @@ elif page == "Trade Log":
 
     st.divider()
 
+    # ── D1b: Cumulative P&L curve + DTE breakdown ─────────────────────────────
+    pnl_curve_df = query("""
+        SELECT toDate(exit_time) AS exit_date,
+               symbol,
+               sum(pnl_inr) AS daily_pnl_inr
+        FROM trades.trade_outcomes FINAL
+        GROUP BY exit_date, symbol
+        ORDER BY symbol, exit_date
+    """)
+
+    dte_paper_df = query("""
+        SELECT dateDiff('day', toDate(entry_time), expiry) AS dte,
+               symbol,
+               count() AS trades,
+               countIf(pnl_inr > 0) AS wins,
+               round(avg(pnl_inr), 0) AS avg_pnl_inr
+        FROM trades.trade_outcomes FINAL
+        GROUP BY dte, symbol
+        ORDER BY dte, symbol
+    """)
+
+    dte_bt_df = query("""
+        SELECT symbol,
+               toInt32(dateDiff('day', toDate(entry_date), toDate(expiry))) AS dte,
+               count() AS n_trades,
+               countIf(target = 1) AS wins,
+               round(avg(pnl_pts), 1) AS avg_pnl_pts,
+               round(avg(net_credit), 1) AS avg_net_credit
+        FROM analysis.spread_backtest FINAL
+        WHERE strategy = 'iron_fly'
+        GROUP BY symbol, dte
+        ORDER BY symbol, dte
+    """)
+
+    tab_curve, tab_dte_paper, tab_dte_bt = st.tabs(
+        ["📈 Cumulative P&L", "📊 DTE — Paper Trades", "🔬 DTE — Backtest"]
+    )
+
+    with tab_curve:
+        if pnl_curve_df.empty:
+            st.info("No completed trades yet — P&L curve will appear after first paper trade.")
+        else:
+            pnl_curve_df["exit_date"] = pd.to_datetime(pnl_curve_df["exit_date"])
+            cumdf_rows = []
+            for sym, grp in pnl_curve_df.groupby("symbol"):
+                grp = grp.sort_values("exit_date").copy()
+                grp["cum_pnl"] = grp["daily_pnl_inr"].cumsum()
+                cumdf_rows.append(grp)
+            if cumdf_rows:
+                cumdf = pd.concat(cumdf_rows)
+                import plotly.express as px
+                fig_curve = px.line(
+                    cumdf, x="exit_date", y="cum_pnl", color="symbol",
+                    labels={"exit_date": "Date", "cum_pnl": "Cumulative P&L (₹)", "symbol": "Symbol"},
+                    title="Cumulative Paper Trade P&L by Symbol",
+                )
+                fig_curve.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_curve.update_layout(height=350)
+                st.plotly_chart(fig_curve, use_container_width=True)
+
+    with tab_dte_paper:
+        if dte_paper_df.empty:
+            st.info("No paper trades yet — DTE breakdown will appear after first trade.")
+        else:
+            dte_paper_df["win_rate"] = (
+                dte_paper_df["wins"] / dte_paper_df["trades"] * 100
+            ).round(0).astype(int).astype(str) + "%"
+            dte_paper_df.rename(columns={
+                "dte": "DTE", "symbol": "Symbol", "trades": "Trades",
+                "wins": "Wins", "avg_pnl_inr": "Avg P&L (₹)", "win_rate": "Win Rate",
+            }, inplace=True)
+            st.dataframe(dte_paper_df[["Symbol","DTE","Trades","Wins","Win Rate","Avg P&L (₹)"]],
+                         use_container_width=True, hide_index=True)
+
+    with tab_dte_bt:
+        if dte_bt_df.empty:
+            st.info("No backtest data — run strategy_backtester first.")
+        else:
+            dte_bt_df["win_rate_pct"] = (
+                dte_bt_df["wins"] / dte_bt_df["n_trades"] * 100
+            ).round(1)
+            pivot = dte_bt_df.pivot_table(
+                index="dte", columns="symbol",
+                values="win_rate_pct", aggfunc="first"
+            ).round(1)
+            st.caption("Win Rate % by DTE × Symbol (from backtester)")
+            st.dataframe(pivot, use_container_width=True)
+
+            import plotly.express as px
+            fig_bt = px.bar(
+                dte_bt_df, x="dte", y="avg_pnl_pts", color="symbol",
+                barmode="group",
+                labels={"dte": "DTE", "avg_pnl_pts": "Avg P&L (pts)", "symbol": "Symbol"},
+                title="Avg Iron Fly P&L (pts) by DTE",
+            )
+            fig_bt.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig_bt.update_layout(height=320)
+            st.plotly_chart(fig_bt, use_container_width=True)
+
+    st.divider()
+
     # ── D2: Open Positions ────────────────────────────────────────────────────
     st.subheader("📂 Open Positions")
     if st.button("🔄 Refresh positions", key="refresh_pos"):

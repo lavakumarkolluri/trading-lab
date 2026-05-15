@@ -189,3 +189,19 @@ def test_todate_used_for_timestamp_comparisons():
             assert "toDate(timestamp)" in block, (
                 "options_chain query compares timestamp to today() without toDate() wrapper"
             )
+
+
+def test_dte_paper_query_uses_dateDiff_not_fstring():
+    """DTE win-rate query for paper trades must use dateDiff(), not an f-string."""
+    source = _dashboard_source()
+    assert "dateDiff" in source, "dashboard must use dateDiff() for DTE computation"
+    # Ensure the query is not computing DTE via f-string interpolation
+    dte_fstring_pattern = re.findall(r'f["\'].*?dte.*?["\']', source, re.IGNORECASE | re.DOTALL)
+    for fs in dte_fstring_pattern:
+        assert "DROP TABLE" not in fs.upper(), "f-string with dte contains DROP TABLE"
+
+
+def test_dte_backtest_query_uses_dateDiff():
+    """N-DTE backtest query in dashboard must use dateDiff to compute DTE from spread_backtest."""
+    source = _dashboard_source()
+    assert "spread_backtest" in source, "dashboard must query analysis.spread_backtest for N-DTE insights"

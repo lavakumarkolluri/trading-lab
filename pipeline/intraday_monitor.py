@@ -63,6 +63,7 @@ MONITOR_EXIT     = dtime(15, 25)
 STOP_COOLDOWN_M  = 30         # minutes to wait before re-entry after stop hit
 
 MIN_PREMIUM       = {"NIFTY": 40.0, "BANKNIFTY": 80.0, "FINNIFTY": 50.0, "MIDCPNIFTY": 30.0}
+MIN_NET_CREDIT    = {"NIFTY": 30.0, "BANKNIFTY": 60.0, "FINNIFTY": 40.0, "MIDCPNIFTY": 20.0}
 MIN_CONFIDENCE    = 60.0   # skip entry if scorecard below this (raised from 50 — coin-flip threshold)
 
 # Iron fly wing distances (OTM strikes to buy for defined-risk structure)
@@ -589,6 +590,11 @@ def record_entry(ch, symbol, snap, lot_size, scorecard_conf,
         ch, symbol, snap["expiry"], wing_ce_strike, wing_pe_strike
     )
     net_premium = snap["straddle"] - wing_ce_ltp - wing_pe_ltp
+
+    min_net = MIN_NET_CREDIT.get(symbol, 30.0)
+    if net_premium < min_net:
+        log.info(f"[{symbol}] net_premium {net_premium:.1f} < {min_net} — wings too expensive, skip entry")
+        return
 
     features = json.dumps({
         "strike":         snap["strike"],
