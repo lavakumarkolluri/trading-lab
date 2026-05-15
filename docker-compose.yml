@@ -972,6 +972,7 @@ services:
     environment:
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
       - TZ=Asia/Kolkata
+      - CH_PASSWORD=${CH_PASSWORD}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
