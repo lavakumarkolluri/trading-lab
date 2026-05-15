@@ -1,5 +1,5 @@
 # Trading Lab — Prioritised Backlog
-**Last updated:** 2026-05-15 (session 3)
+**Last updated:** 2026-05-15 (session 4)
 **Process:** Every fix must have a failing test written first (TDD). Tests must run offline (mock DB). Push to `stage` — never `master` directly.
 **Single source of truth** — progress.md removed; all status tracked here.
 
@@ -105,9 +105,9 @@
 
 ---
 
-### MED-002 — No tests for strategy_backtester iron fly logic
-**File:** `tests/test_strategy_backtester.py` (exists but limited)
-**Fix:** Add iron fly P&L unit tests; assert `net_pnl = premium - wing_cost - txn_cost`.
+### ~~MED-002~~ ✅ FIXED 2026-05-15 — Extended backtester tests + N-DTE tests added
+**File:** `tests/test_strategy_backtester.py`
+**Fix:** Added N-DTE tests: `test_iron_fly_ndte_uses_exit_date_not_expiry`, `test_iron_fly_ndte_missing_exit_leg_returns_none`, `test_process_symbol_generates_ndte_rows`. 434 tests pass.
 
 ---
 
@@ -147,6 +147,49 @@ Services `breakout_backtest`, `gap_analyzer`, `pattern_feature_extractor` unused
 
 ---
 
+---
+
+## Daily Paper Trading Enablement (Sprint 7 — 2026-05-15)
+
+### ~~DAILY-001~~ ✅ FIXED 2026-05-15 — MIDCPNIFTY missing from intraday scraper
+**File:** `pipeline/option_chain_intraday.py` line 47
+**Fix:** Added `"MIDCPNIFTY"` to `SYMBOLS`. Enables Monday data collection → Monday paper trades.
+
+---
+
+### ~~DAILY-002~~ ✅ FIXED 2026-05-15 — No net premium gate (wing cost ignored)
+**File:** `pipeline/intraday_monitor.py` `record_entry()`
+**Fix:** Added `MIN_NET_CREDIT` dict and gate: skip if `net_premium < MIN_NET_CREDIT[symbol]`. Protects against entering high-DTE trades where wings cost more than straddle.
+
+---
+
+### ~~DAILY-003~~ ✅ FIXED 2026-05-15 — Backtester only generates 0DTE trades
+**File:** `pipeline/strategy_backtester.py` `process_symbol()`
+**Fix:** Extended to N-DTE loop (MAX_DTE=5). All `compute_*` functions accept `exit_date` param. Migration 082 adds `entry_date` to `spread_backtest` ORDER BY.
+
+---
+
+### ~~DAILY-004~~ ✅ FIXED 2026-05-15 — DTE not a feature in confidence model
+**File:** `pipeline/confidence_scorer.py`
+**Fix:** `build_dataset()` iterates all (expiry, entry_date) pairs; adds `dte` column. `FEATURE_COLS` includes `"dte"`. `score_today()` populates `dte = (next_expiry − latest_snap).days`.
+
+---
+
+### ~~DAILY-005~~ ✅ FIXED 2026-05-15 — No cumulative P&L visibility
+**File:** `dashboard/app.py` Trade Log page
+**Fix:** Added 3 tabs: Cumulative P&L curve (per symbol), DTE win-rate (paper trades), N-DTE backtest win-rate pivot + bar chart from `analysis.spread_backtest`.
+
+---
+
+### DAILY-006 — Retrain confidence_scorer after N-DTE backtest runs
+**Status:** Pending — backtester is running (N-DTE expansion). After completion:
+```bash
+docker compose run --rm pipeline python confidence_scorer.py --compare
+```
+Then rebuild intraday_monitor image and restart.
+
+---
+
 ## Sprint 6 Completion Criteria (target 2026-05-20)
 
 - [x] CRIT-001 ✅
@@ -159,7 +202,7 @@ Services `breakout_backtest`, `gap_analyzer`, `pattern_feature_extractor` unused
 - [x] HIGH-002 ✅ verified (5 pages already)
 - [x] HIGH-004 ✅
 - [x] HIGH-007 ✅ (2026-05-15)
-- [x] 424 tests pass, 0 deprecation warnings (2026-05-15)
+- [x] 434 tests pass, 0 deprecation warnings (2026-05-15, session 4)
 - [x] HIGH-006 ✅ symbol-aware risk params
 - [x] MED-001 ✅ verified — gates already in place
 - [x] MED-003 ✅ utcnow swept across all active pipeline files

@@ -65,15 +65,21 @@ def get_ch():
 # ── Data Loading ──────────────────────────────────────────────────────────────
 
 def load_chain(ch, symbol: str, from_date: Optional[date] = None) -> pd.DataFrame:
-    """Load full options chain for a symbol (all strikes, both dates: prev + expiry)."""
+    """Load full options chain for a symbol.
+    Uses argMax to keep only the last intraday price per (date, expiry, strike, type)
+    so the chain never has duplicate strikes after set_index().
+    """
     date_filter = f"AND toDate(timestamp) >= '{from_date}'" if from_date else ""
     r = ch.query(f"""
         SELECT toDate(timestamp) AS snap_date,
-               expiry, strike, option_type, ltp, oi
+               expiry, strike, option_type,
+               argMax(ltp, timestamp) AS ltp,
+               argMax(oi,  timestamp) AS oi
         FROM market.options_chain FINAL
         WHERE symbol = '{symbol}'
           AND ltp > 0.05
           {date_filter}
+        GROUP BY snap_date, expiry, strike, option_type
         ORDER BY snap_date, expiry, strike, option_type
     """)
     df = pd.DataFrame(r.result_rows,
