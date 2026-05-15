@@ -88,7 +88,7 @@ def _record_run(service: str, started_at: datetime, status: str,
     if not _TRACKING_OK:
         return
     if finished_at is None:
-        finished_at = datetime.utcnow()
+        finished_at = datetime.now(timezone.utc)
     try:
         ch = _ch_client()
         ch.command(
@@ -229,7 +229,7 @@ def job_auto_deploy():
         pipeline_changed = any(f.startswith("pipeline/") for f in changed)
         if pipeline_changed:
             # Block self-restart during market hours to prevent missing intraday launches.
-            if _is_intraday_market_hours(datetime.utcnow()):
+            if _is_intraday_market_hours(datetime.now(timezone.utc)):
                 log.warning(
                     "AUTO-DEPLOY: pipeline changed but skipping self-restart "
                     "— market hours active (03:30-10:00 UTC). Will restart after 10:00 UTC."
@@ -289,17 +289,17 @@ def _upstream_ok(service: str, today_date: str) -> tuple[bool, str]:
 
 def _run(service: str, *args: str):
     cmd = COMPOSE_CMD + [service] + list(args)
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     ok, reason = _upstream_ok(service, today_str)
     if not ok:
         log.warning("SKIPPING %s — %s", service, reason)
-        started = datetime.utcnow()
+        started = datetime.now(timezone.utc)
         _record_run(service, started, "skipped", error_msg=reason)
         return
 
     log.info("Running: %s", " ".join(cmd))
-    started = datetime.utcnow()
+    started = datetime.now(timezone.utc)
     try:
         result = subprocess.run(cmd, capture_output=False, text=True, check=False)
     except Exception as e:
@@ -417,7 +417,7 @@ def _run_tests_and_record():
         return
     import re as _re
     test_dir = "/trading-lab/tests"
-    t0 = datetime.utcnow()
+    t0 = datetime.now(timezone.utc)
     try:
         result = subprocess.run(
             ["python", "-m", "pytest", test_dir, "--tb=line", "-q", "--no-header"],
@@ -437,7 +437,7 @@ def _run_tests_and_record():
             status = "error"
     except Exception as e:
         n_pass, n_fail, failed_names, status = 0, 0, str(e)[:200], "error"
-    duration = (datetime.utcnow() - t0).total_seconds()
+    duration = (datetime.now(timezone.utc) - t0).total_seconds()
 
     # Collect git info from the mounted repo
     try:
@@ -452,7 +452,7 @@ def _run_tests_and_record():
 
     try:
         ch = _ch_client()
-        run_at = datetime.utcnow()
+        run_at = datetime.now(timezone.utc)
         row = [branch, sha, msg, author, cts,
                n_pass, n_fail, n_pass + n_fail,
                duration, failed_names, status, run_at]
@@ -491,7 +491,7 @@ def job_events_pipeline():
 
 def job_holidays():
     """Run only on the 1st of each month."""
-    if datetime.utcnow().day != 1:
+    if datetime.now(timezone.utc).day != 1:
         return
     log.info("=== Holidays pipeline monthly refresh triggered ===")
     _run("holidays_pipeline")
@@ -558,7 +558,7 @@ def _cleanup_minio_intraday():
         from minio import Minio
         mc = Minio(minio_host, access_key=minio_user,
                    secret_key=minio_pass, secure=False)
-        cutoff = datetime.utcnow() - timedelta(days=30)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
         bucket = "trading-data"
         if not mc.bucket_exists(bucket):
             _log_cleanup("minio_intraday", "skipped", detail="bucket not found")
@@ -583,7 +583,7 @@ def _cleanup_logs():
     """Truncate workspace log files older than 7 days to keep disk usage bounded."""
     import glob as _glob
     log_dir = os.getenv("LOG_DIR", "/trading-lab/workspace/logs")
-    cutoff = datetime.utcnow() - timedelta(days=7)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     truncated = 0
     freed = 0
     for path in _glob.glob(f"{log_dir}/*.log"):
@@ -829,7 +829,7 @@ def job_cleanup_kpi_check():
     except Exception as e:
         log.warning("Cleanup KPI check failed: %s", e)
         return
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     for task, last_ran in rows:
         age_days = (now - last_ran).days if last_ran else 999
         if age_days > 10:
@@ -864,7 +864,7 @@ def _startup_recovery():
     EOD recovery: if within 12:30-16:30 UTC and option_chain_historical has
     no DB run record, re-trigger the EOD chain.
     """
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     if now_utc.weekday() >= 5:  # weekend — no recovery
         return
 
@@ -933,7 +933,7 @@ def _startup_recovery():
 
 def _recompute_check():
     """Print today's run status for all tracked services and exit."""
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     print(f"\nRecompute check — {today_str}")
     print(f"{'Service':<40} {'Status':<10} {'Upstream OK'}")
     print("-" * 70)

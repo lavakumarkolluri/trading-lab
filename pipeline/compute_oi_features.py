@@ -21,6 +21,7 @@ Usage:
 
 import os
 import math
+import time
 import argparse
 from datetime import date, datetime, timezone
 
@@ -215,7 +216,7 @@ def main():
     log.info(f"Computed {len(updates)} dates — updating options_eod_summary...")
 
     # Rebuild full rows with new columns
-    version = int(datetime.utcnow().timestamp())
+    version = int(time.time())
     existing = ch.query_df(f"""
         SELECT * FROM market.options_eod_summary FINAL
         WHERE date >= '{from_date}'

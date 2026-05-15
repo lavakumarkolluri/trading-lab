@@ -12,7 +12,7 @@ Usage:
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 GIT_SHA = "unknown"
 try:
@@ -37,7 +37,7 @@ class PipelineRun:
         return ch_client()
 
     def __enter__(self):
-        self._started_at = datetime.utcnow()
+        self._started_at = datetime.now(timezone.utc)
         ch = self._get_ch()
         self.run_id = ch.query(
             """
@@ -71,7 +71,7 @@ class PipelineRun:
     def __exit__(self, exc_type, exc_val, exc_tb):
         status = "failed" if exc_type else "success"
         error_msg = str(exc_val) if exc_val else ""
-        finished_at = datetime.utcnow()
+        finished_at = datetime.now(timezone.utc)
         try:
             ch = self._get_ch()
             ch.command(
@@ -106,14 +106,14 @@ class PipelineRun:
 
 def record_run(ch, service: str, status: str, started_at, error_msg: str = ""):
     """Lightweight one-shot run record for scripts that don't use PipelineRun context."""
-    from datetime import datetime
+    from datetime import datetime, timezone
     try:
         ch.command(
             """INSERT INTO system_meta.pipeline_runs
                (service, started_at, finished_at, status, git_sha, error_msg)
                VALUES ({svc:String},{start:DateTime},{end:DateTime},{st:String},{sha:String},{err:String})""",
             parameters={"svc": service, "start": started_at,
-                        "end": datetime.utcnow(), "st": status,
+                        "end": datetime.now(timezone.utc), "st": status,
                         "sha": GIT_SHA, "err": error_msg},
         )
     except Exception as e:

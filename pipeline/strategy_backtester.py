@@ -27,7 +27,7 @@ Usage:
 
 import os
 import argparse
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -443,7 +443,7 @@ def main():
     from_date = date.fromisoformat(args.from_date) if args.from_date else None
     symbols   = [args.symbol] if args.symbol else SYMBOLS
 
-    started_at = datetime.utcnow()
+    started_at = datetime.now(timezone.utc)
     try:
         all_frames = []
         for sym in symbols:

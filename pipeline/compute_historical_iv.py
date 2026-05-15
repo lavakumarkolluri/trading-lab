@@ -27,6 +27,7 @@ Docker:
 
 import math
 import argparse
+import time
 from datetime import date, datetime
 
 import pandas as pd
@@ -236,8 +237,7 @@ def update_summary(ch, symbol: str, updates: list[dict]):
     )
     existing["date"] = pd.to_datetime(existing["date"]).dt.date
 
-    now     = datetime.utcnow()
-    version = int(now.timestamp())
+    version = int(time.time())
     rows    = []
 
     for u in updates:

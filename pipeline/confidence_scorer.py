@@ -28,7 +28,7 @@ import json
 import os
 import pickle
 import argparse
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -1142,7 +1142,7 @@ def main():
     target_syms = [args.symbol] if args.symbol else SYMBOLS
     target_strategies = [args.strategy] if args.strategy else STRATEGY_TYPES
 
-    started_at = datetime.utcnow()
+    started_at = datetime.now(timezone.utc)
     try:
         if args.compare:
             for strat in target_strategies:

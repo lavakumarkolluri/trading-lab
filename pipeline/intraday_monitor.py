@@ -51,8 +51,8 @@ SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 
 DEFAULT_LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120}
 
-TARGET_INR   = 2000.0
-STOPLOSS_INR = 1000.0
+TARGET_INR   = {"NIFTY": 2000.0, "BANKNIFTY": 3000.0, "FINNIFTY": 1500.0, "MIDCPNIFTY": 1000.0}
+STOPLOSS_INR = {"NIFTY": 1000.0, "BANKNIFTY": 1500.0, "FINNIFTY":  750.0, "MIDCPNIFTY":  500.0}
 TRAIL_PCT    = 0.75        # trail stop = 75% of peak profit
 
 LOOP_INTERVAL_S  = 5 * 60    # 5 minutes
@@ -576,8 +576,10 @@ def last_stop_time(ch, symbol: str) -> datetime | None:
 def record_entry(ch, symbol, snap, lot_size, scorecard_conf,
                  dry_run=False, kite_mgr: KiteOrderManager | None = None) -> str:
     trade_id = str(uuid.uuid4())
-    target_pts  = TARGET_INR / lot_size
-    stop_pts    = STOPLOSS_INR / lot_size
+    sym_target   = TARGET_INR.get(symbol, 2000.0)
+    sym_stop     = STOPLOSS_INR.get(symbol, 1000.0)
+    target_pts  = sym_target / lot_size
+    stop_pts    = sym_stop   / lot_size
     entry_time  = ist_naive()
 
     # Iron fly wings: buy OTM CE and PE to cap max loss
@@ -619,8 +621,8 @@ def record_entry(ch, symbol, snap, lot_size, scorecard_conf,
         )
         # TODO: also BUY wing_ce and wing_pe via kite for live iron fly
 
-    target_inr   = TARGET_INR   * lots
-    stoploss_inr = STOPLOSS_INR * lots
+    target_inr   = sym_target * lots
+    stoploss_inr = sym_stop   * lots
 
     if not dry_run:
         ch.insert(
@@ -808,7 +810,7 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
 
         # Target hit — activate trailing instead of exiting
         if pnl_inr >= float(pos["target_inr"]):
-            log.info(f"[{symbol}] TARGET ₹{TARGET_INR:.0f} hit — activating trailing stop")
+            log.info(f"[{symbol}] TARGET ₹{TARGET_INR.get(symbol, 2000):.0f} hit — activating trailing stop")
             update_trail(ch, pos, pnl_inr, dry_run)
             return
 
@@ -850,7 +852,7 @@ def tick(ch, symbol: str, lot_sizes: dict, dry_run: bool,
              f"straddle={snap['straddle']:.1f} iv={snap['atm_iv']:.1f}%")
 
     # Entry gate: premium must be large enough relative to stop
-    stop_pts = STOPLOSS_INR / lot_size
+    stop_pts = STOPLOSS_INR.get(symbol, 1000.0) / lot_size
     if snap["straddle"] < min_premium:
         log.info(f"[{symbol}] premium {snap['straddle']:.1f} < min {min_premium} — skip")
         return
@@ -908,8 +910,8 @@ def main():
         log.info("=== Intraday Straddle Monitor (paper trading) ===")
 
     log.info(f"Symbols        : {SYMBOLS}")
-    log.info(f"Target         : ₹{TARGET_INR:.0f} → trailing at {TRAIL_PCT:.0%} of peak")
-    log.info(f"Stop loss      : ₹{STOPLOSS_INR:.0f}")
+    log.info(f"Target         : {TARGET_INR} → trailing at {TRAIL_PCT:.0%} of peak")
+    log.info(f"Stop loss      : {STOPLOSS_INR}")
     log.info(f"Entry window   : {ENTRY_START}–{ENTRY_CUTOFF} IST")
     log.info(f"EOD exit       : {EOD_EXIT} IST")
     log.info(f"Loop interval  : {LOOP_INTERVAL_S//60} min")

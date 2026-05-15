@@ -18,7 +18,7 @@ import time
 import urllib.request
 import zoneinfo
 from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 
 from ch_utils import ch_client as _ch_client, write_alert_log
@@ -371,7 +371,7 @@ def run_pending_verifications(
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def _tick(ch, state: WatchdogState) -> None:
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     today   = now_utc.strftime("%Y-%m-%d")
 
     run_pending_verifications(ch, state, today, now_utc)
