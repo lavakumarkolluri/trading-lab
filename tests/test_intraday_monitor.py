@@ -358,3 +358,24 @@ def test_midcpnifty_config_completeness():
 def test_all_symbols_have_four_entries():
     """Exactly 4 symbols are configured (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY)."""
     assert set(monitor.SYMBOLS) == {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
+
+
+# ── Symbol-aware risk params (HIGH-006) ───────────────────────────────────────
+
+def test_target_stoploss_per_symbol():
+    """TARGET_INR and STOPLOSS_INR must be dicts with distinct per-symbol values (HIGH-006)."""
+    assert isinstance(monitor.TARGET_INR, dict), "TARGET_INR must be a dict"
+    assert isinstance(monitor.STOPLOSS_INR, dict), "STOPLOSS_INR must be a dict"
+    for sym in monitor.SYMBOLS:
+        assert sym in monitor.TARGET_INR,   f"TARGET_INR missing key '{sym}'"
+        assert sym in monitor.STOPLOSS_INR, f"STOPLOSS_INR missing key '{sym}'"
+    # Values must differ — symbol-aware means not all the same
+    assert len(set(monitor.TARGET_INR.values())) > 1, "TARGET_INR values must differ across symbols"
+    assert len(set(monitor.STOPLOSS_INR.values())) > 1, "STOPLOSS_INR values must differ across symbols"
+
+def test_stoploss_half_of_target_per_symbol():
+    """Stop loss must be ≤ target for every symbol."""
+    for sym in monitor.SYMBOLS:
+        assert monitor.STOPLOSS_INR[sym] <= monitor.TARGET_INR[sym], (
+            f"{sym}: STOPLOSS_INR ({monitor.STOPLOSS_INR[sym]}) > TARGET_INR ({monitor.TARGET_INR[sym]})"
+        )

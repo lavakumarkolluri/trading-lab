@@ -16,7 +16,8 @@ Usage:
 
 import argparse
 import os
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timezone
 
 from ch_utils import ch_client
 from logging_utils import get_logger
@@ -229,7 +230,7 @@ def upsert_graduation(ch, strategy_id: str, strategy_name: str,
                        bt: dict, bt_gates: dict,
                        paper: dict, paper_gates: dict,
                        micro: dict, micro_gates: dict):
-    now = int(datetime.utcnow().timestamp())
+    now = int(time.time())
     row = [
         strategy_id, strategy_name,
         stage, stage_label, stage_since,
@@ -240,7 +241,7 @@ def upsert_graduation(ch, strategy_id: str, strategy_name: str,
         paper_gates["trades"], paper_gates["win_rate"], paper_gates["pnl"],
         micro["micro_trades"], micro["micro_win_rate"], micro["micro_net_pnl"],
         micro_gates["trades"], micro_gates["win_rate"], micro_gates["pnl"],
-        datetime.utcnow(), now,
+        datetime.now(timezone.utc).replace(tzinfo=None), now,
     ]
     cols = [
         "strategy_id", "strategy_name", "stage", "stage_label", "stage_since",

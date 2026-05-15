@@ -312,7 +312,7 @@ def test_startup_recovery_launches_monitor_if_not_running():
          patch.object(s, "job_option_chain_intraday") as mock_oc, \
          patch.object(s, "_TRACKING_OK", False), \
          patch.dict("os.environ", {"CH_PASSWORD": "secret"}):
-        mock_dt.utcnow.return_value = _make_intraday_now()
+        mock_dt.now.return_value = _make_intraday_now()
         s._startup_recovery()
 
     mock_monitor.assert_called_once()
@@ -330,7 +330,7 @@ def test_startup_recovery_skips_monitor_if_already_running():
          patch.object(s, "job_intraday_monitor") as mock_monitor, \
          patch.object(s, "_TRACKING_OK", False), \
          patch.dict("os.environ", {"CH_PASSWORD": "secret"}):
-        mock_dt.utcnow.return_value = _make_intraday_now()
+        mock_dt.now.return_value = _make_intraday_now()
         s._startup_recovery()
 
     mock_monitor.assert_not_called()

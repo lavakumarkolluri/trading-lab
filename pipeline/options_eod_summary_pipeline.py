@@ -28,6 +28,7 @@ Docker:
 import os
 import sys
 import argparse
+import time
 from datetime import date, datetime
 
 import pandas as pd
@@ -199,7 +200,7 @@ def process_date(ch, symbol: str, d: date) -> dict | None:
         "atm_pe_iv":      atm_pe_iv,
         "iv_rank":        0.0,
         "iv_percentile":  0.0,
-        "version":        int(datetime.utcnow().timestamp()),
+        "version":        int(time.time()),
     }
 
 

@@ -4,7 +4,7 @@ All tests run offline — no ClickHouse or Docker required.
 """
 import sys
 import os
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from unittest.mock import MagicMock, patch, call
 import pytest
 
@@ -28,7 +28,7 @@ def _mock_ch(rows_by_fragment: dict):
 
 
 def _now():
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
 
 
 # ── EXPECTED_JOBS / config ────────────────────────────────────────────────────
@@ -374,7 +374,7 @@ def test_tick_skips_fix_for_pending_service():
     state = w.WatchdogState()
     # triggered just now → elapsed ≈ 0 << VERIFY_DELAY_S → stays in pending
     state.pending_verifications["vix_pipeline"] = w.PendingVerification(
-        service="vix_pipeline", triggered_at=datetime.utcnow(),
+        service="vix_pipeline", triggered_at=datetime.now(timezone.utc),
         freshness_target="vix", error_msg="",
     )
     # detect_issues returns vix_pipeline as an issue
