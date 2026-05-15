@@ -506,14 +506,14 @@ def load_backtest_pnl(ch, symbol: str, strategy_type: str) -> pd.DataFrame:
     sn = p["short_n"]
     if strategy_type == "iron_fly":
         rows = ch.query(
-            "SELECT expiry, entry_date, pnl_pts FROM analysis.spread_backtest "
+            "SELECT expiry, entry_date, pnl_pts FROM analysis.spread_backtest FINAL "
             "WHERE symbol={sym:String} AND strategy='iron_fly' AND short_n=0",
             parameters={"sym": symbol},
         ).result_rows
     else:
         wm = p["wing_m"]
         rows = ch.query(
-            "SELECT expiry, entry_date, pnl_pts FROM analysis.spread_backtest "
+            "SELECT expiry, entry_date, pnl_pts FROM analysis.spread_backtest FINAL "
             "WHERE symbol={sym:String} AND strategy={strat:String} "
             "AND short_n={sn:Int32} AND wing_m={wm:Int32}",
             parameters={"sym": symbol, "strat": strategy_type, "sn": sn, "wm": wm},
