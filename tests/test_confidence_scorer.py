@@ -143,7 +143,8 @@ def test_extract_chain_features_handles_duplicate_strikes():
     chain = _make_chain_df(n_snapshots=4)
     expiry  = date(2026, 6, 26)
     snap_d  = date(2026, 5, 13)
-    result = cs.extract_chain_features(chain, snap_d, expiry)
+    snap_df = chain[(chain.snap_date == snap_d) & (chain.expiry == expiry)]
+    result = cs.extract_chain_features(snap_df)
     assert result is not None, "extract_chain_features returned None on valid data"
     assert "straddle_premium" in result
     assert result["straddle_premium"] > 0

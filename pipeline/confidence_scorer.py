@@ -23,6 +23,7 @@ Usage:
     python confidence_scorer.py --score-only             # skip backtest, score today
 """
 
+import bisect
 import io
 import json
 import os
@@ -251,10 +252,11 @@ def load_events(ch) -> list:
 
 
 def extract_event_features(event_dates: list, snap_date: date, expiry: date) -> dict:
-    window_events = [d for d in event_dates if snap_date <= d <= expiry]
-    event_in_window = 1 if window_events else 0
-    future = [d for d in event_dates if d >= snap_date]
-    days_to_event = min((future[0] - snap_date).days, 30) if future else 30
+    # bisect assumes event_dates is sorted (load_events uses ORDER BY event_date)
+    lo = bisect.bisect_left(event_dates,  snap_date)
+    hi = bisect.bisect_right(event_dates, expiry)
+    event_in_window = 1 if lo < hi else 0
+    days_to_event   = min((event_dates[lo] - snap_date).days, 30) if lo < len(event_dates) else 30
     return {
         "event_in_window": float(event_in_window),
         "days_to_event":   float(days_to_event),
@@ -443,10 +445,10 @@ def find_atm_strike(ce: pd.Series, pe: pd.Series) -> Optional[float]:
     return float(diff.idxmin())
 
 
-def extract_chain_features(chain, snap_date, expiry) -> Optional[dict]:
-    snap = chain[(chain.snap_date == snap_date) & (chain.expiry == expiry)]
-    if snap.empty:
+def extract_chain_features(snap_df: pd.DataFrame) -> Optional[dict]:
+    if snap_df is None or snap_df.empty:
         return None
+    snap = snap_df
 
     ce    = snap[snap.option_type == "CE"].set_index("strike")["ltp"].groupby(level=0).last()
     pe    = snap[snap.option_type == "PE"].set_index("strike")["ltp"].groupby(level=0).last()
@@ -583,6 +585,44 @@ def load_straddle_stats(ch, symbol: str) -> pd.DataFrame:
 
 # ── Dataset Builder ───────────────────────────────────────────────────────────
 
+def _tech_row_from_dict(t: dict, snap_date, eod_records: dict) -> dict:
+    out = {
+        "atr_percentile": t.get("atr_percentile", float("nan")),
+        "rsi14":          t.get("rsi14",          float("nan")),
+        "hv_ratio":       t.get("hv_ratio",       float("nan")),
+        "supertrend_dir": t.get("supertrend_dir", float("nan")),
+        "cpr_width_pct":  t.get("cpr_width_pct",  float("nan")),
+        "adx14":          t.get("adx14",           float("nan")),
+    }
+    hv5 = t.get("hv5", 0.0) or 0.0
+    if hv5 > 0 and snap_date in eod_records:
+        eod_r = eod_records[snap_date]
+        atm_iv = (eod_r.get("atm_ce_iv", 0.0) + eod_r.get("atm_pe_iv", 0.0)) / 2
+        out["iv_hv5_ratio"] = atm_iv / hv5 if atm_iv > 0 else float("nan")
+    else:
+        out["iv_hv5_ratio"] = float("nan")
+    return out
+
+
+def extract_eod_features_from_dict(r: dict) -> dict:
+    spot = r.get("nifty_spot", 0.0)
+    feats = {
+        "iv_rank":       r.get("iv_rank",       float("nan")),
+        "iv_percentile": r.get("iv_percentile", float("nan")),
+        "atm_ce_iv":     r.get("atm_ce_iv",     float("nan")),
+        "atm_pe_iv":     r.get("atm_pe_iv",     float("nan")),
+        "iv_skew":       r.get("iv_skew",        float("nan")),
+        "pcr_eod":       r.get("pcr_eod",        float("nan")),
+    }
+    if spot > 0:
+        feats["ce_wall_pct"] = (r.get("ce_wall_strike", spot) - spot) / spot * 100
+        feats["pe_wall_pct"] = (spot - r.get("pe_wall_strike", spot)) / spot * 100
+        mp = r.get("max_pain_strike", 0.0)
+        if mp and mp > 0:
+            feats["max_pain_dist_pct"] = (mp - spot) / spot * 100
+    return feats
+
+
 def _tech_row(tech, snap_date, eod) -> dict:
     snap_ts = pd.Timestamp(snap_date)
     if snap_ts not in tech.index:
@@ -637,11 +677,30 @@ def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFr
     all_keys = list(bt_pnl.index)
     log.info(f"[{symbol}][{strategy_type}] {len(all_keys)} backtest rows to process")
 
+    # Pre-group chain by (snap_date, expiry) for O(1) lookup — eliminates O(1.7M) scan per row
+    chain_groups: dict = {}
+    for (sd, exp), grp in chain.groupby(["snap_date", "expiry"], sort=False):
+        chain_groups[(sd, exp)] = grp
+
+    # Pre-convert all per-date DataFrames to dicts for O(1) access in loop
+    eod_records  = eod.to_dict("index")          # {date: {col: val}}
+    poi_records  = poi.to_dict("index")          # {date: {col: val}}
+    vix_by_date  = vix["vix"].to_dict() if not vix.empty else {}
+    vix_z_dict   = vix_zscore.to_dict() if not vix_zscore.empty else {}
+    vs_records   = vol_surf.to_dict("index") if not vol_surf.empty else {}
+    tech_by_date = (
+        {ts.date(): row.to_dict() for ts, row in tech.iterrows()}
+        if not tech.empty else {}
+    )
+
     rows = []
     for expiry, snap_date in all_keys:
         pnl = float(bt_pnl.loc[(expiry, snap_date), "pnl_pts"])
 
-        chain_feats = extract_chain_features(chain, snap_date, expiry)
+        snap_df = chain_groups.get((snap_date, expiry))
+        if snap_df is None:
+            continue
+        chain_feats = extract_chain_features(snap_df)
         if chain_feats is None:
             continue
 
@@ -658,19 +717,22 @@ def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFr
             "dte":           float(dte),
         }
         row.update(chain_feats)
-        row.update(extract_eod_features(eod, snap_date))
-        row.update(extract_poi_features(poi, snap_date))
+        if snap_date in eod_records:
+            row.update(extract_eod_features_from_dict(eod_records[snap_date]))
+        if snap_date in poi_records:
+            row.update({k: float(v) for k, v in poi_records[snap_date].items() if pd.notna(v)})
         row.update(temporal_features(expiry))
-        row["vix"] = float(vix.loc[snap_date, "vix"]) if snap_date in vix.index else float("nan")
-        row["vix_z20"] = float(vix_zscore.loc[snap_date]) if snap_date in vix_zscore.index else float("nan")
-        if not tech.empty:
-            row.update(_tech_row(tech, snap_date, eod))
+        row["vix"]    = vix_by_date.get(snap_date, float("nan"))
+        row["vix_z20"] = vix_z_dict.get(snap_date, float("nan"))
+        t = tech_by_date.get(snap_date, {})
+        if t:
+            row.update(_tech_row_from_dict(t, snap_date, eod_records))
         row.update(extract_event_features(event_dates, snap_date, expiry))
         # IV term structure: negative term_slope = backwardation = short-vol edge
-        if snap_date in vol_surf.index:
-            ts = vol_surf.loc[snap_date]
-            row["term_slope"] = float(ts["term_slope"])
-            row["atm_iv_7d"]  = float(ts["atm_iv_7d"])
+        if snap_date in vs_records:
+            ts = vs_records[snap_date]
+            row["term_slope"] = float(ts.get("term_slope", float("nan")))
+            row["atm_iv_7d"]  = float(ts.get("atm_iv_7d",  float("nan")))
         # Straddle z-score: is today's net_credit cheap or expensive at this DTE?
         dte_int = int(dte)
         if not straddle_stats.empty and dte_int in straddle_stats.index:
@@ -1031,7 +1093,8 @@ def score_today(ch, mc, symbol: str, strategy: str = "iron_fly") -> None:
         return
     next_expiry = future_expiries[0]
 
-    chain_feats = extract_chain_features(chain, latest_snap, next_expiry)
+    snap_df = chain[(chain.snap_date == latest_snap) & (chain.expiry == next_expiry)]
+    chain_feats = extract_chain_features(snap_df)
     if chain_feats is None:
         log.warning(f"[{symbol}] could not extract chain features for {next_expiry}")
         return

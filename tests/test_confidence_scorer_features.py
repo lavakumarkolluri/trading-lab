@@ -53,7 +53,8 @@ def test_extract_chain_features_returns_dict():
     snap_date = date(2025, 5, 1)
     expiry    = date(2025, 5, 8)
     chain = _single_snap(snap_date, expiry)
-    result = cs.extract_chain_features(chain, snap_date, expiry)
+    snap_df = chain[(chain.snap_date == snap_date) & (chain.expiry == expiry)]
+    result = cs.extract_chain_features(snap_df)
     assert result is not None
     assert isinstance(result, dict)
 
@@ -64,7 +65,8 @@ def test_extract_chain_features_straddle_premium():
     expiry    = date(2025, 5, 8)
     ce_ltp, pe_ltp = 120.0, 118.0
     chain = _single_snap(snap_date, expiry, ce_ltp=ce_ltp, pe_ltp=pe_ltp)
-    r = cs.extract_chain_features(chain, snap_date, expiry)
+    snap_df = chain[(chain.snap_date == snap_date) & (chain.expiry == expiry)]
+    r = cs.extract_chain_features(snap_df)
     assert r is not None
     assert abs(r["straddle_premium"] - (ce_ltp + pe_ltp)) < 0.01
 
@@ -75,7 +77,8 @@ def test_extract_chain_features_straddle_pct():
     expiry    = date(2025, 5, 8)
     atm, ce_ltp, pe_ltp = 24000.0, 120.0, 118.0
     chain = _single_snap(snap_date, expiry, atm=atm, ce_ltp=ce_ltp, pe_ltp=pe_ltp)
-    r = cs.extract_chain_features(chain, snap_date, expiry)
+    snap_df = chain[(chain.snap_date == snap_date) & (chain.expiry == expiry)]
+    r = cs.extract_chain_features(snap_df)
     expected = (ce_ltp + pe_ltp) / atm * 100
     assert abs(r["straddle_pct"] - expected) < 0.001
 
@@ -92,7 +95,8 @@ def test_extract_chain_features_pcr_oi_direction():
         (snap_date, expiry, 24100.0, "CE", 50.0,  2000),
         (snap_date, expiry, 24100.0, "PE", 40.0,  4000),
     ])
-    r = cs.extract_chain_features(chain, snap_date, expiry)
+    snap_df = chain[(chain.snap_date == snap_date) & (chain.expiry == expiry)]
+    r = cs.extract_chain_features(snap_df)
     assert r is not None
     # PE OI = 19000, CE OI = 7000 → pcr ≈ 2.71
     assert r["pcr_oi"] > 1.0, "pcr_oi should be > 1 when PE OI > CE OI"
@@ -100,8 +104,8 @@ def test_extract_chain_features_pcr_oi_direction():
 
 def test_extract_chain_features_returns_none_on_empty_snap():
     """No data for this date/expiry → return None, not an empty dict."""
-    chain = _single_snap()
-    result = cs.extract_chain_features(chain, date(2020, 1, 1), date(2020, 1, 8))
+    snap_df = pd.DataFrame(columns=["snap_date", "expiry", "strike", "option_type", "ltp", "oi"])
+    result = cs.extract_chain_features(snap_df)
     assert result is None
 
 
@@ -118,7 +122,8 @@ def test_extract_chain_features_returns_none_when_straddle_too_small():
         (snap_date, expiry, 24100.0, "CE", 0.3, 1000),
         (snap_date, expiry, 24100.0, "PE", 0.3, 1000),
     ])
-    result = cs.extract_chain_features(chain, snap_date, expiry)
+    snap_df = chain[(chain.snap_date == snap_date) & (chain.expiry == expiry)]
+    result = cs.extract_chain_features(snap_df)
     assert result is None
 
 
@@ -151,7 +156,8 @@ def test_extract_chain_features_handles_duplicate_strikes():
         (snap_date, expiry, 24100.0, "PE", 201.0,  5100),
     ])
     # Must not raise TypeError — groupby().last() must be applied
-    result = cs.extract_chain_features(chain, snap_date, expiry)
+    snap_df = chain[(chain.snap_date == snap_date) & (chain.expiry == expiry)]
+    result = cs.extract_chain_features(snap_df)
     assert result is not None
     # straddle_premium: last() CE=122, last() PE=119 → 241
     assert abs(result["straddle_premium"] - 241.0) < 0.01
