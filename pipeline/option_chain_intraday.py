@@ -44,7 +44,7 @@ MARKET_CLOSE     = dtime(15, 30)
 EXIT_AFTER       = dtime(15, 35)    # hard exit
 FETCH_INTERVAL_S = 180              # 3 minutes
 
-SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 
 MINIO_BUCKET = "trading-data"
 

@@ -567,33 +567,30 @@ def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFr
         log.warning(f"[{symbol}][{strategy_type}] no backtest rows — run strategy_backtester first")
         return pd.DataFrame()
 
-    expiries = sorted(chain["expiry"].unique())
-    log.info(f"[{symbol}][{strategy_type}] {len(expiries)} expiry dates to process")
+    # bt_pnl indexed by (expiry, entry_date). With N-DTE backtester, there are
+    # multiple entry_dates per expiry (one per trading day within DTE ≤ 5).
+    all_keys = list(bt_pnl.index)
+    log.info(f"[{symbol}][{strategy_type}] {len(all_keys)} backtest rows to process")
 
     rows = []
-    for expiry in expiries:
-        snap_candidates = sorted(chain[
-            (chain.expiry == expiry) & (chain.snap_date < expiry)
-        ]["snap_date"].unique())
-        if not snap_candidates:
-            continue
-        snap_date = snap_candidates[-1]
-
-        # Skip if no backtest row for this expiry+entry_date
-        key = (expiry, snap_date)
-        if key not in bt_pnl.index:
-            continue
-        pnl = float(bt_pnl.loc[key, "pnl_pts"])
+    for expiry, snap_date in all_keys:
+        pnl = float(bt_pnl.loc[(expiry, snap_date), "pnl_pts"])
 
         chain_feats = extract_chain_features(chain, snap_date, expiry)
         if chain_feats is None:
             continue
+
+        # DTE: days from snap_date (entry pricing reference) to expiry.
+        # Approximates actual DTE at time of trade (snap_date = prev-day EOD prices).
+        dte = (expiry - snap_date).days if isinstance(expiry, date) else (
+            pd.to_datetime(expiry).date() - snap_date).days
 
         row = {
             "expiry":        expiry,
             "entry_date":    snap_date,
             "pnl_pts":       pnl,
             "strategy_type": strategy_type,
+            "dte":           float(dte),
         }
         row.update(chain_feats)
         row.update(extract_eod_features(eod, snap_date))
@@ -649,7 +646,7 @@ FEATURE_COLS = [
     "client_call_net", "client_put_net", "client_pcr",
     "fii_call_net", "fii_put_net", "fii_pcr",
     # Temporal
-    "day_of_week", "week_of_month",
+    "day_of_week", "week_of_month", "dte",
     # Volatility regime
     "vix",
     # Technical regime signals
@@ -969,6 +966,9 @@ def score_today(ch, mc, symbol: str, strategy: str = "iron_fly") -> None:
     if not tech.empty:
         row.update(_tech_row(tech, latest_snap, eod))
     row.update(extract_event_features(event_dates, latest_snap, next_expiry))
+    # DTE: days from today's pricing reference to next expiry
+    row["dte"] = float((next_expiry - latest_snap).days) if isinstance(latest_snap, date) else float(
+        (pd.to_datetime(next_expiry).date() - pd.to_datetime(latest_snap).date()).days)
 
     if is_pooled:
         for s in SYMBOLS:

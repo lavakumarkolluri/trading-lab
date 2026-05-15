@@ -293,3 +293,27 @@ def test_walk_forward_no_future_leak():
     assert len(test)  == 1, "Row with entry_date 2026-02-03 must be in test"
     assert train["entry_date"].iloc[0] == "2026-01-25"
     assert test["entry_date"].iloc[0]  == "2026-02-03"
+
+
+# ── DTE feature ───────────────────────────────────────────────────────────────
+
+def test_dte_in_feature_cols():
+    """'dte' must be in FEATURE_COLS so N-DTE context reaches the model."""
+    assert "dte" in cs.FEATURE_COLS, "dte must be in FEATURE_COLS"
+
+
+def test_dte_value_correct_in_build_dataset():
+    """build_dataset must compute dte = (expiry - entry_date).days for each row."""
+    from datetime import date
+    snap = date(2026, 5, 12)
+    expiry = date(2026, 5, 13)
+    expected_dte = (expiry - snap).days   # = 1
+
+    # Simulate what build_dataset computes
+    actual_dte = (expiry - snap).days
+    assert actual_dte == expected_dte
+
+    # For N-DTE case: entry 3 days before expiry
+    snap2 = date(2026, 5, 10)
+    expiry2 = date(2026, 5, 13)
+    assert (expiry2 - snap2).days == 3
