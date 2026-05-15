@@ -149,7 +149,7 @@ def test_check_ohlcv_returns_false_when_empty():
 
 def test_check_confidence_scores_returns_true_when_all_present():
     rows = [(sym, 65) for sym in m.SYMBOLS]
-    ch = _mock_ch({"scorecard": rows})
+    ch = _mock_ch({"confidence_scores": rows})
     ok, detail = m._check_confidence_scores(ch)
     assert ok is True
     assert "NIFTY" in detail
@@ -233,7 +233,7 @@ def test_run_all_checks_all_pass():
             r.result_rows = [(fresh,)]
         elif "ohlcv_daily" in sql:
             r.result_rows = [("NSE", fresh)]
-        elif "scorecard" in sql:
+        elif "confidence_scores" in sql:
             r.result_rows = [(sym, 65) for sym in m.SYMBOLS]
         elif "pipeline_runs" in sql:
             r.result_rows = [("success",)]

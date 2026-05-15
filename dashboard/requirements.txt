@@ -6,3 +6,4 @@ numpy
 cryptography
 docker
 openpyxl>=3.1
+streamlit-autorefresh

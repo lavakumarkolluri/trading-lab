@@ -205,3 +205,98 @@ def test_dte_backtest_query_uses_dateDiff():
     """N-DTE backtest query in dashboard must use dateDiff to compute DTE from spread_backtest."""
     source = _dashboard_source()
     assert "spread_backtest" in source, "dashboard must query analysis.spread_backtest for N-DTE insights"
+
+
+# ── T-1: Dashboard overhaul constraints ──────────────────────────────────────
+
+def test_no_hardcoded_min_confidence_number():
+    """MIN_CONFIDENCE must not be hardcoded as a bare number in app.py.
+    Gate must always come from cfg() so dashboard and intraday_monitor stay in sync."""
+    source = _dashboard_source()
+    # Allow the fallback default inside cfg() calls but not bare assignment
+    matches = re.findall(r'\bMIN_CONFIDENCE\s*=\s*\d', source)
+    assert not matches, (
+        f"Found hardcoded MIN_CONFIDENCE assignment in dashboard: {matches}. "
+        "Use cfg('min_confidence', 60.0) instead."
+    )
+
+
+def test_signal_card_filters_iron_fly():
+    """Primary signal card query must filter strategy_type to iron_fly.
+    Stage 4 tests only iron_fly — showing another strategy's score would corrupt records."""
+    source = _dashboard_source()
+    assert "iron_fly" in source, (
+        "dashboard must reference iron_fly strategy filter in signal card queries"
+    )
+
+
+def test_score_date_referenced_in_dashboard():
+    """score_date must be referenced in dashboard rendering.
+    Staleness must always be visible — a stale score corrupts Stage 4 win rate."""
+    source = _dashboard_source()
+    assert "score_date" in source, (
+        "dashboard must reference score_date so stale scores are visible before paper trades"
+    )
+
+
+def test_oi_walls_uses_limit_by_symbol():
+    """OI Walls query must use LIMIT 1 BY symbol to show all 4 symbols.
+    NIFTY-only OI walls give no context for BANKNIFTY/FINNIFTY/MIDCPNIFTY paper trades."""
+    source = _dashboard_source()
+    assert "LIMIT 1 BY symbol" in source, (
+        "OI Walls query must use 'LIMIT 1 BY symbol' to display all 4 symbols. "
+        "CRIT-003 has been fixed in migration 081 — remove the NIFTY-only query."
+    )
+
+
+def test_pre_market_check_does_not_use_scorecard():
+    """pre_market_check.py must not query analysis.scorecard — that table does not exist.
+    Silently failed every morning until fixed to use analysis.confidence_scores."""
+    pre_market_path = os.path.join(
+        os.path.dirname(__file__), "..", "pipeline", "pre_market_check.py"
+    )
+    with open(pre_market_path) as f:
+        pre_market_source = f.read()
+    assert "analysis.scorecard" not in pre_market_source, (
+        "pre_market_check.py still references analysis.scorecard which does not exist. "
+        "Change to analysis.confidence_scores."
+    )
+
+
+def test_query_cache_ttl_is_180():
+    """query() cache decorator must use ttl=180 (3 min), not 3600.
+    During Stage 4 paper trading, a 1-hour stale cache shows closed positions as still open."""
+    source = _dashboard_source()
+    # Find the decorator on the query() function specifically
+    match = re.search(
+        r'@st\.cache_data\(ttl=(\d+)\)\s*\ndef query\b', source
+    )
+    assert match is not None, "Could not find @st.cache_data decorator on query() function"
+    assert match.group(1) == "180", (
+        f"query() cache TTL is {match.group(1)}s, must be 180. "
+        "A 3600s TTL hides live position updates during Stage 4 paper trading."
+    )
+
+
+def test_st_autorefresh_imported():
+    """st_autorefresh must be imported from streamlit_autorefresh.
+    Auto-refresh keeps Stage 4 paper trade status current without manual page reload."""
+    source = _dashboard_source()
+    assert "st_autorefresh" in source, (
+        "st_autorefresh not found in dashboard — auto-refresh is required for Stage 4 monitoring. "
+        "Add: from streamlit_autorefresh import st_autorefresh"
+    )
+
+
+def test_streamlit_autorefresh_in_requirements():
+    """streamlit-autorefresh must be in dashboard/requirements.txt.
+    Without it, the Docker image build will fail and auto-refresh won't work."""
+    req_path = os.path.join(
+        os.path.dirname(__file__), "..", "dashboard", "requirements.txt"
+    )
+    with open(req_path) as f:
+        req_content = f.read()
+    assert "streamlit-autorefresh" in req_content, (
+        "streamlit-autorefresh missing from dashboard/requirements.txt. "
+        "The dashboard image will fail to build."
+    )
