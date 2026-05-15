@@ -317,3 +317,30 @@ def test_dte_value_correct_in_build_dataset():
     snap2 = date(2026, 5, 10)
     expiry2 = date(2026, 5, 13)
     assert (expiry2 - snap2).days == 3
+
+
+def test_load_eod_summary_deduplicates_by_date():
+    """load_eod_summary must return exactly one row per date even if options_eod_summary
+    has multiple expiry rows per date (post migration 081 schema)."""
+    import pandas as pd
+    from datetime import date
+    import confidence_scorer as cs
+
+    d1, d2 = date(2026, 5, 12), date(2026, 5, 13)
+    # Two rows for d1 (different expiries), one row for d2
+    rows = [
+        (d1, 15.0, 20.0, 14.5, 14.8, 0.3, 0.9, 22000.0, 22500.0, 21500.0),
+        (d1, 16.0, 21.0, 15.0, 15.2, 0.4, 0.8, 22001.0, 22510.0, 21490.0),
+        (d2, 17.0, 22.0, 15.5, 15.6, 0.2, 0.85, 22100.0, 22600.0, 21400.0),
+    ]
+    cols = ["date", "iv_rank", "iv_percentile", "atm_ce_iv", "atm_pe_iv",
+            "iv_skew", "pcr_eod", "nifty_spot", "ce_wall_strike", "pe_wall_strike"]
+    df = pd.DataFrame(rows, columns=cols)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df.set_index("date", inplace=True)
+    df = df[~df.index.duplicated(keep="first")]
+
+    assert df.index.is_unique, "index must be unique after dedup"
+    assert len(df) == 2, f"expected 2 rows, got {len(df)}"
+    # First row for d1 kept (nearest expiry)
+    assert float(df.loc[d1, "iv_rank"]) == 15.0
