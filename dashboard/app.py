@@ -1016,13 +1016,11 @@ elif page == "Model":
     vix_val = float(vix_df["vix"].iloc[0]) if not vix_df.empty else None
     spot_val = float(vix_df["nifty_spot"].iloc[0]) if not vix_df.empty else None
 
-    # options_eod_summary is NIFTY-only (CRIT-003) — inject 'NIFTY' so downstream
-    # symbol-filter still works; other symbols return empty sym_eod correctly.
     eod_df = query("""
-        SELECT 'NIFTY' AS symbol, date, iv_rank, pcr
+        SELECT symbol, date, iv_rank, pcr
         FROM market.options_eod_summary FINAL
         WHERE date >= today() - 5
-        ORDER BY date DESC
+        ORDER BY symbol, date DESC
     """)
 
     if scores_df.empty:
