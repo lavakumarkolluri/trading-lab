@@ -26,14 +26,15 @@ stage  →  CI tests pass  →  auto-merge to master  (daily 17:00 UTC Mon–Fri
 - Every prod breakage must produce a failing test FIRST, then a fix. No exceptions.
 - Tests must run offline (no live ClickHouse). Use `unittest.mock.MagicMock` for DB calls.
 
-**Test files (141 tests as of 2026-05-13):**
+**Test files (422 tests as of 2026-05-15):**
 - `tests/test_docker_compose.py` — compose file structure, config mounts, credentials
 - `tests/test_migrations.py` — SQL file numbering, syntax validity
-- `tests/test_intraday_monitor.py` — trailing stop, timezone, column schema
+- `tests/test_intraday_monitor.py` — trailing stop, timezone, column schema, MIDCPNIFTY config
 - `tests/test_compute_oi_features.py` — DataFrame duplicate column regression
-- `tests/test_dashboard.py` — 12 tests: expiry date format, nav completeness, SQL safety
-- `tests/test_data_freshness.py` — 17 tests: staleness thresholds, auto-fix, report-only mode
-- `tests/test_confidence_scorer.py` — 9 tests: duplicate-strike, EOD fallback, lot-size loading
+- `tests/test_dashboard.py` — expiry date format, nav completeness, SQL safety
+- `tests/test_data_freshness.py` — staleness thresholds, auto-fix, empty table safety
+- `tests/test_confidence_scorer.py` — duplicate-strike, EOD fallback, lot-size loading
+- `tests/test_options_eod_summary.py` — symbol validation, parameterized queries, dedup fix
 
 ---
 
@@ -59,10 +60,10 @@ stage  →  CI tests pass  →  auto-merge to master  (daily 17:00 UTC Mon–Fri
 | NIFTY       | 65       | Tuesday       | 200 pts     |
 | BANKNIFTY   | 30       | Wednesday     | 500 pts     |
 | FINNIFTY    | 60       | Tuesday       | 200 pts     |
-| MIDCPNIFTY  | (DB)     | Monday        | TBD         |
+| MIDCPNIFTY  | 120      | Monday        | 200 pts     |
 
 **Risk params**: Target ₹2000/trade, stop ₹1000/trade. Trailing activates at target with 75% floor.
-Entry window 09:30–14:00 IST. EOD exit 15:20 IST. MIN_CONFIDENCE=50 gate before entering.
+Entry window 09:30–14:00 IST. EOD exit 15:20 IST. MIN_CONFIDENCE=60 gate before entering.
 
 **Pipeline order** (daily, UTC):
 1. `option_chain_intraday` — live options data during market hours (03:40)
@@ -96,6 +97,8 @@ Entry window 09:30–14:00 IST. EOD exit 15:20 IST. MIN_CONFIDENCE=50 gate befor
 
 **confidence_scorer --compare**: After training, must call `score_today(ch, mc, sym)` for each symbol. Without this, intraday_monitor reads no scores from `analysis.scorecard` and defaults to 50.0 confidence.
 
-**options_eod_summary is NIFTY-only**: The `market.options_eod_summary` table only has NIFTY data. Using it for BANKNIFTY/FINNIFTY/MIDCPNIFTY IV-rank and PCR features silently returns wrong values. ← **KNOWN BUG — not yet fixed** (see TODO.md CRIT-003).
+**options_eod_summary schema requires (symbol, date, expiry) ORDER BY**: NIFTY and FINNIFTY both expire on Tuesday — same `(date, expiry)` pair. Without `symbol` in the ORDER BY, inserting FINNIFTY rows silently replaces NIFTY rows (ReplacingMergeTree collision). Fixed in migration 081. Always ensure `symbol` is in ORDER BY for any per-symbol time-series table.
+
+**compute_historical_iv requires options_eod_summary rows first**: `run_symbol(ch, symbol, from_date)` reads dates from `options_eod_summary` then updates that table with IV. Run `options_eod_summary_pipeline` for all 4 symbols before running `compute_historical_iv`.
 
 **ReplacingMergeTree re-insert**: Never use `ALTER TABLE UPDATE` on the `version` column — ClickHouse raises CANNOT_UPDATE_COLUMN. To refresh a row: re-insert with `version = int(datetime.now().timestamp())`.

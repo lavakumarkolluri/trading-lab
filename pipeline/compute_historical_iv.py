@@ -10,7 +10,8 @@ using the Black-Scholes model, then updates market.options_eod_summary with:
   iv_rank        — (today_iv - 52wk_low) / (52wk_high - 52wk_low) * 100
   iv_percentile  — % of past 252 days where IV was lower than today
 
-Spot source: market.nifty_live.nifty_spot (^NSEI via yfinance — real index level).
+Spot source: estimated via put-call parity from the options chain (works for
+all 4 symbols: NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY).
 
 Black-Scholes inversion via Newton-Raphson (≤10 iterations, converges in ~3).
 Risk-free rate: 6.5% (approximate India repo rate over the period).
@@ -18,6 +19,7 @@ Risk-free rate: 6.5% (approximate India repo rate over the period).
 Usage:
   python compute_historical_iv.py
   python compute_historical_iv.py --from 2024-01-01
+  python compute_historical_iv.py --symbol BANKNIFTY --from 2019-01-01
 
 Docker:
   docker compose run --rm pipeline python compute_historical_iv.py
@@ -39,6 +41,7 @@ RISK_FREE_RATE = 0.065   # India repo rate ~6.5%
 MIN_PRICE      = 0.05    # ignore options below this price (stale/illiquid)
 MAX_IV         = 2.0     # cap IV at 200% to filter bad data
 IV_WINDOW      = 252     # trading days for iv_rank / iv_percentile
+SYMBOLS        = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 
 
 # ── Black-Scholes ─────────────────────────────────────────
@@ -95,17 +98,7 @@ def implied_vol(market_price: float, S: float, K: float, T: float,
 
 # ── Data loading ──────────────────────────────────────────
 
-def load_spot(ch) -> dict:
-    """date → nifty_spot from market.nifty_live."""
-    rows = ch.query(
-        "SELECT toDate(timestamp), argMax(nifty_spot, timestamp) "
-        "FROM market.nifty_live FINAL "
-        "GROUP BY toDate(timestamp)"
-    ).result_rows
-    return {r[0]: float(r[1]) for r in rows if r[1] and r[1] > 0}
-
-
-def load_atm_options(ch, d: date, spot: float) -> pd.DataFrame:
+def load_atm_options(ch, symbol: str, d: date, spot: float) -> pd.DataFrame:
     """
     Load CE and PE rows near ATM for the near-term expiry on date d.
     ATM window: spot ± 2% (captures a few strikes around ATM for robustness).
@@ -113,11 +106,10 @@ def load_atm_options(ch, d: date, spot: float) -> pd.DataFrame:
     lo = spot * 0.98
     hi = spot * 1.02
 
-    # Near-term expiry
     expiry_row = ch.query(
         "SELECT min(expiry) FROM market.options_chain "
-        "WHERE symbol='NIFTY' AND toDate(timestamp)={d:Date} AND expiry >= {d:Date}",
-        parameters={"d": d},
+        "WHERE symbol={sym:String} AND toDate(timestamp)={d:Date} AND expiry >= {d:Date}",
+        parameters={"sym": symbol, "d": d},
     ).result_rows
     if not expiry_row or expiry_row[0][0] is None:
         return pd.DataFrame()
@@ -126,14 +118,52 @@ def load_atm_options(ch, d: date, spot: float) -> pd.DataFrame:
     df = ch.query_df(
         "SELECT strike, option_type, ltp "
         "FROM market.options_chain FINAL "
-        "WHERE symbol='NIFTY' AND toDate(timestamp)={d:Date} "
+        "WHERE symbol={sym:String} AND toDate(timestamp)={d:Date} "
         "  AND expiry={expiry:Date} "
         "  AND strike BETWEEN {lo:Float64} AND {hi:Float64} "
         "  AND ltp > {min_price:Float64}",
-        parameters={"d": d, "expiry": expiry, "lo": lo, "hi": hi, "min_price": MIN_PRICE},
+        parameters={"sym": symbol, "d": d, "expiry": expiry, "lo": lo, "hi": hi, "min_price": MIN_PRICE},
     )
     df["expiry"] = expiry
     return df
+
+
+def estimate_spot_from_chain(ch, symbol: str, d: date) -> float:
+    """
+    Estimate spot via put-call parity from the nearest-expiry options chain.
+    spot ≈ strike + CE_ltp - PE_ltp at the strike where |CE - PE| is minimised.
+    Works for all 4 symbols without needing a separate spot feed.
+    """
+    expiry_row = ch.query(
+        "SELECT min(expiry) FROM market.options_chain "
+        "WHERE symbol={sym:String} AND toDate(timestamp)={d:Date} AND expiry >= {d:Date}",
+        parameters={"sym": symbol, "d": d},
+    ).result_rows
+    if not expiry_row or expiry_row[0][0] is None:
+        return 0.0
+    expiry = expiry_row[0][0]
+
+    df = ch.query_df(
+        "SELECT strike, option_type, ltp "
+        "FROM market.options_chain FINAL "
+        "WHERE symbol={sym:String} AND toDate(timestamp)={d:Date} "
+        "  AND expiry={expiry:Date} AND ltp > {min_price:Float64}",
+        parameters={"sym": symbol, "d": d, "expiry": expiry, "min_price": MIN_PRICE},
+    )
+    if df.empty:
+        return 0.0
+
+    df = df.groupby(["option_type", "strike"], as_index=False).last()
+    ce = df[df["option_type"] == "CE"].set_index("strike")["ltp"]
+    pe = df[df["option_type"] == "PE"].set_index("strike")["ltp"]
+    common = ce.index.intersection(pe.index)
+    if common.empty:
+        return 0.0
+
+    diff = (ce[common] - pe[common]).abs()
+    atm_strike = diff.idxmin()
+    spot = atm_strike + ce.get(atm_strike, 0) - pe.get(atm_strike, 0)
+    return float(spot)
 
 
 def compute_iv_for_date(d: date, spot: float, df: pd.DataFrame) -> dict | None:
@@ -141,7 +171,6 @@ def compute_iv_for_date(d: date, spot: float, df: pd.DataFrame) -> dict | None:
     if df.empty or spot <= 0:
         return None
 
-    # T in years (calendar days / 365 — standard for NSE options)
     ce_ivs, pe_ivs = [], []
 
     for _, row in df.iterrows():
@@ -190,11 +219,11 @@ def compute_iv_rank_percentile(iv_series: pd.Series) -> pd.DataFrame:
 
 # ── Update ────────────────────────────────────────────────
 
-def update_summary(ch, updates: list[dict]):
+def update_summary(ch, symbol: str, updates: list[dict]):
     """
-    Insert updated rows into options_eod_summary.
-    ReplacingMergeTree will keep the highest version on merge.
-    We read existing rows first to preserve pcr/max_pain etc.
+    Insert updated IV rows into options_eod_summary for the given symbol.
+    ReplacingMergeTree keeps the highest version on merge.
+    Reads existing rows first to preserve pcr/max_pain/atm_strike etc.
     """
     if not updates:
         return
@@ -202,7 +231,8 @@ def update_summary(ch, updates: list[dict]):
     dates_str = ", ".join(f"'{u['date']}'" for u in updates)
     existing = ch.query_df(
         f"SELECT * FROM market.options_eod_summary FINAL "
-        f"WHERE date IN ({dates_str})"
+        f"WHERE symbol={{sym:String}} AND date IN ({dates_str})",
+        parameters={"sym": symbol},
     )
     existing["date"] = pd.to_datetime(existing["date"]).dt.date
 
@@ -226,97 +256,110 @@ def update_summary(ch, updates: list[dict]):
         return
 
     df = pd.DataFrame(rows)
-    ch.insert_df("market.options_eod_summary", df[[
-        "date", "expiry", "nifty_spot", "total_ce_oi", "total_pe_oi",
-        "pcr", "max_pain_strike", "atm_strike", "atm_ce_iv", "atm_pe_iv",
-        "iv_rank", "iv_percentile", "version",
-    ]])
+    cols = ["date", "symbol", "expiry", "nifty_spot", "total_ce_oi", "total_pe_oi",
+            "pcr", "max_pain_strike", "atm_strike", "atm_ce_iv", "atm_pe_iv",
+            "iv_rank", "iv_percentile", "version"]
+    # include optional columns if present
+    for opt in ("ce_wall_strike", "pe_wall_strike", "iv_skew"):
+        if opt in df.columns:
+            cols.append(opt)
+    ch.insert_df("market.options_eod_summary", df[[c for c in cols if c in df.columns]])
 
 
-# ── Main ──────────────────────────────────────────────────
+# ── Per-symbol run ────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="Compute historical IV and update options_eod_summary")
-    parser.add_argument("--from", dest="from_date", default="2024-01-01",
-                        help="Start date YYYY-MM-DD (default: 2024-01-01)")
-    args = parser.parse_args()
+def run_symbol(ch, symbol: str, from_date: date):
+    log.info(f"=== [{symbol}] Computing historical IV from {from_date} ===")
 
-    from_date = date.fromisoformat(args.from_date)
-    ch = get_ch()
-
-    log.info("Loading spot prices from market.nifty_live...")
-    spot_map = load_spot(ch)
-    log.info(f"  {len(spot_map)} dates with spot data ({min(spot_map)} → {max(spot_map)})")
-
-    log.info("Loading dates from market.options_eod_summary...")
+    log.info(f"  Loading dates from options_eod_summary...")
     rows = ch.query(
         "SELECT date FROM market.options_eod_summary FINAL "
-        "WHERE date >= {from_date:Date} ORDER BY date",
-        parameters={"from_date": from_date},
+        "WHERE symbol={sym:String} AND date >= {from_date:Date} ORDER BY date",
+        parameters={"sym": symbol, "from_date": from_date},
     ).result_rows
     dates = [r[0] for r in rows]
     log.info(f"  {len(dates)} dates to process")
 
-    # Compute IV for each date
+    if not dates:
+        log.warning(f"  [{symbol}] No rows in options_eod_summary — run options_eod_summary_pipeline first")
+        return
+
     iv_by_date = {}
     for i, d in enumerate(dates, 1):
-        spot = spot_map.get(d)
+        spot = estimate_spot_from_chain(ch, symbol, d)
         if not spot:
-            log.warning(f"  [{i}/{len(dates)}] {d}: no spot data — skip")
+            log.warning(f"  [{symbol}][{i}/{len(dates)}] {d}: no spot estimate — skip")
             continue
 
-        df = load_atm_options(ch, d, spot)
+        df = load_atm_options(ch, symbol, d, spot)
         result = compute_iv_for_date(d, spot, df)
         if result is None:
-            log.warning(f"  [{i}/{len(dates)}] {d}: IV not computable — skip")
+            log.warning(f"  [{symbol}][{i}/{len(dates)}] {d}: IV not computable — skip")
             continue
 
         iv_by_date[d] = result
         if i % 50 == 0:
-            log.info(f"  [{i}/{len(dates)}] computed — latest: {d} CE_IV={result['atm_ce_iv']:.1f}% PE_IV={result['atm_pe_iv']:.1f}%")
+            log.info(f"  [{symbol}][{i}/{len(dates)}] {d}: CE_IV={result['atm_ce_iv']:.1f}% PE_IV={result['atm_pe_iv']:.1f}%")
 
-    log.info(f"IV computed for {len(iv_by_date)} dates")
+    log.info(f"  [{symbol}] IV computed for {len(iv_by_date)} dates")
 
-    # Compute iv_rank and iv_percentile from the full IV time series
-    log.info("Computing iv_rank and iv_percentile...")
+    if not iv_by_date:
+        return
+
+    log.info(f"  [{symbol}] Computing iv_rank and iv_percentile...")
     iv_series = pd.Series(
         {d: (v["atm_ce_iv"] + v["atm_pe_iv"]) / 2 for d, v in sorted(iv_by_date.items())}
     )
     rank_df = compute_iv_rank_percentile(iv_series)
 
-    # Merge and prepare updates
     updates = []
     for d, ivs in iv_by_date.items():
         if d not in rank_df.index:
             continue
         updates.append({
-            "date":         d,
-            "atm_ce_iv":    ivs["atm_ce_iv"],
-            "atm_pe_iv":    ivs["atm_pe_iv"],
-            "iv_rank":      float(rank_df.loc[d, "iv_rank"]),
+            "date":          d,
+            "atm_ce_iv":     ivs["atm_ce_iv"],
+            "atm_pe_iv":     ivs["atm_pe_iv"],
+            "iv_rank":       float(rank_df.loc[d, "iv_rank"]),
             "iv_percentile": float(rank_df.loc[d, "iv_percentile"]),
         })
 
-    log.info(f"Updating {len(updates)} rows in market.options_eod_summary...")
-    # Insert in batches
+    log.info(f"  [{symbol}] Updating {len(updates)} rows...")
     batch_size = 100
     for start in range(0, len(updates), batch_size):
-        batch = updates[start: start + batch_size]
-        update_summary(ch, batch)
-        log.info(f"  Batch {start//batch_size + 1}: inserted {len(batch)} rows")
+        update_summary(ch, symbol, updates[start: start + batch_size])
+        log.info(f"  [{symbol}] Batch {start//batch_size + 1}: inserted {min(batch_size, len(updates)-start)} rows")
 
-    log.info("Done. Sample results:")
     sample = ch.query(
-        "SELECT date, round(atm_ce_iv,1), round(atm_pe_iv,1), "
-        "round(iv_rank,1), round(iv_percentile,1) "
+        "SELECT date, round(atm_ce_iv,1), round(atm_pe_iv,1), round(iv_rank,1) "
         "FROM market.options_eod_summary FINAL "
-        "WHERE atm_ce_iv > 0 "
-        "ORDER BY date DESC LIMIT 10"
+        "WHERE symbol={sym:String} AND atm_ce_iv > 0 "
+        "ORDER BY date DESC LIMIT 5",
+        parameters={"sym": symbol},
     ).result_rows
-    print(f"\n{'Date':>12} {'CE_IV%':>8} {'PE_IV%':>8} {'IV_Rank':>9} {'IV_Pct':>8}")
-    print("-" * 50)
+    log.info(f"  [{symbol}] Latest IV rows:")
     for r in sample:
-        print(f"{str(r[0]):>12} {r[1]:>8.1f} {r[2]:>8.1f} {r[3]:>9.1f} {r[4]:>8.1f}")
+        log.info(f"    {r[0]}  CE_IV={r[1]:.1f}%  PE_IV={r[2]:.1f}%  IV_Rank={r[3]:.1f}")
+
+
+# ── Main ──────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Compute historical IV for all symbols")
+    parser.add_argument("--from", dest="from_date", default="2024-01-01",
+                        help="Start date YYYY-MM-DD (default: 2024-01-01)")
+    parser.add_argument("--symbol", default=None,
+                        help="Single symbol to process (default: all 4 symbols)")
+    args = parser.parse_args()
+
+    from_date = date.fromisoformat(args.from_date)
+    ch = get_ch()
+
+    symbols = [args.symbol] if args.symbol else SYMBOLS
+    for symbol in symbols:
+        run_symbol(ch, symbol, from_date)
+
+    log.info("compute_historical_iv done")
 
 
 if __name__ == "__main__":

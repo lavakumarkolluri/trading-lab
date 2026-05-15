@@ -165,6 +165,9 @@ def process_date(ch, symbol: str, d: date) -> dict | None:
     if df.empty:
         return None
 
+    # Deduplicate multiple intraday snapshots: keep last row per (expiry, strike, option_type)
+    df = df.groupby(["expiry", "strike", "option_type"], as_index=False).last()
+
     expiry = near_term_expiry(df, d)
     if expiry is None:
         return None
