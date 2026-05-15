@@ -344,3 +344,60 @@ def test_load_eod_summary_deduplicates_by_date():
     assert len(df) == 2, f"expected 2 rows, got {len(df)}"
     # First row for d1 kept (nearest expiry)
     assert float(df.loc[d1, "iv_rank"]) == 15.0
+
+
+def test_max_pain_dist_pct_in_feature_cols():
+    import confidence_scorer as cs
+    assert "max_pain_dist_pct" in cs.FEATURE_COLS
+
+
+def test_term_slope_in_feature_cols():
+    import confidence_scorer as cs
+    assert "term_slope" in cs.FEATURE_COLS
+    assert "atm_iv_7d" in cs.FEATURE_COLS
+
+
+def test_vix_z20_in_feature_cols():
+    import confidence_scorer as cs
+    assert "vix_z20" in cs.FEATURE_COLS
+
+
+def test_adx14_in_feature_cols():
+    import confidence_scorer as cs
+    assert "adx14" in cs.FEATURE_COLS
+
+
+def test_straddle_z_in_feature_cols():
+    import confidence_scorer as cs
+    assert "straddle_z" in cs.FEATURE_COLS
+
+
+def test_compute_adx_range_0_to_100():
+    """ADX output must always be between 0 and 100."""
+    import numpy as np
+    import pandas as pd
+    import confidence_scorer as cs
+
+    np.random.seed(42)
+    n = 200
+    close = pd.Series(100 + np.cumsum(np.random.randn(n) * 0.5))
+    high  = close + np.abs(np.random.randn(n) * 0.3)
+    low   = close - np.abs(np.random.randn(n) * 0.3)
+    df = pd.DataFrame({"high": high, "low": low, "close": close})
+    adx = cs._compute_adx(df)
+    valid = adx.dropna()
+    assert len(valid) > 50, "should have enough non-NaN values"
+    assert (valid >= 0).all() and (valid <= 100).all(), f"ADX out of range: {valid.describe()}"
+
+
+def test_load_vol_surface_returns_empty_on_missing_symbol():
+    """load_vol_surface must return empty DataFrame (not raise) if symbol missing."""
+    import pandas as pd
+    from unittest.mock import MagicMock
+    import confidence_scorer as cs
+
+    ch = MagicMock()
+    ch.query.side_effect = Exception("Table missing")
+    result = cs.load_vol_surface(ch, "NIFTY")
+    assert isinstance(result, pd.DataFrame)
+    assert result.empty

@@ -224,6 +224,23 @@ def load_vix(ch) -> pd.DataFrame:
     return df
 
 
+def load_vol_surface(ch, symbol: str) -> pd.DataFrame:
+    """Load volatility term structure for a symbol. Returns empty DataFrame if table missing."""
+    try:
+        r = ch.query(
+            "SELECT date, term_slope, atm_iv_7d, atm_iv_30d "
+            "FROM market.vol_term_structure FINAL "
+            "WHERE symbol = {sym:String} ORDER BY date",
+            parameters={"sym": symbol},
+        )
+        df = pd.DataFrame(r.result_rows, columns=["date", "term_slope", "atm_iv_7d", "atm_iv_30d"])
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df.set_index("date", inplace=True)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["term_slope", "atm_iv_7d", "atm_iv_30d"])
+
+
 def load_events(ch) -> list:
     """Return sorted list of HIGH-impact event dates."""
     r = ch.query(
@@ -257,6 +274,18 @@ def load_index_ohlcv(ch, index_symbol: str) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"])
     df.set_index("date", inplace=True)
     return df
+
+
+def _compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    hi, lo, cl = df["high"], df["low"], df["close"]
+    tr   = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
+    dm_p = (hi - hi.shift()).clip(lower=0).where((hi - hi.shift()) > (lo.shift() - lo), 0.0)
+    dm_n = (lo.shift() - lo).clip(lower=0).where((lo.shift() - lo) > (hi - hi.shift()), 0.0)
+    atr  = tr.ewm(alpha=1/period, adjust=False).mean()
+    di_p = 100 * dm_p.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+    di_n = 100 * dm_n.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+    dx   = 100 * (di_p - di_n).abs() / (di_p + di_n).replace(0, np.nan)
+    return dx.ewm(alpha=1/period, adjust=False).mean().clip(0, 100)
 
 
 def compute_tech_signals(ohlcv: pd.DataFrame) -> pd.DataFrame:
@@ -307,6 +336,8 @@ def compute_tech_signals(ohlcv: pd.DataFrame) -> pd.DataFrame:
     wk["cpr_w"] = wk["cpr_w"].shift(1)
     daily_cpr = wk["cpr_w"].resample("D").ffill().reindex(cl.index, method="ffill")
 
+    adx14 = _compute_adx(ohlcv)
+
     return pd.DataFrame({
         "atr_percentile": atr_percentile,
         "rsi14":          rsi14,
@@ -315,6 +346,7 @@ def compute_tech_signals(ohlcv: pd.DataFrame) -> pd.DataFrame:
         "hv_ratio":       hv_ratio,
         "supertrend_dir": supertrend_dir,
         "cpr_width_pct":  daily_cpr,
+        "adx14":          adx14.reindex(cl.index),
     }, index=cl.index)
 
 
@@ -329,7 +361,7 @@ def _has_symbol_col_eod(ch) -> bool:
 def load_eod_summary(ch, symbol: str = "NIFTY") -> pd.DataFrame:
     """Load EOD summary for a specific symbol. Falls back to unfiltered for legacy schema."""
     cols_sql = ("date, iv_rank, iv_percentile, atm_ce_iv, atm_pe_iv, iv_skew, "
-                "pcr, nifty_spot, ce_wall_strike, pe_wall_strike")
+                "pcr, nifty_spot, ce_wall_strike, pe_wall_strike, max_pain_strike")
     if _has_symbol_col_eod(ch):
         r = ch.query(
             f"SELECT {cols_sql} FROM market.options_eod_summary FINAL "
@@ -342,7 +374,7 @@ def load_eod_summary(ch, symbol: str = "NIFTY") -> pd.DataFrame:
         )
     df = pd.DataFrame(r.result_rows, columns=[
         "date", "iv_rank", "iv_percentile", "atm_ce_iv", "atm_pe_iv", "iv_skew",
-        "pcr_eod", "nifty_spot", "ce_wall_strike", "pe_wall_strike"
+        "pcr_eod", "nifty_spot", "ce_wall_strike", "pe_wall_strike", "max_pain_strike"
     ])
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df.set_index("date", inplace=True)
@@ -460,6 +492,8 @@ def extract_eod_features(eod, snap_date) -> dict:
     if spot > 0:
         feats["ce_wall_pct"] = (row.ce_wall_strike - spot) / spot * 100
         feats["pe_wall_pct"] = (spot - row.pe_wall_strike) / spot * 100
+        if pd.notna(row.get("max_pain_strike", float("nan"))) and float(row.max_pain_strike) > 0:
+            feats["max_pain_dist_pct"] = (float(row.max_pain_strike) - spot) / spot * 100
     return feats
 
 
@@ -509,24 +543,42 @@ def load_backtest_pnl(ch, symbol: str, strategy_type: str) -> pd.DataFrame:
     sn = p["short_n"]
     if strategy_type == "iron_fly":
         rows = ch.query(
-            "SELECT expiry, entry_date, pnl_pts FROM analysis.spread_backtest FINAL "
+            "SELECT expiry, entry_date, pnl_pts, net_credit FROM analysis.spread_backtest FINAL "
             "WHERE symbol={sym:String} AND strategy='iron_fly' AND short_n=0",
             parameters={"sym": symbol},
         ).result_rows
     else:
         wm = p["wing_m"]
         rows = ch.query(
-            "SELECT expiry, entry_date, pnl_pts FROM analysis.spread_backtest FINAL "
+            "SELECT expiry, entry_date, pnl_pts, net_credit FROM analysis.spread_backtest FINAL "
             "WHERE symbol={sym:String} AND strategy={strat:String} "
             "AND short_n={sn:Int32} AND wing_m={wm:Int32}",
             parameters={"sym": symbol, "strat": strategy_type, "sn": sn, "wm": wm},
         ).result_rows
     if not rows:
-        return pd.DataFrame(columns=["expiry", "entry_date", "pnl_pts"])
-    df = pd.DataFrame(rows, columns=["expiry", "entry_date", "pnl_pts"])
+        return pd.DataFrame(columns=["expiry", "entry_date", "pnl_pts", "net_credit"])
+    df = pd.DataFrame(rows, columns=["expiry", "entry_date", "pnl_pts", "net_credit"])
     df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
     df["entry_date"] = pd.to_datetime(df["entry_date"]).dt.date
     return df.set_index(["expiry", "entry_date"])
+
+
+def load_straddle_stats(ch, symbol: str) -> pd.DataFrame:
+    """Mean and std of iron_fly net_credit per DTE for straddle z-score normalization."""
+    try:
+        r = ch.query(
+            "SELECT toInt32(dateDiff('day', toDate(entry_date), toDate(expiry))) AS dte, "
+            "avg(net_credit) AS mean_net, stddevPop(net_credit) AS std_net "
+            "FROM analysis.spread_backtest FINAL "
+            "WHERE symbol = {sym:String} AND strategy = 'iron_fly' AND net_credit > 0 "
+            "GROUP BY dte ORDER BY dte",
+            parameters={"sym": symbol},
+        )
+        df = pd.DataFrame(r.result_rows, columns=["dte", "mean_net", "std_net"])
+        df.set_index("dte", inplace=True)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["mean_net", "std_net"])
 
 
 # ── Dataset Builder ───────────────────────────────────────────────────────────
@@ -542,6 +594,7 @@ def _tech_row(tech, snap_date, eod) -> dict:
         "hv_ratio":       float(t["hv_ratio"])       if pd.notna(t["hv_ratio"])       else float("nan"),
         "supertrend_dir": float(t["supertrend_dir"]) if pd.notna(t["supertrend_dir"]) else float("nan"),
         "cpr_width_pct":  float(t["cpr_width_pct"])  if pd.notna(t["cpr_width_pct"])  else float("nan"),
+        "adx14":          float(t["adx14"])           if pd.notna(t.get("adx14", float("nan"))) else float("nan"),
     }
     hv5 = float(t["hv5"]) if pd.notna(t["hv5"]) and t["hv5"] > 0 else 0.0
     if hv5 > 0 and snap_date in eod.index:
@@ -555,14 +608,23 @@ def _tech_row(tech, snap_date, eod) -> dict:
 
 def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFrame:
     log.info(f"[{symbol}][{strategy_type}] loading data…")
-    chain       = load_options_chain(ch, symbol)
-    eod         = load_eod_summary(ch, symbol)
-    poi         = load_participant_oi(ch)
-    vix         = load_vix(ch)
-    event_dates = load_events(ch)
-    index_sym   = INDEX_MAP.get(symbol, "^NSEI")
-    ohlcv       = load_index_ohlcv(ch, index_sym)
-    tech        = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
+    chain          = load_options_chain(ch, symbol)
+    eod            = load_eod_summary(ch, symbol)
+    poi            = load_participant_oi(ch)
+    vix            = load_vix(ch)
+    vol_surf       = load_vol_surface(ch, symbol)
+    event_dates    = load_events(ch)
+    straddle_stats = load_straddle_stats(ch, symbol) if strategy_type == "iron_fly" else pd.DataFrame()
+    index_sym      = INDEX_MAP.get(symbol, "^NSEI")
+    ohlcv          = load_index_ohlcv(ch, index_sym)
+    tech           = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
+
+    # VIX z-score vs 20-day SMA — mean-reversion context
+    vix_zscore = pd.Series(dtype=float)
+    if not vix.empty:
+        vix_roll_mean = vix["vix"].rolling(20).mean()
+        vix_roll_std  = vix["vix"].rolling(20).std().replace(0, 1.0)
+        vix_zscore    = (vix["vix"] - vix_roll_mean) / vix_roll_std
 
     # Load actual strategy P&L from backtester (pnl already deducts wing costs)
     bt_pnl = load_backtest_pnl(ch, symbol, strategy_type)
@@ -600,9 +662,22 @@ def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFr
         row.update(extract_poi_features(poi, snap_date))
         row.update(temporal_features(expiry))
         row["vix"] = float(vix.loc[snap_date, "vix"]) if snap_date in vix.index else float("nan")
+        row["vix_z20"] = float(vix_zscore.loc[snap_date]) if snap_date in vix_zscore.index else float("nan")
         if not tech.empty:
             row.update(_tech_row(tech, snap_date, eod))
         row.update(extract_event_features(event_dates, snap_date, expiry))
+        # IV term structure: negative term_slope = backwardation = short-vol edge
+        if snap_date in vol_surf.index:
+            ts = vol_surf.loc[snap_date]
+            row["term_slope"] = float(ts["term_slope"])
+            row["atm_iv_7d"]  = float(ts["atm_iv_7d"])
+        # Straddle z-score: is today's net_credit cheap or expensive at this DTE?
+        dte_int = int(dte)
+        if not straddle_stats.empty and dte_int in straddle_stats.index:
+            s = straddle_stats.loc[dte_int]
+            net_credit = float(bt_pnl.loc[(expiry, snap_date), "net_credit"])
+            if s["std_net"] > 0:
+                row["straddle_z"] = (net_credit - s["mean_net"]) / s["std_net"]
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -645,16 +720,20 @@ FEATURE_COLS = [
     # EOD summary
     "iv_rank", "iv_percentile", "atm_ce_iv", "atm_pe_iv",
     "iv_skew", "pcr_eod", "ce_wall_pct", "pe_wall_pct",
+    "max_pain_dist_pct",
     # Participant OI
     "client_call_net", "client_put_net", "client_pcr",
     "fii_call_net", "fii_put_net", "fii_pcr",
     # Temporal
     "day_of_week", "week_of_month", "dte",
     # Volatility regime
-    "vix",
+    "vix", "vix_z20",
+    "term_slope", "atm_iv_7d",
+    "straddle_z",
     # Technical regime signals
     "atr_percentile", "rsi14", "hv_ratio",
     "supertrend_dir", "cpr_width_pct", "iv_hv5_ratio",
+    "adx14",
     # Event calendar
     "event_in_window", "days_to_event",
 ]
@@ -921,14 +1000,23 @@ def score_today(ch, mc, symbol: str, strategy: str = "iron_fly") -> None:
     is_pooled  = meta.get("is_pooled", False)
     feat_cols  = meta.get("features", FEATURE_COLS)
 
-    chain       = load_options_chain(ch, symbol)
-    eod         = load_eod_summary(ch, symbol)
-    poi         = load_participant_oi(ch)
-    vix         = load_vix(ch)
-    event_dates = load_events(ch)
-    index_sym   = INDEX_MAP.get(symbol, "^NSEI")
-    ohlcv       = load_index_ohlcv(ch, index_sym)
-    tech        = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
+    chain          = load_options_chain(ch, symbol)
+    eod            = load_eod_summary(ch, symbol)
+    poi            = load_participant_oi(ch)
+    vix            = load_vix(ch)
+    vol_surf       = load_vol_surface(ch, symbol)
+    straddle_stats = load_straddle_stats(ch, symbol) if strategy == "iron_fly" else pd.DataFrame()
+    event_dates    = load_events(ch)
+    index_sym      = INDEX_MAP.get(symbol, "^NSEI")
+    ohlcv          = load_index_ohlcv(ch, index_sym)
+    tech           = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
+
+    # VIX z-score
+    vix_zscore = pd.Series(dtype=float)
+    if not vix.empty:
+        vix_roll_mean = vix["vix"].rolling(20).mean()
+        vix_roll_std  = vix["vix"].rolling(20).std().replace(0, 1.0)
+        vix_zscore    = (vix["vix"] - vix_roll_mean) / vix_roll_std
 
     today = date.today()
     snap_dates = sorted(chain["snap_date"].unique(), reverse=True)
@@ -960,18 +1048,34 @@ def score_today(ch, mc, symbol: str, strategy: str = "iron_fly") -> None:
     poi_snap = _nearest_eod(poi.index, latest_snap)
     vix_snap = _nearest_eod(vix.index, latest_snap)
 
+    vol_snap = _nearest_eod(vol_surf.index, latest_snap) if not vol_surf.empty else None
+
     row = {}
     row.update(chain_feats)
     row.update(extract_eod_features(eod, eod_snap))
     row.update(extract_poi_features(poi, poi_snap))
     row.update(temporal_features(next_expiry))
     row["vix"] = float(vix.loc[vix_snap, "vix"]) if vix_snap in vix.index else 0.0
+    row["vix_z20"] = float(vix_zscore.loc[vix_snap]) if vix_snap in vix_zscore.index else float("nan")
     if not tech.empty:
         row.update(_tech_row(tech, latest_snap, eod))
     row.update(extract_event_features(event_dates, latest_snap, next_expiry))
     # DTE: days from today's pricing reference to next expiry
     row["dte"] = float((next_expiry - latest_snap).days) if isinstance(latest_snap, date) else float(
         (pd.to_datetime(next_expiry).date() - pd.to_datetime(latest_snap).date()).days)
+    # IV term structure and straddle z-score
+    if vol_snap and vol_snap in vol_surf.index:
+        ts = vol_surf.loc[vol_snap]
+        row["term_slope"] = float(ts["term_slope"])
+        row["atm_iv_7d"]  = float(ts["atm_iv_7d"])
+    dte_today = int(row["dte"])
+    if not straddle_stats.empty and dte_today in straddle_stats.index:
+        s = straddle_stats.loc[dte_today]
+        # Approximate today's gross straddle from chain features
+        spot = float(eod.loc[eod_snap, "nifty_spot"]) if eod_snap in eod.index and eod.loc[eod_snap, "nifty_spot"] > 0 else 0.0
+        gross_straddle = row.get("straddle_pct", 0.0) * spot / 100 if spot > 0 else 0.0
+        if s["std_net"] > 0 and gross_straddle > 0:
+            row["straddle_z"] = (gross_straddle - s["mean_net"]) / s["std_net"]
 
     if is_pooled:
         for s in SYMBOLS:
@@ -1001,6 +1105,97 @@ def score_today(ch, mc, symbol: str, strategy: str = "iron_fly") -> None:
                       "expected_pnl_pct", "features_json", "strategy_type"],
     )
     log.info(f"[{symbol}][{strategy}] confidence score inserted: {confidence:.1f}/100")
+
+
+# ── Live Intraday Scoring ──────────────────────────────────────────────────────
+
+def score_live_snapshot(ch, mc, symbol: str, snap: dict, strategy: str = "iron_fly") -> float:
+    """Score using a live intraday chain snapshot.
+    snap must have: timestamp, expiry, strike, ce_ltp, pe_ltp, straddle, ce_iv, pe_iv.
+    Falls back to 50.0 if model is unavailable.
+    Uses live IV/straddle overriding yesterday's EOD values; all other features from
+    nearest available historical data (EOD, participant OI, technical indicators).
+    """
+    model, meta = load_model(symbol, mc, strategy)
+    if model is None:
+        return 50.0
+
+    feat_cols  = meta.get("features", FEATURE_COLS)
+    is_pooled  = meta.get("is_pooled", False)
+
+    eod            = load_eod_summary(ch, symbol)
+    poi            = load_participant_oi(ch)
+    vix            = load_vix(ch)
+    vol_surf       = load_vol_surface(ch, symbol)
+    straddle_stats = load_straddle_stats(ch, symbol) if strategy == "iron_fly" else pd.DataFrame()
+    event_dates    = load_events(ch)
+    index_sym      = INDEX_MAP.get(symbol, "^NSEI")
+    ohlcv          = load_index_ohlcv(ch, index_sym)
+    tech           = compute_tech_signals(ohlcv) if not ohlcv.empty else pd.DataFrame()
+
+    vix_zscore = pd.Series(dtype=float)
+    if not vix.empty:
+        vix_roll_mean = vix["vix"].rolling(20).mean()
+        vix_roll_std  = vix["vix"].rolling(20).std().replace(0, 1.0)
+        vix_zscore    = (vix["vix"] - vix_roll_mean) / vix_roll_std
+
+    snap_date = pd.to_datetime(snap["timestamp"]).date()
+    expiry    = snap["expiry"] if isinstance(snap["expiry"], date) else pd.to_datetime(snap["expiry"]).date()
+    strike    = float(snap.get("strike", 0))
+    straddle  = float(snap.get("straddle", 0))
+
+    def _nearest(index, snap):
+        if snap in index:
+            return snap
+        past = [d for d in index if d <= snap]
+        return past[-1] if past else None
+
+    eod_snap = _nearest(eod.index, snap_date)
+    poi_snap = _nearest(poi.index, snap_date)
+    vix_snap = _nearest(vix.index, snap_date)
+    vol_snap = _nearest(vol_surf.index, snap_date) if not vol_surf.empty else None
+
+    dte = (expiry - date.today()).days
+
+    row = {
+        # Live values override EOD equivalents
+        "atm_ce_iv":   float(snap.get("ce_iv", 0.0)),
+        "atm_pe_iv":   float(snap.get("pe_iv", 0.0)),
+        "straddle_pct": straddle / strike * 100 if strike > 0 else 0.0,
+        "dte":         float(dte),
+    }
+    if eod_snap:
+        row.update(extract_eod_features(eod, eod_snap))
+        # Override with live IV values from snap
+        row["atm_ce_iv"] = float(snap.get("ce_iv", row.get("atm_ce_iv", 0.0)))
+        row["atm_pe_iv"] = float(snap.get("pe_iv", row.get("atm_pe_iv", 0.0)))
+    if poi_snap:
+        row.update(extract_poi_features(poi, poi_snap))
+    row.update(temporal_features(expiry))
+    if vix_snap and vix_snap in vix.index:
+        row["vix"] = float(vix.loc[vix_snap, "vix"])
+        row["vix_z20"] = float(vix_zscore.loc[vix_snap]) if vix_snap in vix_zscore.index else float("nan")
+    if not tech.empty:
+        row.update(_tech_row(tech, snap_date, eod))
+    row.update(extract_event_features(event_dates, snap_date, expiry))
+    if vol_snap and vol_snap in vol_surf.index:
+        ts = vol_surf.loc[vol_snap]
+        row["term_slope"] = float(ts["term_slope"])
+        row["atm_iv_7d"]  = float(ts["atm_iv_7d"])
+    if not straddle_stats.empty and dte in straddle_stats.index:
+        s = straddle_stats.loc[dte]
+        if s["std_net"] > 0 and straddle > 0:
+            row["straddle_z"] = (straddle - s["mean_net"]) / s["std_net"]
+    if is_pooled:
+        for s in SYMBOLS:
+            row[f"sym_{s}"] = float(s == symbol)
+
+    feat_df = pd.DataFrame([row])
+    for c in feat_cols:
+        if c not in feat_df.columns:
+            feat_df[c] = 0.0
+    feat_df = feat_df[[c for c in feat_cols if c in feat_df.columns]].fillna(0.0).astype(float)
+    return round(float(model.predict_proba(feat_df)[0, 1]) * 100, 1)
 
 
 # ── Model Comparison ──────────────────────────────────────────────────────────
