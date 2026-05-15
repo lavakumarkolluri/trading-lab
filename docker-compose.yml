@@ -629,6 +629,7 @@ services:
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
       - TZ=Asia/Kolkata
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     depends_on:
       clickhouse:
         condition: service_healthy

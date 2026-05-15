@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
@@ -20,6 +21,8 @@ CH_HOST = os.getenv("CH_HOST", "clickhouse")
 CH_PORT = int(os.getenv("CH_PORT", "8123"))
 CH_USER = os.getenv("CH_USER", "default")
 CH_PASS = os.getenv("CH_PASSWORD", "")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO  = "lavakumarkolluri/trading-lab"
 
 # Features that must be non-zero for a reliable model score
 CRITICAL_FEATURES = ["vix", "iv_rank", "pcr_oi", "straddle_pct", "atr_percentile", "rsi14"]
@@ -48,6 +51,24 @@ def query(sql: str) -> pd.DataFrame:
     except Exception as e:
         st.error(f"Query failed: {e}")
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=180)
+def _gh_commits(branch: str, n: int = 30) -> list:
+    """Fetch the last n commits on a branch from the GitHub API."""
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/commits",
+            params={"sha": branch, "per_page": n},
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return []
 
 
 @st.cache_data(ttl=30)
@@ -532,9 +553,11 @@ elif page == "System Health":
 
     st.divider()
 
-    # ── Current branch (latest CI result) ─────────────────────────────────────
+    # ── Branch Status — live from GitHub API ──────────────────────────────────
     st.subheader("Branch Status")
 
+    _master_commits = _gh_commits("master", 1)
+    _stage_commits  = _gh_commits("stage",  1)
     ci_df = query("""
         SELECT branch, commit_sha, commit_msg, commit_author,
                tests_passed, tests_failed, tests_total, duration_s,
@@ -544,76 +567,116 @@ elif page == "System Health":
         LIMIT 1
     """)
 
-    if ci_df.empty:
-        st.info("No CI results yet — scheduler records tests after each auto-deploy.")
-    else:
-        ci      = ci_df.iloc[0]
-        n_pass  = int(ci["tests_passed"])
-        n_fail  = int(ci["tests_failed"])
-        n_total = int(ci["tests_total"])
-        all_ok  = n_fail == 0 and n_pass > 0
-        ci_icon = "🟢" if all_ok else "🔴"
-        run_at_dt = pd.Timestamp(ci["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
+    col_m, col_s, col_ci = st.columns(3)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Branch",  str(ci["branch"]))
-        c2.metric("Commit",  str(ci["commit_sha"])[:10])
-        c3.metric("Message", str(ci["commit_msg"])[:35] + ("…" if len(str(ci["commit_msg"])) > 35 else ""))
-        c4.metric(f"{ci_icon} Tests", f"{n_pass}/{n_total}",
-                  delta=f"{n_fail} failed" if n_fail else "all pass",
-                  delta_color="inverse" if n_fail else "normal")
-        c5.metric("Last Run", _age_str(run_at_dt),
-                  delta=f"{float(ci['duration_s']):.0f}s")
+    with col_m:
+        st.markdown("**master (prod)**")
+        if _master_commits:
+            mc = _master_commits[0]
+            _mc_msg    = mc["commit"]["message"].split("\n")[0]
+            _mc_author = mc["commit"]["author"]["name"]
+            _mc_date   = mc["commit"]["author"]["date"][:10]
+            st.metric("Commit", mc["sha"][:10])
+            st.caption(f"{_mc_msg[:60]}{'…' if len(_mc_msg) > 60 else ''}")
+            st.caption(f"by {_mc_author} · {_mc_date}")
+        else:
+            st.info("GitHub unreachable")
 
-        if n_fail > 0:
-            with st.expander(f"🔴 {n_fail} failing tests — expand for names"):
-                st.code(str(ci["failed_tests"]))
+    with col_s:
+        st.markdown("**stage**")
+        if _stage_commits:
+            sc = _stage_commits[0]
+            _sc_msg    = sc["commit"]["message"].split("\n")[0]
+            _sc_author = sc["commit"]["author"]["name"]
+            _sc_date   = sc["commit"]["author"]["date"][:10]
+            _sc_ahead  = (
+                "✅ same as master"
+                if _stage_commits and _master_commits and sc["sha"] == _master_commits[0]["sha"]
+                else "⚡ ahead of master"
+            )
+            st.metric("Commit", sc["sha"][:10])
+            st.caption(f"{_sc_msg[:60]}{'…' if len(_sc_msg) > 60 else ''}")
+            st.caption(f"by {_sc_author} · {_sc_date} · {_sc_ahead}")
+        else:
+            st.info("GitHub unreachable")
+
+    with col_ci:
+        st.markdown("**Last CI Run**")
+        if not ci_df.empty:
+            ci      = ci_df.iloc[0]
+            n_pass  = int(ci["tests_passed"])
+            n_fail  = int(ci["tests_failed"])
+            n_total = int(ci["tests_total"])
+            all_ok  = n_fail == 0 and n_pass > 0
+            ci_icon = "🟢" if all_ok else "🔴"
+            run_at_dt = pd.Timestamp(ci["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
+            st.metric(f"{ci_icon} Tests", f"{n_pass}/{n_total}",
+                      delta=f"{n_fail} failed" if n_fail else "all pass",
+                      delta_color="inverse" if n_fail else "normal")
+            st.caption(f"ran {_age_str(run_at_dt)} · {float(ci['duration_s']):.0f}s")
+            if n_fail > 0:
+                with st.expander(f"🔴 {n_fail} failing tests"):
+                    st.code(str(ci["failed_tests"]))
+        else:
+            st.info("No CI results yet")
 
     st.divider()
 
-    # ── Commit / Deploy History ────────────────────────────────────────────────
+    # ── Commit History — live from GitHub, CI results merged in ───────────────
     st.subheader("📋 Commit History")
-    st.caption(
-        "Each row = a commit detected on master by the scheduler. "
-        "Flow: push to `stage` → GitHub Actions CI → auto-merge to `master` → scheduler picks up → row appears here. "
-        "🟢 On Master = tests passed & live in prod. 🔴 CI Failed = blocked on stage."
-    )
+    st.caption("Live feed from GitHub · master branch · last 30 commits. CI column comes from scheduler test runs.")
 
-    deploy_df = query("""
-        SELECT branch, commit_sha, commit_msg, commit_author, commit_ts,
-               tests_passed, tests_failed, tests_total, duration_s, status, run_at
+    _master_hist = _gh_commits("master", 30)
+
+    # Build SHA-prefix → CI test row lookup from deploy_log
+    _deploy_df = query("""
+        SELECT commit_sha, tests_passed, tests_failed, tests_total, duration_s, status, run_at
         FROM system_meta.deploy_log
         ORDER BY run_at DESC
-        LIMIT 30
+        LIMIT 60
     """)
+    _ci_by_sha: dict = {}
+    if not _deploy_df.empty:
+        for _, _dr in _deploy_df.iterrows():
+            _ci_by_sha[str(_dr["commit_sha"])[:10]] = _dr
 
-    if deploy_df.empty:
-        st.info(
-            "No deployment history yet — records appear here after the scheduler "
-            "runs its next auto-deploy cycle.",
-            icon="ℹ️",
+    if not _master_hist:
+        st.warning(
+            "Could not fetch commits from GitHub. "
+            "Check that GITHUB_TOKEN is set in the dashboard environment.",
+            icon="⚠️",
         )
     else:
-        deploy_rows = []
-        for _, r in deploy_df.iterrows():
-            n_p = int(r["tests_passed"])
-            n_f = int(r["tests_failed"])
-            n_t = int(r["tests_total"])
-            ok  = n_f == 0 and n_p > 0
-            run_ts    = pd.Timestamp(r["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
-            commit_ts = str(r.get("commit_ts", ""))[:16]
-            lifecycle = ("🟢 On Master" if ok else "🔴 CI Failed")
-            deploy_rows.append({
-                "📅 Deployed (IST)": run_ts.astimezone(IST).strftime("%d %b  %H:%M"),
-                "✏️ Commit":          str(r["commit_sha"])[:10],
-                "💬 Message":         str(r["commit_msg"])[:70],
-                "👤 Author":          str(r["commit_author"])[:20],
-                "🕐 Committed":       commit_ts,
-                "🧪 Tests":           f"{n_p}/{n_t}" + (f"  ❌{n_f}" if n_f else ""),
-                "📍 Stage":           lifecycle,
-                "⏱️ CI (s)":          f"{float(r['duration_s']):.0f}",
+        _commit_rows = []
+        for _c in _master_hist:
+            _sha10  = _c["sha"][:10]
+            _msg    = _c["commit"]["message"].split("\n")[0][:75]
+            _author = _c["commit"]["author"]["name"][:22]
+            _date   = _c["commit"]["author"]["date"][:10]
+            _ci     = _ci_by_sha.get(_sha10)
+            if _ci is not None:
+                _np = int(_ci["tests_passed"])
+                _nf = int(_ci["tests_failed"])
+                _nt = int(_ci["tests_total"])
+                _tests_str = f"{_np}/{_nt}" + (f" ❌{_nf}" if _nf else " ✅")
+                _ci_dur    = f"{float(_ci['duration_s']):.0f}s"
+                _ci_age    = _age_str(
+                    pd.Timestamp(_ci["run_at"]).to_pydatetime().replace(tzinfo=timezone.utc)
+                )
+            else:
+                _tests_str = "—"
+                _ci_dur    = "—"
+                _ci_age    = "—"
+            _commit_rows.append({
+                "📅 Date":     _date,
+                "✏️ SHA":      _sha10,
+                "💬 Message":  _msg,
+                "👤 Author":   _author,
+                "🧪 Tests":    _tests_str,
+                "⏱️ CI":       _ci_dur,
+                "🕐 CI ran":   _ci_age,
             })
-        st.dataframe(pd.DataFrame(deploy_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(_commit_rows), use_container_width=True, hide_index=True)
 
     st.divider()
 
