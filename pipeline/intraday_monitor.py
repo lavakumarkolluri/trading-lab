@@ -47,9 +47,9 @@ log = get_logger(__name__)
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
-SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 
-DEFAULT_LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60}
+DEFAULT_LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120}
 
 TARGET_INR   = 2000.0
 STOPLOSS_INR = 1000.0
@@ -62,11 +62,11 @@ EOD_EXIT         = dtime(15, 20)
 MONITOR_EXIT     = dtime(15, 25)
 STOP_COOLDOWN_M  = 30         # minutes to wait before re-entry after stop hit
 
-MIN_PREMIUM       = {"NIFTY": 40.0, "BANKNIFTY": 80.0, "FINNIFTY": 50.0}
+MIN_PREMIUM       = {"NIFTY": 40.0, "BANKNIFTY": 80.0, "FINNIFTY": 50.0, "MIDCPNIFTY": 30.0}
 MIN_CONFIDENCE    = 60.0   # skip entry if scorecard below this (raised from 50 — coin-flip threshold)
 
 # Iron fly wing distances (OTM strikes to buy for defined-risk structure)
-WING_PTS = {"NIFTY": 200.0, "BANKNIFTY": 500.0, "FINNIFTY": 200.0}
+WING_PTS = {"NIFTY": 200.0, "BANKNIFTY": 500.0, "FINNIFTY": 200.0, "MIDCPNIFTY": 200.0}
 
 DELTA_HEDGE_THRESHOLD = 0.15   # hedge when |net_delta| exceeds this
 RISK_FREE_RATE        = 0.065  # India 10-yr approx

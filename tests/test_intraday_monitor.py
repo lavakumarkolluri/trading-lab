@@ -334,3 +334,27 @@ def test_get_score_features_json_returns_empty_on_error():
     ch.query.side_effect = Exception("timeout")
     result = monitor.get_score_features_json(ch, "NIFTY")
     assert result == {}
+
+
+# ── MIDCPNIFTY config completeness (HIGH-007) ────────────────────────────────
+
+def test_midcpnifty_in_symbols():
+    """MIDCPNIFTY must be in SYMBOLS list (HIGH-007)."""
+    assert "MIDCPNIFTY" in monitor.SYMBOLS
+
+
+def test_midcpnifty_config_completeness():
+    """Every config dict must have an entry for every symbol in SYMBOLS."""
+    config_dicts = {
+        "DEFAULT_LOT_SIZES": monitor.DEFAULT_LOT_SIZES,
+        "MIN_PREMIUM": monitor.MIN_PREMIUM,
+        "WING_PTS": monitor.WING_PTS,
+    }
+    for name, d in config_dicts.items():
+        for sym in monitor.SYMBOLS:
+            assert sym in d, f"{name} missing key '{sym}'"
+
+
+def test_all_symbols_have_four_entries():
+    """Exactly 4 symbols are configured (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY)."""
+    assert set(monitor.SYMBOLS) == {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
