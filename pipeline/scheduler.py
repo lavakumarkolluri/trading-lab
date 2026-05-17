@@ -58,6 +58,11 @@ _COMPOSE_BASE = [
 from ch_utils import ch_client as _ch_client, GIT_SHA, write_alert_log
 _TRACKING_OK = True
 
+# State directory is bind-mounted into the container at /trading-lab so it
+# persists across scheduler restarts — unlike /tmp which is wiped on every restart.
+_STATE_DIR = os.path.join(_PROJECT_DIR, ".scheduler_state")
+os.makedirs(_STATE_DIR, exist_ok=True)
+
 _TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -128,7 +133,7 @@ def _compose(args: list, timeout: int = 300):
     subprocess.run(_COMPOSE_BASE + args, check=False, timeout=timeout)
 
 
-_DEPLOY_SHA_FILE = "/tmp/auto_deploy_last_sha"
+_DEPLOY_SHA_FILE = os.path.join(_STATE_DIR, "auto_deploy_last_sha")
 
 
 def _get_last_deployed_sha() -> str:
@@ -184,9 +189,11 @@ def job_auto_deploy():
 
         old_sha = _get_last_deployed_sha()
         if not old_sha:
-            # First run — record current master, nothing to deploy yet
+            # First run — save SHA and immediately run tests so we validate whatever
+            # is currently on master (covers commits that landed while scheduler was down).
             _save_deployed_sha(new_sha)
-            log.info("AUTO-DEPLOY: initialised — tracking origin/master at %s", new_sha[:8])
+            log.info("AUTO-DEPLOY: first boot — tracking origin/master at %s; running tests", new_sha[:8])
+            _run_tests_and_record()
             return
 
         if old_sha == new_sha:
@@ -449,9 +456,11 @@ def _run_tests_and_record():
         sha    = _git(["rev-parse", "HEAD"]).stdout.strip()[:12] or "unknown"
         msg    = _git(["log", "-1", "--format=%s"]).stdout.strip()[:120] or ""
         author = _git(["log", "-1", "--format=%an"]).stdout.strip()[:60] or ""
-        cts    = _git(["log", "-1", "--format=%ci"]).stdout.strip()[:19] or "1970-01-01 00:00:00"
+        cts_raw = _git(["log", "-1", "--format=%ci"]).stdout.strip()[:19] or "1970-01-01 00:00:00"
+        cts = datetime.strptime(cts_raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception:
-        branch, sha, msg, author, cts = "unknown", "unknown", "", "", "1970-01-01 00:00:00"
+        branch, sha, msg, author = "unknown", "unknown", "", ""
+        cts = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     try:
         ch = _ch_client()
@@ -739,7 +748,7 @@ def job_data_freshness_check():
     _run("data_freshness_check")
 
 
-_CLEANUP_LAST_RUN_FILE = "/tmp/data_cleanup_last_run"
+_CLEANUP_LAST_RUN_FILE = os.path.join(_STATE_DIR, "data_cleanup_last_run")
 
 
 def _cleanup_last_run_ts() -> datetime | None:
@@ -802,7 +811,7 @@ def job_data_cleanup():
         deleted = ch.command(
             """
             ALTER TABLE market.options_chain DELETE
-            WHERE snap_date < today() - 7
+            WHERE toDate(timestamp) < today() - 7
             """
         )
         log.info("data_cleanup: options_chain purged rows older than 7 days")
@@ -1193,9 +1202,7 @@ def main():
     schedule.every(15).minutes.do(job_check_dashboard_health)
     job_check_dashboard_health()  # check immediately on startup
 
-    # Watchdog health check: every 15 min
-    schedule.every(15).minutes.do(job_check_watchdog_health)
-    job_check_watchdog_health()  # check immediately on startup
+    # pipeline_watchdog container does not exist — health check removed to stop false CRITs
 
     # Pre-market GO/NO-GO check: 08:30 IST (03:00 UTC) Mon–Fri
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
