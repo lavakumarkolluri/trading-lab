@@ -562,7 +562,10 @@ def load_backtest_pnl(ch, symbol: str, strategy_type: str) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["expiry", "entry_date", "pnl_pts", "net_credit"])
     df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
     df["entry_date"] = pd.to_datetime(df["entry_date"]).dt.date
-    return df.set_index(["expiry", "entry_date"])
+    df = df.set_index(["expiry", "entry_date"])
+    # Backtester re-runs can produce duplicate (expiry, entry_date) rows.
+    # Keep last to get the most recent values; prevents float(Series) crash.
+    return df[~df.index.duplicated(keep="last")]
 
 
 def load_straddle_stats(ch, symbol: str) -> pd.DataFrame:
