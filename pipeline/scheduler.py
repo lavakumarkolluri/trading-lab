@@ -260,7 +260,9 @@ UPSTREAM_DEPS: dict[str, list[str]] = {
 
 
 def _upstream_ok(service: str, today_date: str) -> tuple[bool, str]:
-    """Return (ok, reason). ok=True means all upstreams succeeded today."""
+    """Return (ok, reason). ok=True means all upstreams succeeded within the last 3 days.
+    3-day window allows weekend jobs (scorer on Sunday) to use Friday's compute_oi_features run.
+    """
     deps = UPSTREAM_DEPS.get(service, [])
     if not deps or not _TRACKING_OK:
         return True, ""
@@ -269,18 +271,19 @@ def _upstream_ok(service: str, today_date: str) -> tuple[bool, str]:
         for dep in deps:
             result = ch.query(
                 """
-                SELECT status FROM system_meta.pipeline_runs FINAL
+                SELECT status, run_date FROM system_meta.pipeline_runs FINAL
                 WHERE service  = {service:String}
-                  AND run_date = {run_date:Date}
-                ORDER BY version DESC LIMIT 1
+                  AND run_date >= toDate({run_date:String}) - 3
+                  AND run_date <= toDate({run_date:String})
+                ORDER BY run_date DESC, version DESC LIMIT 1
                 """,
                 parameters={"service": dep, "run_date": today_date},
             )
             if not result.result_rows:
-                return False, f"upstream '{dep}' has no run record for {today_date}"
-            status = result.result_rows[0][0]
+                return False, f"upstream '{dep}' has no run record in last 3 days"
+            status, run_date = result.result_rows[0]
             if status != "success":
-                return False, f"upstream '{dep}' status={status} on {today_date}"
+                return False, f"upstream '{dep}' status={status} on {run_date}"
     except Exception as e:
         log.warning("Dependency gate check failed: %s", e)
         return True, ""   # fail-open: don't block if we can't query

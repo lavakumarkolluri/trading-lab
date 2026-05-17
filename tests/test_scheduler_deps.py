@@ -92,10 +92,10 @@ def test_upstream_ok_returns_true_when_no_deps():
 
 
 def test_upstream_ok_false_when_upstream_failed():
-    """If compute_oi_features status=failed, confidence_scorer must be blocked."""
+    """If compute_oi_features status=failed (within last 3 days), confidence_scorer must be blocked."""
     import scheduler as s
-    ch = _mock_ch({"compute_oi_features": [("failed",)],
-                   "strategy_backtester":  [("success",)]})
+    ch = _mock_ch({"compute_oi_features": [("failed",  "2026-05-13")],
+                   "strategy_backtester":  [("success", "2026-05-13")]})
     with patch.object(s, "_TRACKING_OK", True):
         with patch.object(s, "_ch_client", return_value=ch):
             ok, reason = s._upstream_ok("confidence_scorer", "2026-05-13")
@@ -104,11 +104,10 @@ def test_upstream_ok_false_when_upstream_failed():
 
 
 def test_upstream_ok_false_when_upstream_missing():
-    """If compute_oi_features has no record today, block confidence_scorer."""
+    """If compute_oi_features has no record in the last 3 days, block confidence_scorer."""
     import scheduler as s
-    # no rows → upstream not run today
     ch = _mock_ch({"compute_oi_features": [],
-                   "strategy_backtester":  [("success",)]})
+                   "strategy_backtester":  [("success", "2026-05-13")]})
     with patch.object(s, "_TRACKING_OK", True):
         with patch.object(s, "_ch_client", return_value=ch):
             ok, reason = s._upstream_ok("confidence_scorer", "2026-05-13")
@@ -116,10 +115,10 @@ def test_upstream_ok_false_when_upstream_missing():
 
 
 def test_upstream_ok_true_when_all_upstreams_succeed():
-    """All upstreams succeeded → confidence_scorer is cleared to run."""
+    """All upstreams succeeded within last 3 days → confidence_scorer is cleared to run."""
     import scheduler as s
-    ch = _mock_ch({"compute_oi_features": [("success",)],
-                   "strategy_backtester":  [("success",)]})
+    ch = _mock_ch({"compute_oi_features": [("success", "2026-05-13")],
+                   "strategy_backtester":  [("success", "2026-05-13")]})
     with patch.object(s, "_TRACKING_OK", True):
         with patch.object(s, "_ch_client", return_value=ch):
             ok, reason = s._upstream_ok("confidence_scorer", "2026-05-13")

@@ -54,18 +54,18 @@ def compute_false_negatives(ch, from_date: date, to_date: date) -> dict:
     """
     total_result = ch.query(
         "SELECT count() FROM analysis.detected_events FINAL "
-        "WHERE event_date >= {d_from:Date} AND event_date <= {d_to:Date}",
+        "WHERE date >= {d_from:Date} AND date <= {d_to:Date}",
         parameters={"d_from": from_date, "d_to": to_date}
     )
     total_events = int(total_result.result_rows[0][0])
 
     missed_result = ch.query(
         "SELECT count() FROM analysis.detected_events de FINAL "
-        "WHERE de.event_date >= {d_from:Date} AND de.event_date <= {d_to:Date} "
+        "WHERE de.date >= {d_from:Date} AND de.date <= {d_to:Date} "
         "  AND NOT EXISTS ("
         "    SELECT 1 FROM analysis.predictions p FINAL "
         "    WHERE p.symbol = de.symbol "
-        "      AND p.prediction_date = de.event_date"
+        "      AND p.prediction_date = de.date"
         "  )",
         parameters={"d_from": from_date, "d_to": to_date}
     )
@@ -107,7 +107,7 @@ def compute_false_positives(ch, from_date: date, to_date: date) -> dict:
 def count_symbols_reviewed(ch, from_date: date, to_date: date) -> int:
     result = ch.query(
         "SELECT count(DISTINCT symbol) FROM analysis.detected_events FINAL "
-        "WHERE event_date >= {d_from:Date} AND event_date <= {d_to:Date}",
+        "WHERE date >= {d_from:Date} AND date <= {d_to:Date}",
         parameters={"d_from": from_date, "d_to": to_date}
     )
     return int(result.result_rows[0][0])
