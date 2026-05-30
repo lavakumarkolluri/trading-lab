@@ -134,6 +134,49 @@ def test_upstream_ok_returns_true_when_tracking_disabled():
     assert ok is True
 
 
+def test_upstream_ok_false_when_row_count_is_zero():
+    """C3: upstream recorded success but produced 0 rows — downstream must be blocked."""
+    import scheduler as s
+
+    def side_effect(sql, parameters=None):
+        result = MagicMock()
+        svc = (parameters or {}).get("service", "")
+        if "pipeline_runs" in sql:
+            result.result_rows = [("success", "2026-05-13")]
+        else:
+            # row-count query returns 0 — table is empty
+            result.result_rows = [(0,)]
+        return result
+
+    ch = MagicMock()
+    ch.query.side_effect = side_effect
+    with patch.object(s, "_TRACKING_OK", True):
+        with patch.object(s, "_ch_client", return_value=ch):
+            ok, reason = s._upstream_ok("options_eod_summary_pipeline", "2026-05-13")
+    assert ok is False
+    assert "0 rows" in reason
+
+
+def test_upstream_ok_true_when_row_count_nonzero():
+    """C3: upstream recorded success AND has rows — downstream is cleared."""
+    import scheduler as s
+
+    def side_effect(sql, parameters=None):
+        result = MagicMock()
+        if "pipeline_runs" in sql:
+            result.result_rows = [("success", "2026-05-13")]
+        else:
+            result.result_rows = [(42,)]   # 42 rows written
+        return result
+
+    ch = MagicMock()
+    ch.query.side_effect = side_effect
+    with patch.object(s, "_TRACKING_OK", True):
+        with patch.object(s, "_ch_client", return_value=ch):
+            ok, reason = s._upstream_ok("options_eod_summary_pipeline", "2026-05-13")
+    assert ok is True
+
+
 # ── job_check_dashboard_health ────────────────────────────────────────────────
 
 def test_dashboard_health_sends_alert_when_down():

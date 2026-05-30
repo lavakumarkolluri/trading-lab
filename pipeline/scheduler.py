@@ -267,10 +267,26 @@ UPSTREAM_DEPS: dict[str, list[str]] = {
     "strategy_selector":            ["confidence_scorer"],
 }
 
+# Row-count validation for C3: verify the upstream actually produced rows, not just
+# a success run record (a service can record success but write 0 rows on a silent failure).
+# Query must return a single integer count; 0 means upstream produced no usable output.
+UPSTREAM_ROW_CHECK: dict[str, str] = {
+    "option_chain_historical": (
+        "SELECT count() FROM market.options_chain WHERE toDate(timestamp) = today()"
+    ),
+    "options_eod_summary_pipeline": (
+        "SELECT count() FROM market.options_eod_summary WHERE date = today()"
+    ),
+    "compute_historical_iv": (
+        "SELECT countIf(atm_iv > 0) FROM market.options_eod_summary WHERE date = today()"
+    ),
+}
+
 
 def _upstream_ok(service: str, today_date: str) -> tuple[bool, str]:
     """Return (ok, reason). ok=True means all upstreams succeeded within the last 3 days.
     3-day window allows weekend jobs (scorer on Sunday) to use Friday's compute_oi_features run.
+    Also verifies row-count for services in UPSTREAM_ROW_CHECK (C3 downstream validation).
     """
     deps = UPSTREAM_DEPS.get(service, [])
     if not deps or not _TRACKING_OK:
@@ -293,6 +309,19 @@ def _upstream_ok(service: str, today_date: str) -> tuple[bool, str]:
             status, run_date = result.result_rows[0]
             if status != "success":
                 return False, f"upstream '{dep}' status={status} on {run_date}"
+            # Row-count check: success record is not enough if the table has 0 rows
+            row_sql = UPSTREAM_ROW_CHECK.get(dep)
+            if row_sql:
+                try:
+                    count = ch.query(row_sql).result_rows[0][0]
+                    if count == 0:
+                        return False, (
+                            f"upstream '{dep}' recorded success but produced 0 rows "
+                            f"(table empty for today)"
+                        )
+                except Exception as e:
+                    log.warning("Row-count check failed for upstream '%s': %s", dep, e)
+                    # fail-open: don't block downstream if count query errors
     except Exception as e:
         log.warning("Dependency gate check failed: %s", e)
         return True, ""   # fail-open: don't block if we can't query
