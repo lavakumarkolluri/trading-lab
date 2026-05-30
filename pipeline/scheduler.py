@@ -209,12 +209,13 @@ def job_auto_deploy():
                  len(changed), ", ".join(changed[:15]))
 
         _save_deployed_sha(new_sha)
+        build_sha = new_sha[:8] if new_sha else "unknown"
 
         # ── Rebuild dashboard if its infra files changed ──────────────────────
         dashboard_infra = {"dashboard/Dockerfile", "dashboard/requirements.txt"}
         if any(f in dashboard_infra for f in changed):
-            log.info("AUTO-DEPLOY: rebuilding dashboard image...")
-            _compose(["build", "dashboard"])
+            log.info("AUTO-DEPLOY: rebuilding dashboard image (GIT_SHA=%s)...", build_sha)
+            _compose(["build", "--build-arg", f"GIT_SHA={build_sha}", "dashboard"])
             _compose(["up", "-d", "dashboard"])
             log.info("AUTO-DEPLOY: dashboard rebuilt and restarted")
 
@@ -243,8 +244,9 @@ def job_auto_deploy():
                     "— market hours active (03:30-10:00 UTC). Will restart after 10:00 UTC."
                 )
                 return
-            log.info("AUTO-DEPLOY: pipeline code changed — rebuilding image...")
-            _compose(["build", "scheduler"])   # scheduler = pipeline image
+            log.info("AUTO-DEPLOY: pipeline code changed — rebuilding image (GIT_SHA=%s)...",
+                     build_sha)
+            _compose(["build", "--build-arg", f"GIT_SHA={build_sha}", "scheduler"])
             log.info("AUTO-DEPLOY: rebuild done — exiting for self-restart "
                      "(restart: unless-stopped will bring up new image)")
             time.sleep(5)  # flush any in-flight I/O before process exits
@@ -1199,6 +1201,20 @@ def main():
         log.error("FATAL: COMPOSE_FILE not found: %s — set COMPOSE_FILE env var correctly",
                   _COMPOSE_FILE)
         sys.exit(1)
+
+    # ── Startup env-var audit (C1 / H1 / H2) ─────────────────────────────────
+    _WEAK = {"changeme", "password123", "password", "secret", "admin", "minioadmin"}
+    for var in ("CH_PASSWORD", "MINIO_PASSWORD", "VSCODE_PASSWORD", "JUPYTER_TOKEN"):
+        val = os.environ.get(var, "")
+        if not val or val.lower() in _WEAK:
+            log.warning("SECURITY: %s is weak or unset — rotate before exposing to network", var)
+    if not os.environ.get("TELEGRAM_BOT_TOKEN") or not os.environ.get("TELEGRAM_CHAT_ID"):
+        log.warning("CONFIG: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set — alerts disabled (H2)")
+    for var in ("KITE_API_KEY", "KITE_ACCESS_TOKEN"):
+        if not os.environ.get(var):
+            log.warning("CONFIG: %s not set — live order execution unavailable (H1)", var)
+    if not os.environ.get("GITHUB_TOKEN"):
+        log.warning("CONFIG: GITHUB_TOKEN not set — auto-deploy will use unauthenticated fetch (H1)")
 
     log.info("Scheduler started — all times UTC (git_sha=%s)", GIT_SHA)
     _startup_recovery()
