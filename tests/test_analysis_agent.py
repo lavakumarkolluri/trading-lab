@@ -253,5 +253,5 @@ def test_analysis_agent_daily_in_scheduler():
         content = f.read()
     assert "job_analysis_agent_daily" in content
     assert "job_analysis_agent_weekly" in content
-    assert "13:15" in content   # daily trigger time
+    assert "17:15" in content   # daily trigger time (moved from 13:15 with C4 fix)
     assert "analysis_agent" in content

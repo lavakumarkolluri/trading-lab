@@ -99,6 +99,27 @@ def test_warn_missing_features_silent_when_data_present(caplog):
     assert "UNRELIABLE SCORE" not in caplog.text
 
 
+def test_warn_missing_features_sends_telegram_alert():
+    """L03: _warn_missing_features must fire a Telegram alert on UNRELIABLE SCORE."""
+    from unittest.mock import patch
+    with patch.object(cs, "_send_telegram") as mock_tg:
+        cs._warn_missing_features("NIFTY", {"vix": 0.0, "atm_ce_iv": 0.0,
+                                             "atm_pe_iv": 0.0, "iv_rank": 0.0,
+                                             "iv_percentile": 0.0})
+    mock_tg.assert_called_once()
+    assert "UNRELIABLE" in mock_tg.call_args[0][0]
+
+
+def test_warn_missing_features_no_telegram_when_data_ok():
+    """No Telegram alert when all critical features are present."""
+    from unittest.mock import patch
+    with patch.object(cs, "_send_telegram") as mock_tg:
+        cs._warn_missing_features("NIFTY", {"vix": 18.5, "atm_ce_iv": 17.2,
+                                             "atm_pe_iv": 15.8, "iv_rank": 24.7,
+                                             "iv_percentile": 71.4})
+    mock_tg.assert_not_called()
+
+
 def test_critical_features_list_includes_vix_and_iv():
     """_CRITICAL_FEATURES must include vix and IV columns — these drive model quality."""
     for col in ("vix", "atm_ce_iv", "atm_pe_iv", "iv_rank"):
