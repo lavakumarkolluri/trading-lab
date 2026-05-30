@@ -94,6 +94,9 @@ INDEX_MAP = {
     "MIDCPNIFTY": "^NSMIDCP",   # CRIT-004: was ^NSEI (wrong — NIFTY 50 signals for a midcap index)
 }
 
+# Daily vol scaling factor used in SPAN estimate (HIGH-005).
+_SPAN_DAILY_FACTOR = float(np.sqrt(1 / 252))
+
 # Per-symbol breakeven in points: approximate iron fly wing cost + transaction costs.
 # A WIN requires straddle P&L > this threshold, not just > 0 (CRIT-001).
 # Wing cost ≈ OTM option premium at WING_PTS distance, both sides.
@@ -102,6 +105,13 @@ _BREAKEVEN = {
     "BANKNIFTY":  50,   # ±500 pt wings ≈ 45 pts + 5 pts txn
     "FINNIFTY":   35,   # ±200 pt wings ≈ 30 pts + 5 pts txn
     "MIDCPNIFTY": 30,   # smaller premium range, tighter cost
+}
+
+LOT_SIZES = {
+    "NIFTY":      65,
+    "BANKNIFTY":  30,
+    "FINNIFTY":   60,
+    "MIDCPNIFTY": 120,
 }
 
 XGB_PARAMS = dict(
@@ -741,6 +751,7 @@ def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFr
         row.update(chain_feats)
         if snap_date in eod_records:
             row.update(extract_eod_features_from_dict(eod_records[snap_date]))
+            row["nifty_spot"] = float(eod_records[snap_date].get("nifty_spot", 0.0))
         if snap_date in poi_records:
             row.update({k: float(v) for k, v in poi_records[snap_date].items() if pd.notna(v)})
         row.update(temporal_features(expiry))
@@ -768,9 +779,25 @@ def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFr
     if df.empty:
         return df
 
-    # pnl_pts from spread_backtest already accounts for wing costs and structure costs.
-    # Target: was the trade profitable after all costs?
-    df["target"] = (df["pnl_pts"] > 0).astype(int)
+    # WIN = net P&L (INR) ≥ 1% of SPAN margin (D005, HIGH-005).
+    # SPAN ≈ atm_iv × spot × sqrt(1/252) × lot_size × 3.0  (IV-based, replaces premium×0.30)
+    # Falls back to pnl_pts > 0 for rows where IV or spot data is absent.
+    _lot = LOT_SIZES.get(symbol, 65)
+
+    def _span_inr(r: dict) -> float:
+        ce_iv  = float(r.get("atm_ce_iv") or 0)
+        pe_iv  = float(r.get("atm_pe_iv") or 0)
+        atm_iv = (ce_iv + pe_iv) / 2
+        spot   = float(r.get("nifty_spot") or 0)
+        if atm_iv > 0 and spot > 0:
+            return atm_iv * spot * _SPAN_DAILY_FACTOR * _lot * 3.0
+        return 0.0
+
+    df["_span_inr"] = df.apply(_span_inr, axis=1)
+    df["target"] = (df["pnl_pts"] * _lot >= 0.01 * df["_span_inr"]).astype(int)
+    no_span = df["_span_inr"] == 0
+    df.loc[no_span, "target"] = (df.loc[no_span, "pnl_pts"] > 0).astype(int)
+    df.drop(columns=["_span_inr", "nifty_spot"], errors="ignore", inplace=True)
     df.sort_values("expiry", inplace=True)
     df.reset_index(drop=True, inplace=True)
     log.info(f"[{symbol}][{strategy_type}] dataset: {len(df)} rows, win_rate={df.target.mean():.1%}")

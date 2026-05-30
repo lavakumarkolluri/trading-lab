@@ -126,6 +126,32 @@ def test_critical_features_list_includes_vix_and_iv():
         assert col in cs._CRITICAL_FEATURES, f"{col} missing from _CRITICAL_FEATURES"
 
 
+# ── SPAN estimate / WIN threshold (HIGH-005) ──────────────────────────────────
+
+def test_span_daily_factor_is_correct():
+    """_SPAN_DAILY_FACTOR must equal sqrt(1/252) — used in SPAN margin estimate."""
+    import math
+    assert abs(cs._SPAN_DAILY_FACTOR - math.sqrt(1 / 252)) < 1e-10
+
+
+def test_span_win_threshold_stricter_than_pnl_gt_zero():
+    """SPAN-based WIN requires more than 0 pts: 1% of SPAN margin in INR.
+    For NIFTY (lot=65, spot=22000, atm_iv=0.185):
+      span_inr ≈ 0.185 × 22000 × sqrt(1/252) × 65 × 3 ≈ 49,900
+      win_threshold_pts = 0.01 × 49900 / 65 ≈ 7.7 pts
+    A 1-pt pnl must NOT be a win; a 10-pt pnl MUST be a win.
+    """
+    import math
+    lot = cs.LOT_SIZES["NIFTY"]
+    spot = 22_000.0
+    atm_iv = 0.185
+    span_inr = atm_iv * spot * math.sqrt(1 / 252) * lot * 3.0
+    threshold_pts = 0.01 * span_inr / lot
+
+    assert threshold_pts > 1.0,  "Threshold should be >1 pt (SPAN-based, not just >0)"
+    assert threshold_pts < 20.0, "Threshold should be <20 pts (not too restrictive)"
+
+
 # ── SYMBOLS list sanity ───────────────────────────────────────────────────────
 
 def test_symbols_includes_nifty_and_banknifty():

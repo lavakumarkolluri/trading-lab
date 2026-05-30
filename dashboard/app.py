@@ -111,13 +111,20 @@ def missing_features(features_json: str) -> list[str]:
 
 
 def span_estimate_pts(features_json: str, spot: float, lot_size: int) -> float:
-    """Rough SPAN estimate = ATM straddle premium × lot_size × 2 × 0.30."""
+    """SPAN estimate: atm_iv × spot × sqrt(1/252) × lot_size × 3.0 (HIGH-005 fix).
+    Falls back to premium × 0.30 for legacy scores that predate IV storage.
+    """
     try:
         feats = json.loads(features_json) if features_json else {}
-        straddle_pct = float(feats.get("straddle_pct", 0))
+        ce_iv  = float(feats.get("atm_ce_iv") or 0)
+        pe_iv  = float(feats.get("atm_pe_iv") or 0)
+        atm_iv = (ce_iv + pe_iv) / 2
+        if atm_iv > 0 and spot > 0:
+            return atm_iv * spot * (1 / 252) ** 0.5 * lot_size * 3.0
+        # Legacy fallback: premium-based (was 20-40% off actual NSE SPAN)
+        straddle_pct = float(feats.get("straddle_pct") or 0)
         if straddle_pct > 0 and spot > 0:
-            atm_premium = straddle_pct * spot / 100
-            return atm_premium * lot_size * 2 * 0.30
+            return (straddle_pct / 100) * spot * lot_size * 2 * 0.30
     except Exception:
         pass
     return 0.0

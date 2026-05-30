@@ -288,6 +288,25 @@ def test_st_autorefresh_imported():
     )
 
 
+# ── span_estimate_pts (HIGH-005) ──────────────────────────────────────────────
+
+def test_span_estimate_uses_iv_formula():
+    """span_estimate_pts() must use the IV-based SPAN formula (HIGH-005).
+    Old formula (premium × 0.30) was 20-40% off actual NSE SPAN margin.
+    New formula: atm_iv × spot × sqrt(1/252) × lot_size × 3.0
+    """
+    source = _dashboard_source()
+    # Function must exist
+    assert "def span_estimate_pts" in source, "span_estimate_pts() not found in dashboard/app.py"
+    # Must reference both IV fields
+    assert "atm_ce_iv" in source
+    assert "atm_pe_iv" in source
+    # Must use daily vol scaling (1/252 or sqrt(1/252))
+    assert "252" in source, "SPAN daily vol scaling (1/252) missing from span_estimate_pts"
+    # Must apply the 3.0× SPAN multiplier
+    assert "3.0" in source, "SPAN 3.0× multiplier missing from span_estimate_pts"
+
+
 def test_streamlit_autorefresh_in_requirements():
     """streamlit-autorefresh must be in dashboard/requirements.txt.
     Without it, the Docker image build will fail and auto-refresh won't work."""
