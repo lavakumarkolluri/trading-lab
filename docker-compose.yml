@@ -5,6 +5,13 @@ x-pipeline-build: &pipeline-build
   args:
     GIT_SHA: ${GIT_SHA:-unknown}
 
+# Docker log limits applied to every service — prevents unbounded log growth (H7).
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   vscode:
     image: codercom/code-server:latest
@@ -17,27 +24,35 @@ services:
       - .:/home/coder/trading-lab
     environment:
       - PASSWORD=${VSCODE_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
     restart: unless-stopped
 
   minio:
     image: minio/minio:latest
     container_name: minio
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
     environment:
       MINIO_ROOT_USER: ${MINIO_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
-      TZ: Asia/Kolkata
+      TZ: ${TZ:-Asia/Kolkata}
     command: server /data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
       retries: 5
+    logging: *default-logging
     restart: unless-stopped
 
   clickhouse:
@@ -55,7 +70,7 @@ services:
       # Required: v26 entrypoint disables network access for default user if
       # CLICKHOUSE_PASSWORD is absent — from_env XML alone is not sufficient.
       CLICKHOUSE_PASSWORD: ${CH_PASSWORD}
-      TZ: Asia/Kolkata
+      TZ: ${TZ:-Asia/Kolkata}
     ulimits:
       nofile:
         soft: 262144
@@ -67,6 +82,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    logging: *default-logging
     restart: unless-stopped
 
   jupyter:
@@ -78,7 +94,14 @@ services:
       - ./workspace:/home/jovyan/work
     environment:
       - JUPYTER_TOKEN=${JUPYTER_TOKEN}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8888/api"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
     restart: unless-stopped
 
   portainer:
@@ -90,6 +113,13 @@ services:
       # rw required — Portainer needs full daemon access to manage containers/images
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fks", "https://localhost:9443/api/system/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
     restart: unless-stopped
 
   pipeline:
@@ -106,12 +136,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
 
   migrate:
@@ -124,10 +155,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "/clickhouse/migrate.py"]
     command: ["--run"]
@@ -143,12 +175,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "mf_pipeline.py"]
 
@@ -160,10 +193,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "mf_aggregation.py"]
     command: []
@@ -176,10 +210,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "cleanup_schemes.py"]
     command: []
@@ -192,13 +227,15 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "event_detector.py"]
     command: []
+
   pattern_feature_extractor:
     build: *pipeline-build
     container_name: pattern_feature_extractor
@@ -207,10 +244,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "pattern_feature_extractor.py"]
     command: []
@@ -223,10 +261,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "pattern_builder.py"]
     command: []
@@ -239,10 +278,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "backtest_engine.py"]
     command: []
@@ -255,10 +295,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "star_rater.py"]
     command: []
@@ -271,10 +312,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "prediction_engine.py"]
     command: []
@@ -287,10 +329,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "validation_engine.py"]
     command: []
@@ -308,10 +351,11 @@ services:
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "meta_pipeline.py"]
     command: []
@@ -327,12 +371,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "events_pipeline.py"]
     command: []
@@ -345,10 +390,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "holidays_pipeline.py"]
     command: []
@@ -364,12 +410,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "fii_dii_pipeline.py"]
 
@@ -384,12 +431,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "participant_oi_pipeline.py"]
     command: []
@@ -405,12 +453,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "vix_pipeline.py"]
     command: []
@@ -426,12 +475,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "option_chain_pipeline.py"]
     command: []
@@ -447,12 +497,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "option_backtest.py"]
     command: []
@@ -465,10 +516,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "nifty_straddle_backtest.py"]
     command: []
@@ -484,14 +536,17 @@ services:
       - GAP_LLM_ENABLED=${GAP_LLM_ENABLED:-false}
       - GAP_LLM_MODEL=${GAP_LLM_MODEL:-claude-sonnet-4-6}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "gap_analyzer.py"]
     command: []
 
+  # Long-running intraday services: restart on-failure so they recover from crashes
+  # mid-session without human intervention (H5).
   option_chain_intraday:
     build: *pipeline-build
     container_name: option_chain_intraday
@@ -503,19 +558,20 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
-    restart: "no"
+    restart: on-failure
     healthcheck:
       test: ["CMD", "sh", "-c", "test -f /tmp/intraday_heartbeat && [ $(( $(date +%s) - $(cat /tmp/intraday_heartbeat) )) -lt 1200 ]"]
       interval: 5m
       timeout: 10s
       retries: 2
       start_period: 10m
+    logging: *default-logging
     entrypoint: ["python", "option_chain_intraday.py"]
     command: []
 
@@ -527,22 +583,25 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
       - KITE_API_KEY=${KITE_API_KEY:-}
       - KITE_ACCESS_TOKEN=${KITE_ACCESS_TOKEN:-}
     depends_on:
       clickhouse:
         condition: service_healthy
-    restart: "no"
+    restart: on-failure
     healthcheck:
       test: ["CMD", "sh", "-c", "test -f /tmp/intraday_heartbeat && [ $(( $(date +%s) - $(cat /tmp/intraday_heartbeat) )) -lt 1200 ]"]
       interval: 5m
       timeout: 10s
       retries: 2
       start_period: 10m
+    logging: *default-logging
     entrypoint: ["python", "intraday_monitor.py"]
     command: []
 
+  # EOD pipeline: scheduled at 16:10 UTC (21:40 IST) — after option_chain_intraday
+  # exits at 15:35 UTC, eliminating the race condition on market.options_chain (C4).
   option_chain_historical:
     build: *pipeline-build
     container_name: option_chain_historical
@@ -554,12 +613,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "option_chain_historical.py"]
     command: []
@@ -572,10 +632,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "options_eod_summary_pipeline.py"]
     command: []
@@ -588,10 +649,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "compute_historical_iv.py"]
     command: []
@@ -604,10 +666,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "compute_oi_features.py"]
     command: []
@@ -628,11 +691,18 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
     restart: unless-stopped
 
   lot_size_pipeline:
@@ -646,12 +716,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "lot_size_pipeline.py"]
     command: []
@@ -664,10 +735,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "strategy_backtester.py"]
     command: []
@@ -683,12 +755,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "confidence_scorer.py"]
     command: []
@@ -701,10 +774,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "graduation_gate.py"]
     command: []
@@ -717,10 +791,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "strategy_selector.py"]
     command: []
@@ -735,12 +810,13 @@ services:
       - CH_PASSWORD=${CH_PASSWORD}
       # In-container path: project is bind-mounted at /trading-lab:ro
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock  # rw: recompute calls docker compose run
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "recompute.py"]
     command: []
@@ -756,12 +832,13 @@ services:
       - MINIO_HOST=minio:9000
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASSWORD=${MINIO_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "fundamental_pipeline.py"]
     command: []
@@ -774,10 +851,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "monthly_breakout_backtest.py"]
     command: []
@@ -790,10 +868,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "edge_analysis.py"]
     command: []
@@ -806,10 +885,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "weekend_theta_backtest.py"]
     command: []
@@ -822,10 +902,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "compute_vol_surface.py"]
     command: []
@@ -838,10 +919,11 @@ services:
       - CH_PORT=8123
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "compute_greeks.py"]
     command: []
@@ -856,10 +938,11 @@ services:
       - CH_PASSWORD=${CH_PASSWORD}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "data_freshness_check.py"]
     command: []
@@ -877,10 +960,11 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - REPORT_DIR=/trading-lab/agents/analysis
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "analysis_agent.py"]
     command: []
@@ -895,10 +979,11 @@ services:
       - CH_PASSWORD=${CH_PASSWORD}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "signal_agent.py"]
     command: []
@@ -913,10 +998,17 @@ services:
       - CH_PASSWORD=${CH_PASSWORD}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "pgrep -f monitor_agent.py > /dev/null"]
+      interval: 5m
+      timeout: 10s
+      retries: 2
+      start_period: 2m
+    logging: *default-logging
     restart: unless-stopped
     entrypoint: ["python", "monitor_agent.py"]
     command: []
@@ -935,10 +1027,11 @@ services:
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: unless-stopped
     entrypoint: ["python", "pipeline_watchdog.py"]
     command: []
@@ -955,10 +1048,11 @@ services:
       - CH_PASSWORD=${CH_PASSWORD}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
     entrypoint: ["python", "pre_market_check.py"]
     command: []
@@ -972,13 +1066,57 @@ services:
       - .:/trading-lab
     environment:
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
-      - TZ=Asia/Kolkata
+      - TZ=${TZ:-Asia/Kolkata}
       - CH_PASSWORD=${CH_PASSWORD}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    # Heartbeat: scheduler writes .scheduler_state/heartbeat every loop iteration.
+    # Healthcheck alerts if the file is not updated within 5 minutes (H4).
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /trading-lab/.scheduler_state/heartbeat && [ $(( $(date +%s) - $(cat /trading-lab/.scheduler_state/heartbeat) )) -lt 300 ]"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 1m
+    logging: *default-logging
     restart: unless-stopped
     entrypoint: ["python", "scheduler.py"]
+
+  # ClickHouse backup: weekly export of key market tables to local volume (M7).
+  # Runs every Sunday at 10:00 UTC (15:30 IST) after cleanup job.
+  clickhouse-backup:
+    image: clickhouse/clickhouse-server:26.2
+    container_name: clickhouse-backup
+    entrypoint:
+      - sh
+      - -c
+      - |
+        while true; do
+          NOW=$$(date +%Y-%m-%d)
+          BACKUP_DIR=/backups/$$NOW
+          mkdir -p $$BACKUP_DIR
+          echo "[backup] Starting ClickHouse export for $$NOW"
+          for TABLE in market.options_eod_summary market.fo_lot_sizes analysis.scorecard market.trading_holidays; do
+            FILE=$$BACKUP_DIR/$$(echo $$TABLE | tr '.' '_').native
+            clickhouse-client --host clickhouse --password "$$CH_PASSWORD" \
+              --query "SELECT * FROM $$TABLE" --format Native > $$FILE 2>/dev/null \
+              && echo "[backup] Exported $$TABLE ($$( wc -c < $$FILE ) bytes)" \
+              || echo "[backup] WARN: failed to export $$TABLE"
+          done
+          find /backups -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + 2>/dev/null || true
+          echo "[backup] Done — sleeping 24h"
+          sleep 86400
+        done
+    environment:
+      - CH_PASSWORD=${CH_PASSWORD}
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    logging: *default-logging
+    restart: unless-stopped
 
 volumes:
   vscode-data:

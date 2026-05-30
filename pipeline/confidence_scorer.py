@@ -46,6 +46,25 @@ from logging_utils import get_logger
 from pipeline_utils import record_run as _record_run_helper
 log = get_logger(__name__, fmt="%(asctime)s %(levelname)s %(message)s")
 
+_TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+def _send_telegram(msg: str) -> None:
+    if not (_TG_TOKEN and _TG_CHAT_ID):
+        log.info("Telegram not configured — would alert: %s", msg[:120])
+        return
+    try:
+        import urllib.request as _req, json as _json
+        payload = _json.dumps({"chat_id": _TG_CHAT_ID, "text": msg}).encode()
+        r = _req.Request(
+            f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage",
+            data=payload, headers={"Content-Type": "application/json"},
+        )
+        _req.urlopen(r, timeout=10)
+    except Exception as e:
+        log.warning("Telegram send failed: %s", e)
+
 
 def _record_run(ch, status: str, started_at: datetime, error_msg: str = ""):
     _record_run_helper(ch, "confidence_scorer", status, started_at, error_msg)
@@ -1043,16 +1062,18 @@ def load_model(symbol: str, mc, strategy: str = "iron_fly") -> tuple:
 _CRITICAL_FEATURES = ["vix", "atm_ce_iv", "atm_pe_iv", "iv_rank", "iv_percentile"]
 
 def _warn_missing_features(symbol: str, row: dict) -> None:
-    """Log a warning for each critical feature that is zero or missing.
+    """Log a warning and fire a Telegram alert when critical features are missing.
     Zero VIX / zero IV means EOD data wasn't ready when scorer ran — scores
     will be unreliable. This doesn't block scoring but makes the gap visible.
     """
     missing = [f for f in _CRITICAL_FEATURES if not row.get(f)]
     if missing:
-        log.warning(
+        msg = (
             f"[{symbol}] UNRELIABLE SCORE — critical features are zero/missing: {missing}. "
             "Run compute_oi_features first, then re-score."
         )
+        log.warning(msg)
+        _send_telegram(f"⚠️ {msg}")
 
 
 def score_today(ch, mc, symbol: str, strategy: str = "iron_fly") -> None:

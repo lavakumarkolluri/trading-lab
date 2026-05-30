@@ -134,6 +134,49 @@ def test_upstream_ok_returns_true_when_tracking_disabled():
     assert ok is True
 
 
+def test_upstream_ok_false_when_row_count_is_zero():
+    """C3: upstream recorded success but produced 0 rows — downstream must be blocked."""
+    import scheduler as s
+
+    def side_effect(sql, parameters=None):
+        result = MagicMock()
+        svc = (parameters or {}).get("service", "")
+        if "pipeline_runs" in sql:
+            result.result_rows = [("success", "2026-05-13")]
+        else:
+            # row-count query returns 0 — table is empty
+            result.result_rows = [(0,)]
+        return result
+
+    ch = MagicMock()
+    ch.query.side_effect = side_effect
+    with patch.object(s, "_TRACKING_OK", True):
+        with patch.object(s, "_ch_client", return_value=ch):
+            ok, reason = s._upstream_ok("options_eod_summary_pipeline", "2026-05-13")
+    assert ok is False
+    assert "0 rows" in reason
+
+
+def test_upstream_ok_true_when_row_count_nonzero():
+    """C3: upstream recorded success AND has rows — downstream is cleared."""
+    import scheduler as s
+
+    def side_effect(sql, parameters=None):
+        result = MagicMock()
+        if "pipeline_runs" in sql:
+            result.result_rows = [("success", "2026-05-13")]
+        else:
+            result.result_rows = [(42,)]   # 42 rows written
+        return result
+
+    ch = MagicMock()
+    ch.query.side_effect = side_effect
+    with patch.object(s, "_TRACKING_OK", True):
+        with patch.object(s, "_ch_client", return_value=ch):
+            ok, reason = s._upstream_ok("options_eod_summary_pipeline", "2026-05-13")
+    assert ok is True
+
+
 # ── job_check_dashboard_health ────────────────────────────────────────────────
 
 def test_dashboard_health_sends_alert_when_down():
@@ -391,3 +434,111 @@ def test_post_check_no_alert_when_trades_recorded():
         s.job_intraday_post_check()
 
     mock_tg.assert_not_called()
+
+
+# ── _is_trading_holiday (C5) ──────────────────────────────────────────────────
+
+def test_is_trading_holiday_true_when_holiday():
+    """Returns True when trading_holidays table has a matching full_closure NSE row."""
+    import scheduler as s
+    ch = MagicMock()
+    ch.query.return_value.result_rows = [(1,)]
+    with patch.object(s, "_ch_client", return_value=ch):
+        s._HOLIDAY_CACHE.clear()
+        result = s._is_trading_holiday("2026-01-26")
+    assert result is True
+
+
+def test_is_trading_holiday_false_on_trading_day():
+    """Returns False when no holiday row exists for the date."""
+    import scheduler as s
+    ch = MagicMock()
+    ch.query.return_value.result_rows = [(0,)]
+    with patch.object(s, "_ch_client", return_value=ch):
+        s._HOLIDAY_CACHE.clear()
+        result = s._is_trading_holiday("2026-05-19")
+    assert result is False
+
+
+def test_is_trading_holiday_fail_open_on_ch_error():
+    """If CH is unreachable, assume trading day (fail-open) so jobs are not blocked."""
+    import scheduler as s
+    ch = MagicMock()
+    ch.query.side_effect = RuntimeError("CH down")
+    with patch.object(s, "_ch_client", return_value=ch):
+        s._HOLIDAY_CACHE.clear()
+        result = s._is_trading_holiday("2026-01-26")
+    assert result is False
+
+
+def test_intraday_jobs_skip_on_holiday():
+    """option_chain_intraday and intraday_monitor must not start on a market holiday."""
+    import scheduler as s
+    with patch.object(s, "_is_trading_holiday", return_value=True), \
+         patch.object(s, "_run_background") as mock_bg:
+        s.job_option_chain_intraday()
+        s.job_intraday_monitor()
+    mock_bg.assert_not_called()
+
+
+def test_eod_job_skips_on_holiday():
+    """job_option_chain_eod must not run on a market holiday (no bhavcopy published)."""
+    import scheduler as s
+    with patch.object(s, "_is_trading_holiday", return_value=True), \
+         patch.object(s, "_run") as mock_run:
+        s.job_option_chain_eod()
+    mock_run.assert_not_called()
+
+
+# ── _run() retry logic (H6) ───────────────────────────────────────────────────
+
+def test_run_retries_three_times_on_failure():
+    """_run retries up to 3 attempts when the service exits non-zero."""
+    import scheduler as s
+    fail = MagicMock()
+    fail.returncode = 1
+    call_count = {"n": 0}
+
+    def fake_subprocess_run(cmd, **kwargs):
+        call_count["n"] += 1
+        return fail
+
+    with patch.object(s, "_upstream_ok", return_value=(True, "")), \
+         patch.object(s, "_record_run"), \
+         patch("subprocess.run", side_effect=fake_subprocess_run), \
+         patch("time.sleep"):
+        s._run("some_service")
+
+    assert call_count["n"] == 3, f"Expected 3 attempts, got {call_count['n']}"
+
+
+def test_run_stops_retrying_on_success():
+    """_run records success and stops after the first successful attempt."""
+    import scheduler as s
+    fail = MagicMock(returncode=1)
+    ok = MagicMock(returncode=0)
+
+    with patch.object(s, "_upstream_ok", return_value=(True, "")), \
+         patch.object(s, "_record_run") as mock_record, \
+         patch("subprocess.run", side_effect=[fail, ok]), \
+         patch("time.sleep"):
+        s._run("some_service")
+
+    statuses = [call[0][2] for call in mock_record.call_args_list]
+    assert "success" in statuses
+    assert "failed" not in statuses
+
+
+def test_run_records_failed_after_all_retries_exhausted():
+    """After 3 failed attempts, _run records exactly one 'failed' entry."""
+    import scheduler as s
+    fail = MagicMock(returncode=2)
+
+    with patch.object(s, "_upstream_ok", return_value=(True, "")), \
+         patch.object(s, "_record_run") as mock_record, \
+         patch("subprocess.run", return_value=fail), \
+         patch("time.sleep"):
+        s._run("some_service")
+
+    statuses = [call[0][2] for call in mock_record.call_args_list]
+    assert statuses == ["failed"], f"Expected exactly one 'failed' record, got {statuses}"
