@@ -102,3 +102,13 @@ Entry window 09:30–14:00 IST. EOD exit 15:20 IST. MIN_CONFIDENCE=60 gate befor
 **compute_historical_iv requires options_eod_summary rows first**: `run_symbol(ch, symbol, from_date)` reads dates from `options_eod_summary` then updates that table with IV. Run `options_eod_summary_pipeline` for all 4 symbols before running `compute_historical_iv`.
 
 **ReplacingMergeTree re-insert**: Never use `ALTER TABLE UPDATE` on the `version` column — ClickHouse raises CANNOT_UPDATE_COLUMN. To refresh a row: re-insert with `version = int(datetime.now().timestamp())`.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

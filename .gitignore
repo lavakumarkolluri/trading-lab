@@ -11,3 +11,4 @@ FUNDAMENTAL_DATA_SOURCES.md
 .claude/
 .venv/
 .scheduler_state/
+graphify-out/
