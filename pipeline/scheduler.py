@@ -39,7 +39,11 @@ import sys
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 _COMPOSE_FILE = os.getenv("COMPOSE_FILE", "docker-compose.yml")
-_PROJECT_DIR  = os.path.dirname(_COMPOSE_FILE) if "/" in _COMPOSE_FILE else "."
+# HOST_PROJECT_DIR is the HOST-side absolute path (set via ${PWD} in docker-compose.yml).
+# Needed for DooD: docker compose run inside the container must pass the HOST path as
+# --project-directory so bind-mount sources resolve correctly on the host daemon.
+_PROJECT_DIR  = os.getenv("HOST_PROJECT_DIR",
+                           os.path.dirname(_COMPOSE_FILE) if "/" in _COMPOSE_FILE else ".")
 _GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 _GIT_DIR      = _PROJECT_DIR  # /trading-lab inside container
 

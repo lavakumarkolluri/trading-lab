@@ -88,7 +88,11 @@ def _send_telegram(message: str):
 # COMPOSE_FILE env var is set in docker-compose.yml for the meta_pipeline
 # service, pointing to /trading-lab/docker-compose.yml.
 _COMPOSE_FILE = os.getenv("COMPOSE_FILE", "docker-compose.yml")
-_PROJECT_DIR  = os.path.dirname(_COMPOSE_FILE) if "/" in _COMPOSE_FILE else "."
+# HOST_PROJECT_DIR is the HOST-side absolute path (set via ${PWD} in docker-compose.yml).
+# Needed for DooD: docker compose run inside the container must pass the HOST path as
+# --project-directory so bind-mount sources resolve correctly on the host daemon.
+_PROJECT_DIR  = os.getenv("HOST_PROJECT_DIR",
+                           os.path.dirname(_COMPOSE_FILE) if "/" in _COMPOSE_FILE else ".")
 
 COMPOSE_CMD = [
     "docker", "compose",

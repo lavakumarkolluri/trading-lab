@@ -127,6 +127,22 @@ def test_long_running_services_have_healthcheck(compose):
         )
 
 
+def test_dood_services_have_host_project_dir(compose):
+    """scheduler and meta_pipeline use DooD (Docker-outside-of-Docker via socket).
+    Both must export HOST_PROJECT_DIR so their docker compose run sub-invocations
+    pass the correct HOST bind-mount path to the host Docker daemon.
+    Without this, sub-containers get an empty /trading-lab and fail to read the
+    compose file (root cause of meta_pipeline weekly 'exit 1' failures)."""
+    for svc_name in ("scheduler", "meta_pipeline"):
+        svc = compose["services"][svc_name]
+        env = svc.get("environment", [])
+        env_str = " ".join(str(e) for e in env)
+        assert "HOST_PROJECT_DIR" in env_str, (
+            f"Service '{svc_name}' must have HOST_PROJECT_DIR in environment "
+            f"(use ${{PWD}} so the HOST path is injected at docker compose up time)"
+        )
+
+
 def test_migration_055_ttl_file_exists():
     """OPS-010: migration 055 adding TTL to market.options_chain must exist."""
     import os, glob
