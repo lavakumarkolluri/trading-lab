@@ -727,7 +727,8 @@ def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFr
 
     rows = []
     for expiry, snap_date in all_keys:
-        pnl = float(bt_pnl.loc[(expiry, snap_date), "pnl_pts"])
+        pnl        = float(bt_pnl.loc[(expiry, snap_date), "pnl_pts"])
+        net_credit = float(bt_pnl.loc[(expiry, snap_date), "net_credit"])
 
         snap_df = chain_groups.get((snap_date, expiry))
         if snap_df is None:
@@ -742,11 +743,14 @@ def build_dataset(ch, symbol: str, strategy_type: str = "iron_fly") -> pd.DataFr
             pd.to_datetime(expiry).date() - snap_date).days
 
         row = {
-            "expiry":        expiry,
-            "entry_date":    snap_date,
-            "pnl_pts":       pnl,
-            "strategy_type": strategy_type,
-            "dte":           float(dte),
+            "expiry":          expiry,
+            "entry_date":      snap_date,
+            "pnl_pts":         pnl,
+            "entry_premium":   net_credit,
+            "exit_value":      net_credit - pnl,
+            "pnl_pct":         pnl / max(net_credit, 0.01) * 100,
+            "strategy_type":   strategy_type,
+            "dte":             float(dte),
         }
         row.update(chain_feats)
         if snap_date in eod_records:
