@@ -351,6 +351,10 @@ services:
       - CH_USER=default
       - CH_PASSWORD=${CH_PASSWORD}
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
+      # HOST_PROJECT_DIR: HOST-side absolute path so DooD docker compose run
+      # passes the correct bind-mount source to the host Docker daemon.
+      # ${PWD} is resolved by docker compose at up/run time on the HOST.
+      - HOST_PROJECT_DIR=${PWD}
       - TZ=${TZ:-Asia/Kolkata}
     depends_on:
       clickhouse:
@@ -1066,6 +1070,9 @@ services:
       - .:/trading-lab
     environment:
       - COMPOSE_FILE=/trading-lab/docker-compose.yml
+      # HOST_PROJECT_DIR: HOST-side absolute path so DooD docker compose run
+      # passes the correct bind-mount source to the host Docker daemon.
+      - HOST_PROJECT_DIR=${PWD}
       - TZ=${TZ:-Asia/Kolkata}
       - CH_PASSWORD=${CH_PASSWORD}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
