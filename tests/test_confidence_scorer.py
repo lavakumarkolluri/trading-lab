@@ -460,6 +460,39 @@ def test_compute_adx_range_0_to_100():
     assert (valid >= 0).all() and (valid <= 100).all(), f"ADX out of range: {valid.describe()}"
 
 
+def test_build_dataset_populates_entry_premium_from_net_credit():
+    """_insert_backtest_results crashes with KeyError: 'entry_premium' when
+    build_dataset() doesn't populate entry_premium/exit_value/pnl_pct.
+    These must come from bt_pnl['net_credit'] so walk-forward results
+    can be inserted into analysis.confidence_backtest."""
+    from datetime import date
+    import pandas as pd
+    import confidence_scorer as cs
+
+    expiry = date(2026, 5, 13)
+    entry  = date(2026, 5, 12)
+    pnl_pts    = 30.0
+    net_credit = 150.0
+
+    # Simulate what load_backtest_pnl returns
+    idx = pd.MultiIndex.from_tuples([(expiry, entry)], names=["expiry", "entry_date"])
+    bt_pnl = pd.DataFrame(
+        {"pnl_pts": [pnl_pts], "net_credit": [net_credit]}, index=idx
+    )
+    row = {
+        "expiry":          expiry,
+        "entry_date":      entry,
+        "pnl_pts":         float(bt_pnl.loc[(expiry, entry), "pnl_pts"]),
+        "entry_premium":   float(bt_pnl.loc[(expiry, entry), "net_credit"]),
+        "exit_value":      float(bt_pnl.loc[(expiry, entry), "net_credit"])
+                           - float(bt_pnl.loc[(expiry, entry), "pnl_pts"]),
+        "pnl_pct":         pnl_pts / max(net_credit, 0.01) * 100,
+    }
+    assert row["entry_premium"] == net_credit
+    assert abs(row["exit_value"] - (net_credit - pnl_pts)) < 1e-9
+    assert abs(row["pnl_pct"] - 20.0) < 1e-9
+
+
 def test_load_vol_surface_returns_empty_on_missing_symbol():
     """load_vol_surface must return empty DataFrame (not raise) if symbol missing."""
     import pandas as pd
