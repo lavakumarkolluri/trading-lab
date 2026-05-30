@@ -8,9 +8,9 @@ Runs inside a long-lived container — no host cron required.
 Schedule (all times UTC, IST = UTC+5:30):
   Daily    — Mon–Fri 03:40 UTC (09:10 IST)  → option_chain_intraday (self-exits 15:35 IST)
   Daily    — Mon–Fri 11:00 UTC (16:30 IST)  → meta_pipeline (steps 1-12)
-  Daily    — Mon–Fri 12:30 UTC (18:00 IST)  → option_chain_historical (bhavcopy pickup)
-  Daily    — Mon–Fri 13:00 UTC (18:30 IST)  → options_eod_summary_pipeline (PCR/max pain)
-  Daily    — Mon–Fri 13:30 UTC (19:00 IST)  → compute_historical_iv (ATM IV + rank)
+  Daily    — Mon–Fri 16:10 UTC (21:40 IST)  → option_chain_historical (after intraday exits)
+  Daily    — Mon–Fri 17:00 UTC (22:30 IST)  → options_eod_summary_pipeline (PCR/max pain)
+  Daily    — Mon–Fri 17:30 UTC (23:00 IST)  → compute_historical_iv (ATM IV + rank)
   Weekly   — Sun     00:30 UTC (06:00 IST)  → meta_pipeline --weekly (steps 13-16)
   Weekly   — Sun     01:00 UTC (06:30 IST)  → gap_analyzer
   Weekly   — Sun     02:00 UTC (07:30 IST)  → option_backtest (full 2yr refresh)
@@ -133,7 +133,8 @@ def _compose(args: list, timeout: int = 300):
     subprocess.run(_COMPOSE_BASE + args, check=False, timeout=timeout)
 
 
-_DEPLOY_SHA_FILE = os.path.join(_STATE_DIR, "auto_deploy_last_sha")
+_DEPLOY_SHA_FILE  = os.path.join(_STATE_DIR, "auto_deploy_last_sha")
+_HEARTBEAT_FILE   = os.path.join(_STATE_DIR, "heartbeat")
 
 
 def _get_last_deployed_sha() -> str:
@@ -246,6 +247,7 @@ def job_auto_deploy():
             _compose(["build", "scheduler"])   # scheduler = pipeline image
             log.info("AUTO-DEPLOY: rebuild done — exiting for self-restart "
                      "(restart: unless-stopped will bring up new image)")
+            time.sleep(5)  # flush any in-flight I/O before process exits
             sys.exit(0)
 
     except SystemExit:
@@ -310,18 +312,26 @@ def _run(service: str, *args: str):
 
     log.info("Running: %s", " ".join(cmd))
     started = datetime.now(timezone.utc)
-    try:
-        result = subprocess.run(cmd, capture_output=False, text=True, check=False)
-    except Exception as e:
-        _record_run(service, started, "failed", error_msg=str(e))
-        log.error("Command exception for %s: %s", service, e)
-        return
-    if result.returncode != 0:
-        log.error("Command failed (exit %d): %s", result.returncode, " ".join(cmd))
-        _record_run(service, started, "failed", error_msg=f"exit {result.returncode}")
-    else:
-        log.info("Done: %s", service)
-        _record_run(service, started, "success")
+    last_exit = 1
+    for attempt in range(1, 4):
+        try:
+            result = subprocess.run(cmd, capture_output=False, text=True, check=False)
+        except Exception as e:
+            _record_run(service, started, "failed", error_msg=str(e))
+            log.error("Command exception for %s: %s", service, e)
+            return
+        if result.returncode == 0:
+            log.info("Done: %s", service)
+            _record_run(service, started, "success")
+            return
+        last_exit = result.returncode
+        log.error("Command failed (exit %d): %s [attempt %d/3]",
+                  last_exit, " ".join(cmd), attempt)
+        if attempt < 3:
+            log.warning("Retrying %s in 30s...", service)
+            time.sleep(30)
+    _record_run(service, started, "failed",
+                error_msg=f"exit {last_exit} after 3 attempts")
 
 
 def job_daily():
@@ -402,6 +412,10 @@ def job_analysis_agent_weekly():
 
 
 def job_strategy_selector_recommend():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _is_trading_holiday(today):
+        log.info("=== Strategy selector recommendation skipped — market holiday %s ===", today)
+        return
     log.info("=== Strategy selector daily recommendation triggered ===")
     _run("strategy_selector", "--recommend")
 
@@ -719,11 +733,19 @@ def _run_background(service: str, *args: str):
 
 
 def job_option_chain_intraday():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _is_trading_holiday(today):
+        log.info("=== Option chain intraday skipped — market holiday %s ===", today)
+        return
     log.info("=== Option chain intraday scraper triggered ===")
     _run_background("option_chain_intraday")
 
 
 def job_intraday_monitor():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _is_trading_holiday(today):
+        log.info("=== Intraday monitor skipped — market holiday %s ===", today)
+        return
     log.info("=== Intraday straddle monitor triggered ===")
     _run_background("intraday_monitor")
 
@@ -731,9 +753,14 @@ def job_intraday_monitor():
 def job_option_chain_eod():
     """
     Daily bhavcopy chain: download → PCR/max pain → IV → OI walls/skew → VIX.
-    Runs sequentially after NSE publishes bhavcopy (~17:30-18:00 IST).
+    Runs at 16:10 UTC (after intraday exits at ~10:05 UTC) to avoid concurrent
+    writes to market.options_chain (C4 race condition fix).
     Each step is idempotent — safe to re-run if a step fails.
     """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _is_trading_holiday(today):
+        log.info("=== Option chain EOD skipped — market holiday %s ===", today)
+        return
     log.info("=== Option chain EOD pipeline triggered ===")
     _run("option_chain_historical")         # download new bhavcopy day
     _run("options_eod_summary_pipeline")    # compute PCR + max pain
@@ -920,12 +947,19 @@ def job_check_watchdog_health():
 
 def job_pre_market_check():
     """Mon–Fri 03:00 UTC (08:30 IST) — GO/NO-GO readiness gate before market open."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _is_trading_holiday(today):
+        log.info("=== Pre-market check skipped — market holiday %s ===", today)
+        return
     log.info("=== Pre-market system readiness check ===")
     _run("pre_market_check")
 
 
 def job_intraday_post_check():
     """Mon–Fri 10:00 UTC (15:30 IST) — alert if intraday_monitor produced no trades today."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _is_trading_holiday(today):
+        return
     if _container_is_running("intraday_monitor"):
         return  # still running — skip, it will finish on its own
     try:
@@ -966,6 +1000,38 @@ def _is_intraday_market_hours(now_utc: datetime) -> bool:
     """True if now_utc is within the intraday window Mon-Fri 03:30-10:00 UTC."""
     from datetime import time as _t
     return now_utc.weekday() < 5 and _t(3, 30) <= now_utc.time() <= _t(10, 0)
+
+
+_HOLIDAY_CACHE: dict[str, bool] = {}
+
+
+def _is_trading_holiday(date_str: str) -> bool:
+    """Return True if date_str (YYYY-MM-DD) is an NSE full-closure trading holiday.
+
+    Fails open: if CH is unreachable, returns False so jobs are not blocked.
+    Results are cached per date so the DB is queried at most once per date.
+    """
+    if date_str in _HOLIDAY_CACHE:
+        return _HOLIDAY_CACHE[date_str]
+    try:
+        ch = _ch_client()
+        rows = ch.query(
+            """
+            SELECT count() FROM market.trading_holidays
+            WHERE holiday_date = {d:Date}
+              AND holiday_type  = 'full_closure'
+              AND exchange      = 'NSE'
+            """,
+            parameters={"d": date_str},
+        ).result_rows
+        is_holiday = bool(rows[0][0]) if rows else False
+    except Exception as e:
+        log.warning("Holiday check failed for %s: %s — assuming trading day", date_str, e)
+        is_holiday = False
+    _HOLIDAY_CACHE[date_str] = is_holiday
+    if is_holiday:
+        log.info("Market holiday %s — trading-day jobs will be skipped", date_str)
+    return is_holiday
 
 
 def _container_is_running(name: str) -> bool:
@@ -1019,13 +1085,13 @@ def _startup_recovery():
             )
             job_intraday_monitor()
 
-    # ── EOD recovery: 12:30-16:30 UTC (18:00-22:00 IST) ─────────────────────
+    # ── EOD recovery: 16:10-20:10 UTC (21:40 IST next day) ──────────────────
     if not _TRACKING_OK:
         log.warning("EOD startup recovery skipped — tracking unavailable")
         return
 
     today_str = now_utc.strftime("%Y-%m-%d")
-    eod_window_start = now_utc.replace(hour=12, minute=30, second=0, microsecond=0)
+    eod_window_start = now_utc.replace(hour=16, minute=10, second=0, microsecond=0)
     eod_window_end   = eod_window_start + timedelta(hours=4)
 
     if not (eod_window_start <= now_utc <= eod_window_end):
@@ -1100,15 +1166,20 @@ def main():
         _recompute_check()
         return
 
+    if not os.path.isfile(_COMPOSE_FILE):
+        log.error("FATAL: COMPOSE_FILE not found: %s — set COMPOSE_FILE env var correctly",
+                  _COMPOSE_FILE)
+        sys.exit(1)
+
     log.info("Scheduler started — all times UTC (git_sha=%s)", GIT_SHA)
     _startup_recovery()
     log.info("  Events pipeline     : Sun     00:00 UTC (05:30 IST) --weekly")
     log.info("  Intraday OC scraper : Mon–Fri 03:40 UTC (09:10 IST)")
     log.info("  Intraday monitor    : Mon–Fri 03:50 UTC (09:20 IST) paper straddle")
     log.info("  Daily   pipeline    : Mon–Fri 11:00 UTC (16:30 IST)")
-    log.info("  Option chain EOD    : Mon–Fri 12:30 UTC (18:00 IST) → historical+PCR+IV+VIX")
-    log.info("  Confidence scorer   : Mon–Fri 13:00 UTC (18:30 IST) --score-only (daily refresh)")
-    log.info("  Graduation gate     : Mon–Fri 13:05 UTC (18:35 IST) strategy stage check")
+    log.info("  Option chain EOD    : Mon–Fri 16:10 UTC (21:40 IST) → historical+PCR+IV+VIX [C4 fix]")
+    log.info("  Confidence scorer   : Mon–Fri 17:00 UTC (22:30 IST) --score-only (daily refresh)")
+    log.info("  Graduation gate     : Mon–Fri 17:05 UTC (22:35 IST) strategy stage check")
     log.info("  Weekly  refresh     : Sun     00:30 UTC (06:00 IST)")
     log.info("  Gap     analyzer    : Sun     01:00 UTC (06:30 IST)")
     log.info("  Option  backtest    : Sun     02:00 UTC (07:30 IST)")
@@ -1117,8 +1188,8 @@ def main():
     log.info("  Lot sizes           : Sun     05:00 UTC (10:30 IST)")
     log.info("  Confidence scorer   : Sun     07:00 UTC (12:30 IST) --compare (90 min after backtester)")
     log.info("  Strategy selector   : Sun     08:00 UTC (13:30 IST) --backtest")
-    log.info("  Data freshness check: Mon-Fri 13:30 UTC (19:00 IST) auto-fix stale sources")
-    log.info("  Outcome fill-back   : Mon-Fri 14:00 UTC (19:30 IST) --fill-outcomes (marks yesterday's recommendations)")
+    log.info("  Data freshness check: Mon-Fri 17:30 UTC (23:00 IST) auto-fix stale sources")
+    log.info("  Outcome fill-back   : Mon-Fri 18:00 UTC (23:30 IST) --fill-outcomes (marks yesterday's recommendations)")
     log.info("  Strategy recommend  : Mon-Thu 10:30 UTC (16:00 IST) --recommend")
     log.info("  FII/DII + ParticOI  : Mon-Fri 10:45 UTC (16:15 IST) pre-feed for meta_pipeline")
     log.info("  Holidays pipeline   : 1st of month 04:00 UTC (09:30 IST)")
@@ -1146,28 +1217,29 @@ def main():
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("11:00").do(job_daily)
 
-    # Option chain EOD: bhavcopy + PCR/max pain + IV at 18:00 IST (12:30 UTC)
+    # Option chain EOD: 16:10 UTC (21:40 IST) — after intraday exits at ~10:05 UTC
+    # Delayed from 12:30 to 16:10 to eliminate C4 race on market.options_chain
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-        getattr(schedule.every(), day).at("12:30").do(job_option_chain_eod)
+        getattr(schedule.every(), day).at("16:10").do(job_option_chain_eod)
 
-    # Daily confidence scoring (score-only): after EOD pipeline at 13:00 UTC (18:30 IST)
+    # Daily confidence scoring (score-only): 17:00 UTC (22:30 IST) — after EOD pipeline
     # Uses existing model; ensures intraday_monitor has fresh scores each morning
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-        getattr(schedule.every(), day).at("13:00").do(job_confidence_scorer_daily)
+        getattr(schedule.every(), day).at("17:00").do(job_confidence_scorer_daily)
 
-    # Signal Agent: explain today's confidence scores at 13:10 UTC (18:40 IST)
+    # Signal Agent: explain today's confidence scores at 17:10 UTC (22:40 IST)
     # Runs 10 min after scorer so scores are written before report is generated
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-        getattr(schedule.every(), day).at("13:10").do(job_signal_agent)
+        getattr(schedule.every(), day).at("17:10").do(job_signal_agent)
 
-    # Analysis Agent daily: post-market trade summary at 13:15 UTC (18:45 IST)
+    # Analysis Agent daily: post-market trade summary at 17:15 UTC (22:45 IST)
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-        getattr(schedule.every(), day).at("13:15").do(job_analysis_agent_daily)
+        getattr(schedule.every(), day).at("17:15").do(job_analysis_agent_daily)
 
-    # Graduation gate: after daily scorer at 13:05 UTC (18:35 IST)
+    # Graduation gate: after daily scorer at 17:05 UTC (22:35 IST)
     # Updates analysis.strategy_graduation so dashboard shows current stage
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-        getattr(schedule.every(), day).at("13:05").do(job_graduation_gate)
+        getattr(schedule.every(), day).at("17:05").do(job_graduation_gate)
 
     schedule.every().sunday.at("00:00").do(job_events_pipeline)
     schedule.every().sunday.at("00:30").do(job_weekly)
@@ -1187,13 +1259,13 @@ def main():
     for day in ("monday", "tuesday", "wednesday", "thursday"):
         getattr(schedule.every(), day).at("10:30").do(job_strategy_selector_recommend)
 
-    # Data freshness watchdog: after all EOD pipelines (13:30 UTC = 19:00 IST)
+    # Data freshness watchdog: after all EOD pipelines (17:30 UTC = 23:00 IST)
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-        getattr(schedule.every(), day).at("13:30").do(job_data_freshness_check)
+        getattr(schedule.every(), day).at("17:30").do(job_data_freshness_check)
 
-    # Outcome fill-back: after EOD pipeline (14:00 UTC = 19:30 IST)
+    # Outcome fill-back: after EOD pipeline (18:00 UTC = 23:30 IST)
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-        getattr(schedule.every(), day).at("14:00").do(job_strategy_selector_fill_outcomes)
+        getattr(schedule.every(), day).at("18:00").do(job_strategy_selector_fill_outcomes)
 
     # Monthly: schedule runs daily at 04:00, guard inside job checks day==1
     schedule.every().day.at("04:00").do(job_holidays)
@@ -1227,6 +1299,11 @@ def main():
 
     while True:
         schedule.run_pending()
+        try:
+            with open(_HEARTBEAT_FILE, "w") as _hb:
+                _hb.write(str(int(time.time())))
+        except OSError:
+            pass
         time.sleep(30)
 
 
