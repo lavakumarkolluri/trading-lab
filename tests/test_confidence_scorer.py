@@ -367,6 +367,28 @@ def test_dte_value_correct_in_build_dataset():
     assert (expiry2 - snap2).days == 3
 
 
+def test_load_backtest_pnl_returns_all_dte_rows():
+    """DAILY-006: load_backtest_pnl must return all (expiry, entry_date) pairs.
+    N-DTE backtester writes up to 5 rows per expiry (DTE 1-5); all must be loaded
+    so confidence_scorer retrains on the full N-DTE dataset."""
+    from datetime import date
+    from unittest.mock import MagicMock
+    ch = MagicMock()
+    expiry = date(2026, 5, 13)
+    ch.query.return_value.result_rows = [
+        (expiry, date(2026, 5, 12), 50.0, 120.0),   # DTE=1
+        (expiry, date(2026, 5, 11), 45.0, 118.0),   # DTE=2
+        (expiry, date(2026, 5, 10), 40.0, 115.0),   # DTE=3
+    ]
+    df = cs.load_backtest_pnl(ch, "NIFTY", "iron_fly")
+    assert len(df) == 3, f"All 3 N-DTE rows must be loaded, got {len(df)}"
+    assert df.index.names == ["expiry", "entry_date"]
+    entry_dates = df.index.get_level_values("entry_date").tolist()
+    assert date(2026, 5, 12) in entry_dates   # DTE=1
+    assert date(2026, 5, 11) in entry_dates   # DTE=2
+    assert date(2026, 5, 10) in entry_dates   # DTE=3
+
+
 def test_load_eod_summary_deduplicates_by_date():
     """load_eod_summary must return exactly one row per date even if options_eod_summary
     has multiple expiry rows per date (post migration 081 schema)."""

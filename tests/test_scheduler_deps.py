@@ -50,6 +50,37 @@ def test_confidence_scorer_requires_strategy_backtester():
     assert "strategy_backtester" in deps
 
 
+def test_strategy_backtester_in_upstream_row_check():
+    """DAILY-006: confidence_scorer must not retrain when spread_backtest is empty.
+    strategy_backtester must be in UPSTREAM_ROW_CHECK so a 'success' record with
+    0 rows still blocks the downstream scorer."""
+    import scheduler as s
+    assert "strategy_backtester" in s.UPSTREAM_ROW_CHECK
+    assert "spread_backtest" in s.UPSTREAM_ROW_CHECK["strategy_backtester"]
+
+
+def test_confidence_scorer_blocked_when_spread_backtest_empty():
+    """DAILY-006: If spread_backtest has 0 rows, confidence_scorer is blocked
+    even if strategy_backtester recorded a success status."""
+    import scheduler as s
+
+    def side_effect(sql, parameters=None):
+        result = MagicMock()
+        if "pipeline_runs" in sql:
+            result.result_rows = [("success", "2026-05-13")]
+        else:
+            result.result_rows = [(0,)]  # spread_backtest is empty
+        return result
+
+    ch = MagicMock()
+    ch.query.side_effect = side_effect
+    with patch.object(s, "_TRACKING_OK", True):
+        with patch.object(s, "_ch_client", return_value=ch):
+            ok, reason = s._upstream_ok("confidence_scorer", "2026-05-13")
+    assert ok is False
+    assert "0 rows" in reason
+
+
 def test_strategy_selector_requires_confidence_scorer():
     """strategy_selector reads from analysis.scorecard — must run after scorer."""
     import scheduler as s

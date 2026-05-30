@@ -282,6 +282,11 @@ UPSTREAM_ROW_CHECK: dict[str, str] = {
     "compute_historical_iv": (
         "SELECT countIf(atm_iv > 0) FROM market.options_eod_summary WHERE date = today()"
     ),
+    # DAILY-006: confidence_scorer --compare must not retrain on an empty backtest table.
+    # The backtester writes historical rows — check total row count, not today's.
+    "strategy_backtester": (
+        "SELECT count() FROM analysis.spread_backtest"
+    ),
 }
 
 
