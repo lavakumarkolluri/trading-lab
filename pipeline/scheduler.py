@@ -1125,21 +1125,24 @@ def _startup_recovery():
             )
             job_intraday_monitor()
 
-    # ── EOD recovery: 16:10-20:10 UTC (21:40 IST next day) ──────────────────
+    # ── EOD recovery: any time after 16:10 UTC on a trading day ─────────────
+    # Root cause fixed 2026-05-31: the old 4-hour window (16:10–20:10 UTC)
+    # caused EOD to be missed whenever the scheduler auto-deployed outside that
+    # narrow window. Now we check on every startup: if option_chain_historical
+    # has no success record within the last 5 calendar days, trigger immediately.
+    # The idempotency guard (result_rows check below) prevents double-runs.
     if not _TRACKING_OK:
         log.warning("EOD startup recovery skipped — tracking unavailable")
         return
 
     today_str = now_utc.strftime("%Y-%m-%d")
     eod_window_start = now_utc.replace(hour=16, minute=10, second=0, microsecond=0)
-    eod_window_end   = eod_window_start + timedelta(hours=4)
-
-    if not (eod_window_start <= now_utc <= eod_window_end):
-        return
 
     try:
         ch = _ch_client()
-        result = ch.query(
+
+        # Check if EOD ran today already — skip if so
+        today_result = ch.query(
             """
             SELECT status FROM system_meta.pipeline_runs FINAL
             WHERE service  = {service:String}
@@ -1148,15 +1151,30 @@ def _startup_recovery():
             """,
             parameters={"service": "option_chain_historical", "run_date": today_str},
         )
-        if result.result_rows:
+        if today_result.result_rows and today_result.result_rows[0][0] == "success":
             return  # already ran today — no recovery needed
 
-        elapsed_min = (now_utc - eod_window_start).total_seconds() / 60
+        # Check last successful run across all days (catch multi-day gaps)
+        last_result = ch.query(
+            """
+            SELECT max(run_date) FROM system_meta.pipeline_runs FINAL
+            WHERE service = 'option_chain_historical' AND status = 'success'
+            """
+        )
+        last_date = last_result.result_rows[0][0] if last_result.result_rows else None
+        days_gap = (now_utc.date() - last_date).days if last_date else 999
+
+        # Trigger if: missed today (past 16:10) OR gap > 1 trading day
+        missed_today = now_utc >= eod_window_start and not today_result.result_rows
+        multi_day_gap = days_gap > 1
+
+        if not (missed_today or multi_day_gap):
+            return
+
         log.warning(
-            "STARTUP RECOVERY: option_chain_historical has no run record for %s "
-            "(scheduler was likely down; restarted %d min after window). "
-            "Re-triggering EOD chain now.",
-            today_str, int(elapsed_min),
+            "STARTUP RECOVERY: option_chain_historical last ran %s (%d days ago). "
+            "Re-triggering EOD chain now (missed_today=%s, multi_day_gap=%s).",
+            last_date, days_gap, missed_today, multi_day_gap,
         )
         job_option_chain_eod()
     except Exception as e:

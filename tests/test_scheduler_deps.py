@@ -573,3 +573,99 @@ def test_run_records_failed_after_all_retries_exhausted():
 
     statuses = [call[0][2] for call in mock_record.call_args_list]
     assert statuses == ["failed"], f"Expected exactly one 'failed' record, got {statuses}"
+
+
+# ── EOD startup recovery — multi-day gap fix (2026-05-31) ────────────────────
+
+def _eod_recovery_now(hour=22, minute=0, weekday=0):
+    """Return a weekday UTC datetime at the given hour (default Monday 22:00 UTC)."""
+    from datetime import datetime as real_dt
+    # Monday 2026-05-18 22:00 UTC (past the 16:10 window)
+    return real_dt(2026, 5, 18, hour, minute, 0)
+
+
+def test_eod_recovery_triggers_on_multi_day_gap():
+    """If option_chain_historical has not run in >1 day, recovery fires even outside
+    the old 16:10-20:10 window — preventing the 2-week data gap seen on 2026-05-31."""
+    import scheduler as s
+    from datetime import date as real_date
+
+    def side_effect(sql, parameters=None):
+        result = MagicMock()
+        if "run_date" in (parameters or {}):
+            result.result_rows = []          # no record for today
+        else:
+            # last success was 5 days ago
+            result.result_rows = [(real_date(2026, 5, 13),)]
+        return result
+
+    ch = MagicMock()
+    ch.query.side_effect = side_effect
+
+    with patch.object(s, "datetime") as mock_dt, \
+         patch.object(s, "_TRACKING_OK", True), \
+         patch.object(s, "_ch_client", return_value=ch), \
+         patch.object(s, "_container_is_running", return_value=True), \
+         patch.object(s, "job_option_chain_eod") as mock_eod, \
+         patch.dict("os.environ", {"CH_PASSWORD": "secret"}):
+        mock_dt.now.return_value = _eod_recovery_now(hour=22)
+        s._startup_recovery()
+
+    mock_eod.assert_called_once()
+
+
+def test_eod_recovery_skips_when_ran_today():
+    """No recovery when option_chain_historical already succeeded today."""
+    import scheduler as s
+    from datetime import date as real_date
+
+    def side_effect(sql, parameters=None):
+        result = MagicMock()
+        if "run_date" in (parameters or {}):
+            result.result_rows = [("success",)]   # ran today
+        else:
+            result.result_rows = [(real_date(2026, 5, 18),)]
+        return result
+
+    ch = MagicMock()
+    ch.query.side_effect = side_effect
+
+    with patch.object(s, "datetime") as mock_dt, \
+         patch.object(s, "_TRACKING_OK", True), \
+         patch.object(s, "_ch_client", return_value=ch), \
+         patch.object(s, "_container_is_running", return_value=True), \
+         patch.object(s, "job_option_chain_eod") as mock_eod, \
+         patch.dict("os.environ", {"CH_PASSWORD": "secret"}):
+        mock_dt.now.return_value = _eod_recovery_now(hour=22)
+        s._startup_recovery()
+
+    mock_eod.assert_not_called()
+
+
+def test_eod_recovery_skips_before_window_start():
+    """Recovery must not trigger before 16:10 UTC — let schedule handle it."""
+    import scheduler as s
+    from datetime import date as real_date
+
+    def side_effect(sql, parameters=None):
+        result = MagicMock()
+        if "run_date" in (parameters or {}):
+            result.result_rows = []           # no record for today
+        else:
+            result.result_rows = [(real_date(2026, 5, 17),)]  # yesterday
+        return result
+
+    ch = MagicMock()
+    ch.query.side_effect = side_effect
+
+    with patch.object(s, "datetime") as mock_dt, \
+         patch.object(s, "_TRACKING_OK", True), \
+         patch.object(s, "_ch_client", return_value=ch), \
+         patch.object(s, "_container_is_running", return_value=True), \
+         patch.object(s, "job_option_chain_eod") as mock_eod, \
+         patch.dict("os.environ", {"CH_PASSWORD": "secret"}):
+        # 08:00 UTC — before the 16:10 EOD window
+        mock_dt.now.return_value = _eod_recovery_now(hour=8, minute=0)
+        s._startup_recovery()
+
+    mock_eod.assert_not_called()
