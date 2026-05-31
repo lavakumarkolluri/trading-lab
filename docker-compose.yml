@@ -12,6 +12,16 @@ x-logging: &default-logging
     max-size: "50m"
     max-file: "3"
 
+# Minimal healthcheck for run-once pipeline services (P0-1).
+# Detects hung/zombie containers — process-alive check is the lowest bar
+# that makes container state visible in `docker ps --filter health=unhealthy`.
+x-pipeline-healthcheck: &pipeline-healthcheck
+  test: ["CMD", "sh", "-c", "test -f /proc/1/status"]
+  interval: 2m
+  timeout: 10s
+  retries: 3
+  start_period: 30s
+
 services:
   vscode:
     image: codercom/code-server:latest
@@ -142,6 +152,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
 
@@ -159,6 +170,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "/clickhouse/migrate.py"]
@@ -181,6 +193,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "mf_pipeline.py"]
@@ -197,6 +210,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "mf_aggregation.py"]
@@ -214,6 +228,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "cleanup_schemes.py"]
@@ -231,6 +246,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "event_detector.py"]
@@ -248,6 +264,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "pattern_feature_extractor.py"]
@@ -265,6 +282,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "pattern_builder.py"]
@@ -282,6 +300,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "backtest_engine.py"]
@@ -299,6 +318,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "star_rater.py"]
@@ -316,6 +336,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "prediction_engine.py"]
@@ -333,6 +354,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "validation_engine.py"]
@@ -359,6 +381,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "meta_pipeline.py"]
@@ -381,6 +404,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "events_pipeline.py"]
@@ -398,6 +422,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "holidays_pipeline.py"]
@@ -420,6 +445,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "fii_dii_pipeline.py"]
@@ -441,6 +467,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "participant_oi_pipeline.py"]
@@ -463,6 +490,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "vix_pipeline.py"]
@@ -485,6 +513,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "option_chain_pipeline.py"]
@@ -507,6 +536,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "option_backtest.py"]
@@ -524,6 +554,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "nifty_straddle_backtest.py"]
@@ -544,6 +575,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "gap_analyzer.py"]
@@ -623,6 +655,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "option_chain_historical.py"]
@@ -640,6 +673,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "options_eod_summary_pipeline.py"]
@@ -657,6 +691,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "compute_historical_iv.py"]
@@ -674,6 +709,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "compute_oi_features.py"]
@@ -726,6 +762,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "lot_size_pipeline.py"]
@@ -743,6 +780,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "strategy_backtester.py"]
@@ -765,6 +803,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "confidence_scorer.py"]
@@ -782,6 +821,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "graduation_gate.py"]
@@ -799,6 +839,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "strategy_selector.py"]
@@ -820,6 +861,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "recompute.py"]
@@ -842,6 +884,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "fundamental_pipeline.py"]
@@ -859,6 +902,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "monthly_breakout_backtest.py"]
@@ -876,6 +920,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "edge_analysis.py"]
@@ -893,6 +938,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "weekend_theta_backtest.py"]
@@ -910,6 +956,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "compute_vol_surface.py"]
@@ -927,6 +974,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "compute_greeks.py"]
@@ -946,6 +994,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "data_freshness_check.py"]
@@ -968,6 +1017,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "analysis_agent.py"]
@@ -987,6 +1037,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "signal_agent.py"]
@@ -1035,6 +1086,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: unless-stopped
     entrypoint: ["python", "pipeline_watchdog.py"]
@@ -1056,6 +1108,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: "no"
     entrypoint: ["python", "pre_market_check.py"]
@@ -1125,6 +1178,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck: *pipeline-healthcheck
     logging: *default-logging
     restart: unless-stopped
 

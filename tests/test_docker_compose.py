@@ -159,6 +159,17 @@ def test_dood_services_have_host_project_dir(compose):
         )
 
 
+def test_all_services_have_healthchecks(compose):
+    """P0-1: Every service must have a healthcheck so Docker can detect hung containers.
+    Pipeline run-once services use the *pipeline-healthcheck anchor (process-alive check).
+    Long-running services use service-appropriate checks (HTTP, heartbeat file, etc.)."""
+    missing = [n for n, s in compose["services"].items() if not s.get("healthcheck")]
+    assert not missing, (
+        f"Services missing healthcheck ({len(missing)}): {missing}\n"
+        "Add 'healthcheck: *pipeline-healthcheck' for pipeline services."
+    )
+
+
 def test_all_services_have_log_limits(compose):
     """P0-3: Every service must cap Docker log volume.
     Use the x-logging YAML anchor (max-size: 50m, max-file: 3) — without it,
