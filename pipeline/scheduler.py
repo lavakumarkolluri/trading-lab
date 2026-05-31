@@ -311,7 +311,7 @@ def _upstream_ok(service: str, today_date: str) -> tuple[bool, str]:
                 WHERE service  = {service:String}
                   AND run_date >= toDate({run_date:String}) - 3
                   AND run_date <= toDate({run_date:String})
-                ORDER BY run_date DESC, version DESC LIMIT 1
+                ORDER BY started_at DESC LIMIT 1
                 """,
                 parameters={"service": dep, "run_date": today_date},
             )

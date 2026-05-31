@@ -642,6 +642,40 @@ def test_eod_recovery_skips_when_ran_today():
     mock_eod.assert_not_called()
 
 
+# ── P0-4: upstream_ok ordering guarantee ─────────────────────────────────────
+
+def test_upstream_fails_if_most_recent_run_failed():
+    """Old success cannot override a more recent failure on the same date.
+    Regression guard: when scheduler AND service both write pipeline_runs records,
+    the query ordering must surface the MOST RECENTLY STARTED run, not an older insert."""
+    import scheduler as s
+    # Mock returns [("failed", today)] — the DB's LIMIT 1 result after correct ordering.
+    # Simulates: service wrote "success" at T1, scheduler wrote "failed" at T2 (T2>T1).
+    ch = _mock_ch({
+        "compute_oi_features": [("failed", "2026-05-31")],
+        "strategy_backtester":  [("success", "2026-05-31")],
+    })
+    with patch.object(s, "_TRACKING_OK", True):
+        with patch.object(s, "_ch_client", return_value=ch):
+            ok, reason = s._upstream_ok("confidence_scorer", "2026-05-31")
+    assert ok is False, "Recent failure must block downstream even if an older success exists"
+    assert "compute_oi_features" in reason
+    assert "failed" in reason
+
+
+def test_upstream_ok_query_orders_by_started_at():
+    """_upstream_ok must ORDER BY started_at DESC, not version DESC.
+    started_at is the actual run start time; version is the INSERT timestamp and can
+    diverge when scheduler and service both write records for the same run."""
+    import scheduler as s
+    import inspect
+    source = inspect.getsource(s._upstream_ok)
+    assert "started_at" in source, (
+        "_upstream_ok must use ORDER BY started_at DESC — "
+        "started_at captures when the run BEGAN; version captures when the INSERT happened"
+    )
+
+
 def test_eod_recovery_skips_before_window_start():
     """Recovery must not trigger before 16:10 UTC — let schedule handle it."""
     import scheduler as s
