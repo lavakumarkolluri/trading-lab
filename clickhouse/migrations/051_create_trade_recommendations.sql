@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS analysis.strategy_simulation
     short_n          UInt8,
     wing_m           UInt8,
     confidence       Float32,
-    lots             UInt32,
+    lots             UInt8,
     lot_size         UInt16,
     pnl_pts          Float32,
     pnl_amount       Float32,

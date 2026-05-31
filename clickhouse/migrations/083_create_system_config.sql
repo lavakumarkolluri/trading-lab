@@ -3,7 +3,7 @@ CREATE DATABASE IF NOT EXISTS system_meta;
 -- ── Mutable operational config ─────────────────────────────────────────────────
 -- Tunable at runtime via INSERT. Change min_confidence, risk limits, cleanup
 -- frequency — anything operational. Use:
---   INSERT INTO system_meta.config VALUES ('min_confidence', '65', now());
+--   INSERT INTO system_meta.config VALUES ('min_confidence', '65', now())
 CREATE TABLE IF NOT EXISTS system_meta.config
 (
     key        String,
@@ -49,8 +49,7 @@ INSERT INTO system_meta.stage_boundaries (key, value, note) VALUES
      'Stage 3: walk-forward CV uses data from this date up to stage4_holdout_start'),
     ('stage4_holdout_start',
      '2024-05-15',
-     'CRITICAL: Stage 3 training never uses data on or after this date. '
-     'Stage 4 Paper Trade Historical covers this date → stage4_holdout_end.'),
+     'CRITICAL: Stage 3 training never uses data on or after this date. Stage 4 Paper Trade Historical covers this date to stage4_holdout_end.'),
     ('stage4_holdout_end',
      '2026-05-15',
      'Stage 4 Paper Trade Historical ends here. Stage 4 Paper Trade Future begins here.');
