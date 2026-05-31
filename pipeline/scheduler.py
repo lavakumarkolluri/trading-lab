@@ -394,6 +394,16 @@ def job_fii_dii_pipeline():
     _run("fii_dii_pipeline")
 
 
+def job_loss_attributor():
+    log.info("=== Loss attributor triggered ===")
+    _run("loss_attributor")
+
+
+def job_drift_detector():
+    log.info("=== Drift detector triggered ===")
+    _run("drift_detector")
+
+
 def job_participant_oi_pipeline():
     log.info("=== Participant OI pipeline triggered ===")
     _run("participant_oi_pipeline")
@@ -1327,6 +1337,11 @@ def main():
     schedule.every().sunday.at("07:00").do(job_confidence_scorer)   # 90 min after backtester
     schedule.every().sunday.at("07:30").do(job_graduation_gate)     # after weekly retrain
     schedule.every().sunday.at("08:00").do(job_strategy_selector_backtest)
+    schedule.every().sunday.at("09:00").do(job_drift_detector)   # weekly drift scan
+
+    # Loss attributor: after trades settle Mon–Fri at 17:30 UTC (23:00 IST)
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("17:30").do(job_loss_attributor)
     schedule.every().sunday.at("08:30").do(job_analysis_agent_weekly)  # weekly full report
     schedule.every().sunday.at("09:00").do(job_cleanup)  # 09:00 UTC = 14:30 IST
 

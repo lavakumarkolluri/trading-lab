@@ -237,6 +237,7 @@ page = st.sidebar.radio("", [
     "Trade Log",
     "Market Data",
     "MF Advisor",
+    "Self-Improvement",
 ])
 
 
@@ -3792,3 +3793,221 @@ elif page == "MF Advisor":
                     _ftp = px.pie(alloc_df, names="Category", values="Amount (₹)",
                                   title="Target Allocation")
                     st.plotly_chart(_ftp, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 7 — SELF-IMPROVEMENT
+# Shows: feature drift, loss attribution, win rate trend, retrain events
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Self-Improvement":
+
+    st.title("Self-Improvement")
+    st.caption(
+        "The system learns from every loss. This page shows which features are "
+        "drifting, why recent trades lost, and when the model was retrained."
+    )
+
+    # ── Section 1: Feature Drift Monitor ─────────────────────────────────────
+    st.header("Feature Drift Monitor")
+    st.caption("Rolling Pearson correlation between each feature and win outcome. "
+               "Red = drifted (|corr − baseline| > 0.15).")
+
+    _drift_df = query("""
+        SELECT
+            feature_name,
+            symbol,
+            argMax(correlation,    (computed_at, window_days)) FILTER (WHERE window_days = 30)  AS corr_30d,
+            argMax(correlation,    (computed_at, window_days)) FILTER (WHERE window_days = 60)  AS corr_60d,
+            argMax(correlation,    (computed_at, window_days)) FILTER (WHERE window_days = 90)  AS corr_90d,
+            argMax(baseline_corr,  (computed_at, window_days)) FILTER (WHERE window_days = 90)  AS baseline,
+            max(drift_detected)                                                                  AS drifted
+        FROM analysis.feature_performance FINAL
+        WHERE computed_at >= today() - 30
+        GROUP BY feature_name, symbol
+        ORDER BY drifted DESC, abs(corr_30d - baseline) DESC
+    """)
+
+    if _drift_df.empty:
+        st.info(
+            "No feature drift data yet. drift_detector.py runs weekly (Sunday) "
+            "and needs at least 10 trades per symbol to compute correlations."
+        )
+    else:
+        _sym_opts = ["All"] + sorted(_drift_df["symbol"].unique().tolist())
+        _sym_sel = st.selectbox("Symbol", _sym_opts, key="drift_sym")
+        _dv = _drift_df if _sym_sel == "All" else _drift_df[_drift_df["symbol"] == _sym_sel]
+
+        def _drift_color(row):
+            color = "background-color: #ffcccc" if row["drifted"] else ""
+            return [color] * len(row)
+
+        _disp = _dv[["feature_name", "symbol", "corr_30d", "corr_60d", "corr_90d",
+                      "baseline", "drifted"]].copy()
+        for col in ("corr_30d", "corr_60d", "corr_90d", "baseline"):
+            _disp[col] = _disp[col].map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
+        _disp["drifted"] = _disp["drifted"].map(lambda x: "🔴 YES" if x else "🟢 ok")
+        st.dataframe(
+            _dv[["feature_name", "symbol", "corr_30d", "corr_60d", "corr_90d", "baseline"]]
+               .style.apply(_drift_color, axis=1),
+            use_container_width=True, hide_index=True,
+        )
+
+        _n_drifted = int(_drift_df["drifted"].sum())
+        if _n_drifted:
+            st.warning(f"{_n_drifted} feature(s) currently drifting — "
+                       f"retrain will be triggered automatically if 2+ drift for same symbol.")
+        else:
+            st.success("All features stable — no drift detected in the last 30 days.")
+
+    st.divider()
+
+    # ── Section 2: Loss Attribution ───────────────────────────────────────────
+    st.header("Loss Attribution")
+    st.caption(
+        "For each recent loss, which entry features deviated most from winning trades. "
+        "Positive attribution = feature was 'worse' than winners (in standard deviations)."
+    )
+
+    _attr_df = query("""
+        SELECT
+            trade_id, symbol, exit_date, exit_reason,
+            pnl_pts, feature_name, feature_value, win_mean, attribution
+        FROM analysis.trade_attributions FINAL
+        WHERE exit_date >= today() - 30
+        ORDER BY exit_date DESC, trade_id, abs(attribution) DESC
+    """)
+
+    if _attr_df.empty:
+        st.info(
+            "No attribution data yet. loss_attributor.py runs daily after trades settle "
+            "(17:30 UTC) and needs at least 5 historical wins to compute the win profile."
+        )
+    else:
+        _recent_losses = (
+            _attr_df[["trade_id", "symbol", "exit_date", "exit_reason", "pnl_pts"]]
+            .drop_duplicates("trade_id")
+            .sort_values("exit_date", ascending=False)
+            .head(10)
+        )
+        _trade_sel = st.selectbox(
+            "Select loss to inspect",
+            _recent_losses.apply(
+                lambda r: f"{r['exit_date']} · {r['symbol']} · {r['pnl_pts']:+.1f}pts "
+                          f"({r['exit_reason']})", axis=1
+            ).tolist(),
+            key="attr_trade",
+        )
+        _sel_trade_id = _recent_losses.iloc[
+            _recent_losses.apply(
+                lambda r: f"{r['exit_date']} · {r['symbol']} · {r['pnl_pts']:+.1f}pts "
+                          f"({r['exit_reason']})", axis=1
+            ).tolist().index(_trade_sel)
+        ]["trade_id"]
+
+        _trade_attr = _attr_df[_attr_df["trade_id"] == _sel_trade_id].sort_values(
+            "attribution", key=abs, ascending=False
+        ).head(10)
+
+        _fig_attr = px.bar(
+            _trade_attr,
+            x="attribution", y="feature_name", orientation="h",
+            color="attribution",
+            color_continuous_scale=["#2ecc71", "#f39c12", "#e74c3c"],
+            color_continuous_midpoint=0,
+            title=f"Feature attribution — {_trade_sel}",
+            labels={"attribution": "Deviation from winning profile (σ)",
+                    "feature_name": "Feature"},
+        )
+        _fig_attr.update_layout(height=400, showlegend=False)
+        st.plotly_chart(_fig_attr, use_container_width=True)
+
+        with st.expander("Raw attribution values"):
+            _attr_show = _trade_attr[["feature_name", "feature_value",
+                                       "win_mean", "attribution"]].copy()
+            _attr_show["attribution"] = _attr_show["attribution"].map(lambda x: f"{x:+.2f}σ")
+            _attr_show["win_mean"] = _attr_show["win_mean"].map(lambda x: f"{x:.2f}")
+            st.dataframe(_attr_show, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Section 3: Win Rate Trend ─────────────────────────────────────────────
+    st.header("Win Rate Trend")
+    st.caption("Rolling 10-trade win rate. Green line = 55% target.")
+
+    _wr_df = query("""
+        SELECT
+            toDate(exit_time)          AS exit_date,
+            symbol,
+            countIf(pnl_pts >= 0)      AS wins,
+            count()                    AS total,
+            countIf(pnl_pts >= 0) / count() AS win_rate
+        FROM trades.trade_outcomes FINAL
+        WHERE toDate(exit_time) >= today() - 90
+        GROUP BY exit_date, symbol
+        ORDER BY exit_date
+    """)
+
+    if _wr_df.empty:
+        st.info("No trade outcome data yet. Paper trades will populate this once they start.")
+    else:
+        _rt_df = query("""
+            SELECT trigger_date, symbol, reason, acted_on
+            FROM analysis.retrain_triggers FINAL
+            ORDER BY trigger_date DESC
+        """)
+
+        _sym_wr = st.selectbox("Symbol", ["All"] + sorted(_wr_df["symbol"].unique().tolist()),
+                                key="wr_sym")
+        _wr_view = _wr_df if _sym_wr == "All" else _wr_df[_wr_df["symbol"] == _sym_wr]
+
+        # Rolling 10-trade win rate via cumulative sum
+        _wr_view = _wr_view.sort_values("exit_date")
+        _wr_view["rolling_wins"]  = _wr_view["wins"].rolling(10, min_periods=1).sum()
+        _wr_view["rolling_total"] = _wr_view["total"].rolling(10, min_periods=1).sum()
+        _wr_view["rolling_wr"]    = _wr_view["rolling_wins"] / _wr_view["rolling_total"]
+
+        _fig_wr = px.line(
+            _wr_view, x="exit_date", y="rolling_wr",
+            color="symbol" if _sym_wr == "All" else None,
+            title="Rolling 10-trade win rate",
+            labels={"rolling_wr": "Win rate", "exit_date": "Date"},
+        )
+        _fig_wr.add_hline(y=0.55, line_dash="dash", line_color="green",
+                          annotation_text="55% target")
+        _fig_wr.add_hline(y=0.50, line_dash="dot", line_color="orange",
+                          annotation_text="50% floor")
+        _fig_wr.update_yaxes(tickformat=".0%", range=[0, 1])
+
+        # Overlay retrain events as vertical lines
+        if not _rt_df.empty:
+            for _, ev in _rt_df.iterrows():
+                _fig_wr.add_vline(
+                    x=str(ev["trigger_date"]), line_dash="dash",
+                    line_color="purple", opacity=0.5,
+                    annotation_text="retrain", annotation_position="top",
+                )
+
+        st.plotly_chart(_fig_wr, use_container_width=True)
+
+    st.divider()
+
+    # ── Section 4: Retrain Events ─────────────────────────────────────────────
+    st.header("Retrain Events")
+    st.caption("When drift_detector triggered a model retrain and whether it was acted on.")
+
+    _rt2_df = query("""
+        SELECT trigger_date, symbol, reason, drifted_features,
+               if(acted_on, 'Done', 'Pending') AS status
+        FROM analysis.retrain_triggers FINAL
+        ORDER BY trigger_date DESC
+        LIMIT 50
+    """)
+
+    if _rt2_df.empty:
+        st.info("No retrain triggers yet. Triggers are emitted when 2+ features drift "
+                "for the same symbol in the 30-day window.")
+    else:
+        _n_pending = int((_rt2_df["status"] == "Pending").sum())
+        if _n_pending:
+            st.warning(f"{_n_pending} pending retrain trigger(s) — "
+                       f"will be acted on by scheduler (next confidence_scorer --compare run).")
+        st.dataframe(_rt2_df, use_container_width=True, hide_index=True)

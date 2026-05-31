@@ -581,6 +581,40 @@ services:
     entrypoint: ["python", "gap_analyzer.py"]
     command: []
 
+  loss_attributor:
+    build: *pipeline-build
+    container_name: loss_attributor
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=${TZ:-Asia/Kolkata}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck: *pipeline-healthcheck
+    logging: *default-logging
+    restart: "no"
+    entrypoint: ["python", "loss_attributor.py"]
+
+  drift_detector:
+    build: *pipeline-build
+    container_name: drift_detector
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=${TZ:-Asia/Kolkata}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck: *pipeline-healthcheck
+    logging: *default-logging
+    restart: "no"
+    entrypoint: ["python", "drift_detector.py"]
+
   # Long-running intraday services: restart on-failure so they recover from crashes
   # mid-session without human intervention (H5).
   option_chain_intraday:
