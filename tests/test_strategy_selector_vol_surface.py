@@ -202,3 +202,32 @@ def test_migration_065_exists_and_has_correct_columns():
     assert "trade_recommendations" in sql
     assert "term_slope" in sql
     assert "skew_2pct" in sql
+
+
+# ── Migration 084 — lots UInt8→UInt32 ─────────────────────────────────────────
+
+def test_migration_084_widens_lots_to_uint32():
+    """Regression: compounding simulation grows capital ~30x, lots can exceed UInt8 max (255)."""
+    path = os.path.join(os.path.dirname(__file__), "..",
+                        "clickhouse", "migrations",
+                        "084_strategy_simulation_lots_uint32.sql")
+    assert os.path.exists(path)
+    sql = open(path).read()
+    assert "strategy_simulation" in sql
+    assert "UInt32" in sql
+    assert "lots" in sql
+
+
+def test_strategy_simulation_ddl_uses_uint32_for_lots():
+    """DDL in migration 051 must declare lots as UInt32 (not UInt8) after migration 084."""
+    path = os.path.join(os.path.dirname(__file__), "..",
+                        "clickhouse", "migrations",
+                        "051_create_trade_recommendations.sql")
+    sql = open(path).read()
+    # Find the strategy_simulation CREATE TABLE block
+    sim_block_start = sql.index("analysis.strategy_simulation")
+    sim_block = sql[sim_block_start:]
+    lots_line = next(l for l in sim_block.splitlines() if "lots" in l and "UInt" in l)
+    assert "UInt32" in lots_line, (
+        f"strategy_simulation.lots must be UInt32 (not UInt8) — found: {lots_line.strip()}"
+    )
