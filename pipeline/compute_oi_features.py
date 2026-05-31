@@ -307,23 +307,11 @@ if __name__ == "__main__":
     _started = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         main()
-        _ch = clickhouse_connect.get_client(
-            host=os.getenv("CH_HOST", "clickhouse"),
-            port=int(os.getenv("CH_PORT", "8123")),
-            username=os.getenv("CH_USER", "default"),
-            password=os.getenv("CH_PASSWORD", ""),
-        )
-        _record_run(_ch, "success", _started)
+        _record_run(get_ch(), "success", _started)
     except Exception as _e:
         log.error(f"compute_oi_features fatal: {_e}", exc_info=True)
         try:
-            _ch = clickhouse_connect.get_client(
-                host=os.getenv("CH_HOST", "clickhouse"),
-                port=int(os.getenv("CH_PORT", "8123")),
-                username=os.getenv("CH_USER", "default"),
-                password=os.getenv("CH_PASSWORD", ""),
-            )
-            _record_run(_ch, "failed", _started, str(_e))
+            _record_run(get_ch(), "failed", _started, str(_e))
         except Exception:
             pass
         raise

@@ -32,3 +32,15 @@ def test_pf_insert_no_duplicate_columns_when_column_missing():
     result = pf[[c for c in list(dict.fromkeys(pf_cols + ["fii_fut_net_3d"])) if c in pf.columns]]
     assert list(result.columns).count("fii_fut_net_3d") == 1
     assert not result.columns.duplicated().any()
+
+
+def test_compute_oi_features_main_block_uses_get_ch_not_clickhouse_connect():
+    """Regression: __main__ block used clickhouse_connect.get_client() which was never
+    imported — caused NameError on every run after main() completed, leaving no
+    pipeline_runs record and preventing _upstream_ok() from clearing the gate.
+    Fix: use get_ch() from ch_utils throughout."""
+    import ast, os
+    src = open(os.path.join(os.path.dirname(__file__), "..", "pipeline", "compute_oi_features.py")).read()
+    assert "clickhouse_connect" not in src, (
+        "compute_oi_features must not reference clickhouse_connect — use get_ch() from ch_utils"
+    )
