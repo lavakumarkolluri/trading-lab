@@ -150,21 +150,33 @@ def _win_feat_row(features: dict):
 _WINS = [_win_feat_row({"iv_rank": 70.0 + i, "vix": 18.0 + i}) for i in range(5)]
 
 
-def test_run_attributes_losses_only():
-    """run() must only attribute trades where pnl_pts < 0."""
+def _make_ch(live_losses=None, hist_losses=None, live_wins=None, hist_wins=None):
+    """Build a CH mock routing 4 distinct queries in loss_attributor.run()."""
     ch = MagicMock()
-
-    loss = _loss_row("loss1", -30.0, {"iv_rank": 20.0, "vix": 25.0})
 
     def side_effect(sql, parameters=None):
         result = MagicMock()
-        if "pnl_pts < 0" in sql:
-            result.result_rows = [loss]
+        if "pnl_pts < 0" in sql:                        # live losses
+            result.result_rows = list(live_losses or [])
+        elif "target = 0" in sql:                        # historical losses
+            result.result_rows = list(hist_losses or [])
+        elif "pnl_pts >= 0" in sql:                      # live wins
+            result.result_rows = list(live_wins or [])
+        elif "target = 1" in sql:                        # historical wins
+            result.result_rows = list(hist_wins or [])
         else:
-            result.result_rows = _WINS
+            result.result_rows = []
         return result
 
     ch.query.side_effect = side_effect
+    return ch
+
+
+def test_run_attributes_losses_only():
+    """run() must only attribute trades where pnl_pts < 0."""
+    loss = _loss_row("loss1", -30.0, {"iv_rank": 20.0, "vix": 25.0})
+    ch = _make_ch(live_losses=[loss], live_wins=_WINS)
+
     la.run(ch, run_date=date(2026, 5, 30))
 
     assert ch.insert.called
@@ -174,54 +186,72 @@ def test_run_attributes_losses_only():
 
 
 def test_run_skips_when_no_losses():
-    """If no losses today, insert is not called (no-op)."""
-    ch = MagicMock()
-
-    def side_effect(sql, parameters=None):
-        result = MagicMock()
-        result.result_rows = []
-        return result
-
-    ch.query.side_effect = side_effect
+    """If no losses (live or historical), insert is not called."""
+    ch = _make_ch()
     la.run(ch, run_date=date(2026, 5, 30))
     ch.insert.assert_not_called()
 
 
 def test_run_skips_when_no_win_profile():
-    """If fewer than MIN_WIN_TRADES historical winners, attribution cannot be computed.
-    run() must not crash — log warning and return."""
-    ch = MagicMock()
+    """If no winning trades at all (live or historical), attribution cannot be computed."""
     loss = _loss_row("loss1", -30.0, {"iv_rank": 20.0})
+    ch = _make_ch(live_losses=[loss])   # no wins anywhere
 
-    def side_effect(sql, parameters=None):
-        result = MagicMock()
-        if "pnl_pts < 0" in sql:
-            result.result_rows = [loss]
-        else:
-            result.result_rows = []   # no winners
-        return result
-
-    ch.query.side_effect = side_effect
-    la.run(ch, run_date=date(2026, 5, 30))   # must not raise
+    la.run(ch, run_date=date(2026, 5, 30))
     ch.insert.assert_not_called()
 
 
 def test_run_handles_missing_entry_features_gracefully():
     """If entry_features JSON is empty, skip that trade."""
-    ch = MagicMock()
     loss_no_features = _loss_row("loss2", -20.0, {})
+    ch = _make_ch(live_losses=[loss_no_features], live_wins=_WINS)
+
+    la.run(ch, run_date=date(2026, 5, 30))
+    ch.insert.assert_not_called()
+
+
+# ── historical data integration ───────────────────────────────────────────────
+
+def test_run_uses_historical_data_when_no_live_trades():
+    """When no live paper trades exist, historical losses + wins still produce attributions.
+    This ensures the dashboard shows real data before any paper trades close.
+    """
+    ch = MagicMock()
+
+    hist_loss = (
+        "NIFTY_2024-01-15",           # trade_id (concat)
+        "NIFTY",                       # symbol
+        date(2024, 1, 15),             # exit_date (entry_date)
+        "iron_fly",                    # exit_reason (strategy)
+        -25.0,                         # pnl_pts
+        json.dumps({"iv_rank": 20.0, "vix": 28.0}),  # features_json
+    )
 
     def side_effect(sql, parameters=None):
         result = MagicMock()
-        if "pnl_pts < 0" in sql:
-            result.result_rows = [loss_no_features]
+        if "pnl_pts < 0" in sql and "trade_outcomes" in sql:
+            result.result_rows = []            # no live losses
+        elif "target = 0" in sql:
+            result.result_rows = [hist_loss]   # historical losses
+        elif "trade_outcomes" in sql and "pnl_pts >= 0" in sql:
+            result.result_rows = []            # no live wins
+        elif "target = 1" in sql:
+            # 5 historical winners to meet MIN_WIN_TRADES
+            result.result_rows = [
+                (json.dumps({"iv_rank": float(70 + i), "vix": float(16 + i)}),)
+                for i in range(5)
+            ]
         else:
-            result.result_rows = _WINS
+            result.result_rows = []
         return result
 
     ch.query.side_effect = side_effect
-    la.run(ch, run_date=date(2026, 5, 30))   # must not raise
-    ch.insert.assert_not_called()
+    la.run(ch, run_date=date(2026, 5, 31))
+
+    assert ch.insert.called, "Expected attributions even with no live paper trades"
+    insert_rows = ch.insert.call_args[0][1]
+    trade_ids = {r[0] for r in insert_rows}
+    assert "NIFTY_2024-01-15" in trade_ids
 
 
 # ── migration 085 ─────────────────────────────────────────────────────────────

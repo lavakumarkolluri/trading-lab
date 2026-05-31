@@ -404,6 +404,11 @@ def job_drift_detector():
     _run("drift_detector")
 
 
+def job_historical_seeder():
+    log.info("=== Historical seeder triggered ===")
+    _run("historical_seeder")
+
+
 def job_participant_oi_pipeline():
     log.info("=== Participant OI pipeline triggered ===")
     _run("participant_oi_pipeline")
@@ -1337,7 +1342,8 @@ def main():
     schedule.every().sunday.at("07:00").do(job_confidence_scorer)   # 90 min after backtester
     schedule.every().sunday.at("07:30").do(job_graduation_gate)     # after weekly retrain
     schedule.every().sunday.at("08:00").do(job_strategy_selector_backtest)
-    schedule.every().sunday.at("09:00").do(job_drift_detector)   # weekly drift scan
+    schedule.every().sunday.at("08:30").do(job_historical_seeder)  # refresh historical features
+    schedule.every().sunday.at("09:00").do(job_drift_detector)   # weekly drift scan (after seeder)
 
     # Loss attributor: after trades settle Mon–Fri at 17:30 UTC (23:00 IST)
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):

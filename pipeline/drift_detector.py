@@ -79,12 +79,9 @@ def _should_trigger_retrain(drifted_features: list[str]) -> bool:
     return len(drifted_features) >= MIN_FEATURES_FOR_TRIGGER
 
 
-def run(ch, symbol: str, run_date: date) -> None:
-    """Compute feature drift for all windows for a symbol. Write results and any triggers."""
-
-    # 1. Fetch baseline data (180-day window for reference correlations)
-    baseline_start = run_date - timedelta(days=BASELINE_WINDOW)
-    baseline_rows = ch.query(
+def _fetch_live_pairs(ch, symbol: str, start: date, end: date) -> list[tuple]:
+    """Fetch (entry_features_json, pnl_pts) from live paper trades only."""
+    return ch.query(
         """
         SELECT entry_features, pnl_pts
         FROM trades.trade_outcomes FINAL
@@ -94,29 +91,58 @@ def run(ch, symbol: str, run_date: date) -> None:
           AND entry_features != ''
         ORDER BY exit_time
         """,
-        parameters={"sym": symbol, "start": baseline_start, "end": run_date},
+        parameters={"sym": symbol, "start": start, "end": end},
     ).result_rows
 
+
+def _fetch_historical_pairs(ch, symbol: str, start: date, end: date) -> list[tuple]:
+    """Fetch (features_json, pnl_pts) from seeded historical backtest data."""
+    return ch.query(
+        """
+        SELECT features_json, pnl_pts
+        FROM analysis.historical_trade_features FINAL
+        WHERE symbol = {sym:String}
+          AND entry_date >= {start:Date}
+          AND entry_date <= {end:Date}
+          AND features_json != '{}'
+        ORDER BY entry_date
+        """,
+        parameters={"sym": symbol, "start": start, "end": end},
+    ).result_rows
+
+
+def run(ch, symbol: str, run_date: date) -> None:
+    """Compute feature drift for all windows for a symbol. Write results and any triggers.
+
+    Baseline (180d): historical + live — establishes the reference correlation.
+    Current windows (30/60/90d): live trades ONLY — avoids false drift signals
+    from historical-data variance. If fewer than MIN_TRADES_FOR_DRIFT live trades
+    exist for a window, that window is skipped rather than generating spurious drift.
+    """
+
+    # 1. Fetch baseline data: UNION historical + live (rich reference)
+    baseline_start = run_date - timedelta(days=BASELINE_WINDOW)
+    baseline_rows = (
+        _fetch_historical_pairs(ch, symbol, baseline_start, run_date)
+        + _fetch_live_pairs(ch, symbol, baseline_start, run_date)
+    )
     baseline_pairs = extract_feature_win_pairs(baseline_rows)
 
-    # 2. For each window, compute correlations and detect drift
+    # 2. For each window, compute correlations using LIVE TRADES ONLY.
+    # Historical data is not used here — if it were, a 30-day historical slice
+    # would naturally differ from the 180-day baseline due to sampling noise
+    # rather than genuine concept drift, generating false retrain triggers.
     perf_rows = []   # for analysis.feature_performance
     drifted_features: list[str] = []
 
     for window in WINDOWS:
         window_start = run_date - timedelta(days=window)
-        window_rows = ch.query(
-            """
-            SELECT entry_features, pnl_pts
-            FROM trades.trade_outcomes FINAL
-            WHERE symbol = {sym:String}
-              AND toDate(exit_time) >= {start:Date}
-              AND toDate(exit_time) <= {end:Date}
-              AND entry_features != ''
-            ORDER BY exit_time
-            """,
-            parameters={"sym": symbol, "start": window_start, "end": run_date},
-        ).result_rows
+        window_rows = _fetch_live_pairs(ch, symbol, window_start, run_date)
+
+        if not window_rows:
+            log.debug("drift_detector: no live trades for %s in %dd window — skipping",
+                      symbol, window)
+            continue
 
         window_pairs = extract_feature_win_pairs(window_rows)
 

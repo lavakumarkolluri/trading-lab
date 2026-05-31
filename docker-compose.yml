@@ -615,6 +615,23 @@ services:
     restart: "no"
     entrypoint: ["python", "drift_detector.py"]
 
+  historical_seeder:
+    build: *pipeline-build
+    container_name: historical_seeder
+    environment:
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_USER=default
+      - CH_PASSWORD=${CH_PASSWORD}
+      - TZ=${TZ:-Asia/Kolkata}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck: *pipeline-healthcheck
+    logging: *default-logging
+    restart: "no"
+    entrypoint: ["python", "historical_seeder.py"]
+
   # Long-running intraday services: restart on-failure so they recover from crashes
   # mid-session without human intervention (H5).
   option_chain_intraday:

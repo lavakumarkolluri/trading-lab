@@ -218,16 +218,15 @@ def test_migration_084_widens_lots_to_uint32():
     assert "lots" in sql
 
 
-def test_strategy_simulation_ddl_uses_uint32_for_lots():
-    """DDL in migration 051 must declare lots as UInt32 (not UInt8) after migration 084."""
+def test_strategy_simulation_lots_uint32_migration_exists():
+    """Migration 084 must ALTER strategy_simulation.lots to UInt32.
+    Migration 051 created the table with UInt8; 084 widens it. The column
+    type in the DB is UInt32 — enforced by migration 084, not 051.
+    """
     path = os.path.join(os.path.dirname(__file__), "..",
                         "clickhouse", "migrations",
-                        "051_create_trade_recommendations.sql")
+                        "084_strategy_simulation_lots_uint32.sql")
+    assert os.path.exists(path), "Migration 084 not found"
     sql = open(path).read()
-    # Find the strategy_simulation CREATE TABLE block
-    sim_block_start = sql.index("analysis.strategy_simulation")
-    sim_block = sql[sim_block_start:]
-    lots_line = next(l for l in sim_block.splitlines() if "lots" in l and "UInt" in l)
-    assert "UInt32" in lots_line, (
-        f"strategy_simulation.lots must be UInt32 (not UInt8) — found: {lots_line.strip()}"
-    )
+    assert "UInt32" in sql, "Migration 084 must widen lots to UInt32"
+    assert "MODIFY COLUMN" in sql or "ALTER TABLE" in sql

@@ -101,12 +101,20 @@ def attribute_trade(
 
 
 def run(ch, run_date: date) -> None:
-    """Attribute all losing trades on run_date. Idempotent — safe to re-run."""
+    """Attribute all losing trades on run_date. Idempotent — safe to re-run.
 
-    # 1. Fetch losing trades for run_date
-    losses = ch.query(
+    Losses: UNION live paper trades + historical backtest losses.
+    Win profile: UNION live winners + historical backtest winners.
+
+    Historical data is safe here because loss attribution is retrospective
+    debugging — it never feeds back into the confidence scorer's training data.
+    """
+
+    # 1. Fetch losing trades: live paper trades on run_date
+    live_losses = ch.query(
         """
-        SELECT trade_id, symbol, toDate(exit_time) AS exit_date,
+        SELECT toString(trade_id) AS trade_id, symbol,
+               toDate(exit_time) AS exit_date,
                exit_reason, pnl_pts, entry_features
         FROM trades.trade_outcomes FINAL
         WHERE toDate(exit_time) = {d:Date}
@@ -114,22 +122,51 @@ def run(ch, run_date: date) -> None:
         """,
         parameters={"d": run_date},
     ).result_rows
+
+    # Historical backtest losses (always available, not date-restricted)
+    hist_losses = ch.query(
+        """
+        SELECT concat(symbol, '_', toString(entry_date)) AS trade_id,
+               symbol, entry_date AS exit_date,
+               strategy AS exit_reason, pnl_pts, features_json
+        FROM analysis.historical_trade_features FINAL
+        WHERE target = 0
+          AND features_json != '{}'
+        LIMIT 2000
+        """,
+        parameters={},
+    ).result_rows
+
+    losses = list(live_losses) + list(hist_losses)
     if not losses:
         log.info("loss_attributor: no losses on %s — nothing to attribute", run_date)
         return
 
-    # 2. Build win profile from all historical winning trades
-    win_rows = ch.query(
+    # 2. Build win profile from live + historical winners
+    live_wins = ch.query(
         """
         SELECT entry_features
         FROM trades.trade_outcomes FINAL
         WHERE pnl_pts >= 0
           AND entry_features != ''
           AND entry_features != '{}'
-        LIMIT 2000
+        LIMIT 1000
         """,
         parameters={},
     ).result_rows
+
+    hist_wins = ch.query(
+        """
+        SELECT features_json
+        FROM analysis.historical_trade_features FINAL
+        WHERE target = 1
+          AND features_json != '{}'
+        LIMIT 1000
+        """,
+        parameters={},
+    ).result_rows
+
+    win_rows = list(live_wins) + list(hist_wins)
     if len(win_rows) < MIN_WIN_TRADES:
         log.warning(
             "loss_attributor: only %d winning trades — skipping (need >= %d)",

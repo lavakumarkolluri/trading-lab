@@ -196,6 +196,41 @@ def test_run_no_retrain_trigger_when_insufficient_data():
     assert not insert_calls
 
 
+# ── historical baseline / live-only current window ────────────────────────────
+
+def test_run_current_window_uses_live_only_no_false_drift():
+    """Current windows must query trades.trade_outcomes, NOT historical_trade_features.
+    If only historical data exists (no live trades), no drift is detected and no
+    retrain trigger is emitted — preventing false positive retrains from backtest
+    data variance poisoning the drift signal.
+    """
+    ch = MagicMock()
+
+    def side_effect(sql, parameters=None):
+        result = MagicMock()
+        if "historical_trade_features" in sql:
+            # Baseline: return rich historical data
+            result.result_rows = [
+                (json.dumps({"iv_rank": float(60 + i), "vix": float(15 + i)}), float(i % 2 * 20))
+                for i in range(60)
+            ]
+        else:
+            # Live trades (trade_outcomes): empty — no paper trades yet
+            result.result_rows = []
+        return result
+
+    ch.query.side_effect = side_effect
+    dd.run(ch, symbol="NIFTY", run_date=date(2026, 5, 31))
+
+    # With no live trades in any current window, no drift can be detected
+    insert_calls = [c for c in ch.insert.call_args_list
+                    if "retrain_triggers" in str(c)]
+    assert not insert_calls, (
+        "No retrain trigger should fire when current window has zero live trades. "
+        "Historical data must only be used for baseline, not current windows."
+    )
+
+
 # ── migration 086 ─────────────────────────────────────────────────────────────
 
 def test_migration_086_exists_with_required_tables():
