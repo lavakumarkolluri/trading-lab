@@ -1220,9 +1220,12 @@ def _recompute_check():
 
 def main():
     import sys as _sys
+    from startup_validator import validate_service
     if "--recompute-check" in _sys.argv:
         _recompute_check()
         return
+
+    validate_service("scheduler")
 
     if not os.path.isfile(_COMPOSE_FILE):
         log.error("FATAL: COMPOSE_FILE not found: %s — set COMPOSE_FILE env var correctly",
