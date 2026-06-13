@@ -1,6 +1,16 @@
 # CLAUDE.md
 
+## Domain Logic Rules
+
+**Historical data only** — For any learning, training, backtesting, or drift-detection logic, ALWAYS use historical data windows. Never query live/paper-trade-only windows as the sole source. Verify the data source spans the intended historical range before implementing.
+
+**Plan before core logic** — Before implementing seeders, learning loops, attribution, or drift detection: restate the intended goal and the data source in plain terms and confirm before writing code.
+
+---
+
 ## Coding Guidelines
+
+**Pipeline boilerplate rule** — Never inline ClickHouse/MinIO/logging setup in `pipeline/`. Always import from `ch_utils`, `logging_utils`, `pipeline_utils`. `scripts/lint_boilerplate.py` fails CI if you do.
 
 **Simplicity First** — minimum code that solves the problem. No speculative features, no abstractions for single-use code, no error handling for impossible scenarios.
 
@@ -25,6 +35,7 @@ stage  →  CI tests pass  →  auto-merge to master  (daily 17:00 UTC Mon–Fri
 - If all tests pass, the workflow auto-merges `stage` → `master` and tags `prod-YYYYMMDD-HHMM`.
 - Every prod breakage must produce a failing test FIRST, then a fix. No exceptions.
 - Tests must run offline (no live ClickHouse). Use `unittest.mock.MagicMock` for DB calls.
+- Standard mock pattern: `ch = MagicMock(); ch.query.return_value.result_rows = [("NIFTY", 65)]`
 
 **Test files (422 tests as of 2026-05-15):**
 - `tests/test_docker_compose.py` — compose file structure, config mounts, credentials
