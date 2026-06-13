@@ -14,10 +14,10 @@ read-only from the model's perspective.
 
 Run once as backfill, then weekly (Sunday 08:30 UTC) to pick up new backtests.
 """
+
 import json
 import logging
 import math
-from datetime import date
 
 from confidence_scorer import build_dataset, FEATURE_COLS
 
@@ -26,8 +26,13 @@ log = logging.getLogger(__name__)
 SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 
 _COL_NAMES = [
-    "symbol", "entry_date", "expiry", "strategy",
-    "pnl_pts", "target", "features_json",
+    "symbol",
+    "entry_date",
+    "expiry",
+    "strategy",
+    "pnl_pts",
+    "target",
+    "features_json",
 ]
 
 
@@ -54,7 +59,9 @@ def run(ch, symbols: list[str] | None = None) -> None:
     for sym in targets:
         df = build_dataset(ch, symbol=sym)
         if df.empty:
-            log.warning("historical_seeder: build_dataset returned empty for %s — skipping", sym)
+            log.warning(
+                "historical_seeder: build_dataset returned empty for %s — skipping", sym
+            )
             continue
 
         rows = []
@@ -62,8 +69,11 @@ def run(ch, symbols: list[str] | None = None) -> None:
             feat_json = _serialize_features(row)
             parsed = json.loads(feat_json)
             if not parsed:
-                log.debug("historical_seeder: row for %s on %s has no valid features — skipping",
-                          sym, row.get("entry_date"))
+                log.debug(
+                    "historical_seeder: row for %s on %s has no valid features — skipping",
+                    sym,
+                    row.get("entry_date"),
+                )
                 continue
 
             entry_date = row["entry_date"]
@@ -89,6 +99,7 @@ def run(ch, symbols: list[str] | None = None) -> None:
 if __name__ == "__main__":
     from ch_utils import ch_client
     from startup_validator import validate_service
+
     validate_service("historical_seeder")
     ch = ch_client()
     run(ch)
