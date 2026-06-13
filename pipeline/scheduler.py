@@ -311,7 +311,7 @@ def _upstream_ok(service: str, today_date: str) -> tuple[bool, str]:
                 WHERE service  = {service:String}
                   AND run_date >= toDate({run_date:String}) - 3
                   AND run_date <= toDate({run_date:String})
-                ORDER BY run_date DESC, version DESC LIMIT 1
+                ORDER BY started_at DESC LIMIT 1
                 """,
                 parameters={"service": dep, "run_date": today_date},
             )
@@ -392,6 +392,21 @@ def job_gap_analyzer():
 def job_fii_dii_pipeline():
     log.info("=== FII/DII pipeline triggered ===")
     _run("fii_dii_pipeline")
+
+
+def job_loss_attributor():
+    log.info("=== Loss attributor triggered ===")
+    _run("loss_attributor")
+
+
+def job_drift_detector():
+    log.info("=== Drift detector triggered ===")
+    _run("drift_detector")
+
+
+def job_historical_seeder():
+    log.info("=== Historical seeder triggered ===")
+    _run("historical_seeder")
 
 
 def job_participant_oi_pipeline():
@@ -1220,9 +1235,12 @@ def _recompute_check():
 
 def main():
     import sys as _sys
+    from startup_validator import validate_service
     if "--recompute-check" in _sys.argv:
         _recompute_check()
         return
+
+    validate_service("scheduler")
 
     if not os.path.isfile(_COMPOSE_FILE):
         log.error("FATAL: COMPOSE_FILE not found: %s — set COMPOSE_FILE env var correctly",
@@ -1324,6 +1342,12 @@ def main():
     schedule.every().sunday.at("07:00").do(job_confidence_scorer)   # 90 min after backtester
     schedule.every().sunday.at("07:30").do(job_graduation_gate)     # after weekly retrain
     schedule.every().sunday.at("08:00").do(job_strategy_selector_backtest)
+    schedule.every().sunday.at("08:30").do(job_historical_seeder)  # refresh historical features
+    schedule.every().sunday.at("09:00").do(job_drift_detector)   # weekly drift scan (after seeder)
+
+    # Loss attributor: after trades settle Mon–Fri at 17:30 UTC (23:00 IST)
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+        getattr(schedule.every(), day).at("17:30").do(job_loss_attributor)
     schedule.every().sunday.at("08:30").do(job_analysis_agent_weekly)  # weekly full report
     schedule.every().sunday.at("09:00").do(job_cleanup)  # 09:00 UTC = 14:30 IST
 

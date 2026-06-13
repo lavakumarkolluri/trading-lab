@@ -114,6 +114,22 @@ def test_all_pipeline_services_have_clickhouse_dependency(compose):
             assert "clickhouse" in deps, f"Service '{name}' missing depends_on clickhouse"
 
 
+def test_migrate_is_dependency_of_scheduler(compose):
+    """P0-5: scheduler must wait for migrate to complete before starting.
+    Without this, scheduler can launch pipelines against a schema that is missing
+    new columns or tables added in recent migrations."""
+    svc = compose["services"].get("scheduler", {})
+    deps = svc.get("depends_on", {})
+    assert "migrate" in deps, (
+        "scheduler must declare depends_on.migrate (condition: service_completed_successfully) "
+        "so pipelines only run against a fully-migrated schema"
+    )
+    condition = deps["migrate"].get("condition") if isinstance(deps, dict) else ""
+    assert condition == "service_completed_successfully", (
+        f"scheduler depends_on migrate must use condition: service_completed_successfully, got: {condition}"
+    )
+
+
 def test_long_running_services_have_healthcheck(compose):
     """OPS-012: intraday_monitor and option_chain_intraday must have healthchecks.
     Without them, a hung container looks healthy to Docker — no alert fires."""
@@ -141,6 +157,35 @@ def test_dood_services_have_host_project_dir(compose):
             f"Service '{svc_name}' must have HOST_PROJECT_DIR in environment "
             f"(use ${{PWD}} so the HOST path is injected at docker compose up time)"
         )
+
+
+def test_all_services_have_healthchecks(compose):
+    """P0-1: Every service must have a healthcheck so Docker can detect hung containers.
+    Pipeline run-once services use the *pipeline-healthcheck anchor (process-alive check).
+    Long-running services use service-appropriate checks (HTTP, heartbeat file, etc.)."""
+    missing = [n for n, s in compose["services"].items() if not s.get("healthcheck")]
+    assert not missing, (
+        f"Services missing healthcheck ({len(missing)}): {missing}\n"
+        "Add 'healthcheck: *pipeline-healthcheck' for pipeline services."
+    )
+
+
+def test_all_services_have_log_limits(compose):
+    """P0-3: Every service must cap Docker log volume.
+    Use the x-logging YAML anchor (max-size: 50m, max-file: 3) — without it,
+    a single chatty service can fill the disk and kill the entire system."""
+    missing = []
+    wrong = []
+    for name, svc in compose["services"].items():
+        log_cfg = svc.get("logging")
+        if not log_cfg:
+            missing.append(name)
+            continue
+        opts = log_cfg.get("options", {})
+        if not opts.get("max-size") or not opts.get("max-file"):
+            wrong.append(f"{name} (options={opts})")
+    assert not missing, f"Services missing logging config: {missing}"
+    assert not wrong, f"Services with incomplete log limits: {wrong}"
 
 
 def test_migration_055_ttl_file_exists():
